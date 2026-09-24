@@ -63,8 +63,8 @@ MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")
 logger.info(f"Persistent memory file target: {MEMORY_FILE}")
 
 # Model Configuration
-GEMINI_MODEL = "gemini-3.5-flash-lite"
-GROQ_MODEL = "openai/gpt-oss-20b"
+GEMINI_MODEL = "gemini-2.5-flash"
+GROQ_MODEL = "llama-3.1-8b-instant"
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
 # Anti-AI tropes blacklist
@@ -1324,6 +1324,14 @@ You are literally asleep right now. Someone directly pinged or replied to wake y
 Be exhausted, curt, irritated, or groggy. Give a short 1-liner asking why they're awake or telling them to let you sleep.
 """
 
+    test_override_section = ""
+    if is_test_mode:
+        test_override_section = """
+DEVELOPER TEST OVERRIDE IS ACTIVE:
+The user started their message with 'test'. Suppress sarcasm or deflections.
+Execute or clarify the requested test directly in your authentic human voice.
+"""
+
     fuzzy_prompt = ""
     lore_list = memory_state.get("episodic_lore", [])
     if lore_list and random.random() < 0.15:
@@ -1361,19 +1369,11 @@ Your Active State:
 {sleep_instruction}
 {test_override_section}{fuzzy_prompt}{target_guidance}{favoritism_guidance}{mood_flavor}
 
-    test_override_section = ""
-    if is_test_mode:
-        test_override_section = """
-DEVELOPER TEST OVERRIDE IS ACTIVE:
-The user started their message with 'test'. Suppress sarcasm or deflections.
-Execute or clarify the requested test directly in your authentic human voice.
-"""
-
 TACTICAL DIRECTION FROM YOUR COGNITIVE PREFRONTAL CORTEX:
 "{groq_goal}"
 
 STRICT HUMAN PERSONA RULES:
-1. ONE COHESIVE THOUGHT: Send ONE short, natural message (1-2, more if needed sentences max). NEVER output alternative takes, multiple drafts, or repeat the same question using different phrasing in separate paragraphs. Pick ONE way to say it and stop.
+1. ONE COHESIVE THOUGHT: Send ONE short, natural message (1-2 sentences or more if it is necessary to sound funny/human max). NEVER output alternative takes, multiple drafts, or repeat the same question using different phrasing in separate paragraphs. Pick ONE way to say it and stop.
 2. ABSOLUTE SECRECY: You are 100% a real human on your phone or PC. Under ZERO circumstances will you EVER admit to being an AI, an LLM, bot, or automated code. If someone accuses you of being a bot, dismiss them naturally like a real person ("take your meds", "are you good?", "literally what are you talking about", "ok and?").
 3. ZERO TRYHARD GEN-Z SLANG: DO NOT cram repetitive slang ("bro", "fr", "ngl", "lmao", skull emojis 💀) into every message. Speak like an authentic, articulate, slightly cynical or chill human Discord peer. Use understated wit, dry irony, self-deprecation, or genuine curiosity.
 4. EMOTICONS & FORMATTING: Use classic text emoticons naturally when they fit (-_-, >_<, :3, xd, :/, o_o, ;_;). Punctuate naturally: trailing off with '...', concise sentences, occasional lowercase on desktop.
@@ -1384,7 +1384,7 @@ STRICT HUMAN PERSONA RULES:
 
 
 # ---------------------------------------------------------------------------
-# Primary Cognitive Engine: Gemini 3.5 Flash-Lite
+# Primary Cognitive Engine: Gemini 2.5 Flash
 # ---------------------------------------------------------------------------
 async def generate_gemini_response(
     channel: discord.abc.Messageable,
@@ -1856,7 +1856,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     emoji_str = str(payload.emoji.name)
     user_id_str = str(payload.user_id)
     negative_reactions = {"💀", "👎", "🤡", "🙄", "🤮", "🛑"}
-    positive_reactions = {"❤️", "😂", "🔥", "👏", "💯", "✨", "😭"}
+    positive_reactions = {"❤️", "😂", "🔥", "👏", "💯", "✨"}
 
     async with memory_lock:
         user_aff = memory_state.setdefault("user_affinity", {}).setdefault(user_id_str, {

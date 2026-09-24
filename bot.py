@@ -62,9 +62,9 @@ else:
 MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")
 logger.info(f"Persistent memory file target: {MEMORY_FILE}")
 
-# Model Configuration (Valid, verified model identifiers)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+# Model Configuration
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
 # Anti-AI tropes blacklist
@@ -116,7 +116,7 @@ DEFAULT_MEMORY = {
         "vulnerability": 40.0,
         "irritation": 10.0,
         "boredom": 30.0,
-        "vibe": "chill",  # "chill", "deadpan", "love", "edgy", "unhinged", "mischievous", "flustered", "petty", "tired", "annoyed", "chaotic", "funny", "dad_jokes", "introspective"
+        "vibe": "chill",
         "last_updated": datetime.now(AMSTERDAM_TZ).isoformat(),
     },
     "traits": [
@@ -359,40 +359,22 @@ def process_image_buffer(data: bytes, target_size: Tuple[int, int], exact_crop: 
 
 
 # ---------------------------------------------------------------------------
-# Groq Prefrontal Router: Contextual Social Intelligence & Selectivity
+# Groq Prefrontal Router: Compact & TPM-Optimized System Prompt
 # ---------------------------------------------------------------------------
-GROQ_ROUTER_PROMPT = """You are the prefrontal social intuition of an authentic human Discord member.
-You read room context, conversational momentum, and speaker dynamics to decide if the bot should speak, lurk, react, or do an action.
-
-Respond strictly with valid JSON conforming to:
+GROQ_ROUTER_PROMPT = """You are the prefrontal router of a human Discord member. Analyze recent chat and return JSON:
 {
   "should_speak": boolean,
   "target_user": string or null,
   "detected_tension": boolean,
-  "emotional_shift": {
-    "vibe": string,
-    "energy_delta": number,
-    "irritation_delta": number
-  },
+  "emotional_shift": {"vibe": string, "energy_delta": number, "irritation_delta": number},
   "conversational_goal": string
 }
 
-CONVERSATIONAL SELECTIVITY RULES:
-1. should_speak = TRUE conditions:
-   - DIRECT INTERACTION: Pinged, replied to, or explicitly named. (Always True).
-   - CONVERSATIONAL CONTINUITY: A user is answering, acknowledging, or building upon what YOU (the bot) said earlier (even minutes later and without a ping!).
-   - ROOM BROADCASTS & SUBSTANTIVE CHAT: Someone asks an open question to the room ("anyone down for games?", "what's good music?"), shares a hot take, or drops something funny where your witty input adds value.
-   - JEALOUSY & THIRD-WHEELING: If you spoke earlier and two friends start chatting back and forth while ignoring you, feel left out or petty. Butt in or instigate!
-   - PROACTIVE SCAN: The room has been quiet. Set should_speak: True to break the ice with an unprompted observation, joke, or media idea.
-2. should_speak = FALSE conditions (LURK):
-   - TRIVIAL NOISE: Do NOT jump in on simple one-word messages ("lol", "ok", "cool", "yeah", "nice") unless directly asked or continuing your own dialogue.
-   - TWO OTHER USERS: Are having a rapid private back-and-forth or venting seriously about personal life problems. Do not interrupt every sentence.
-   - You just sent the very last message in the room and no one has responded yet.
-   - Sleep hours (03:00 - 08:00 AM Amsterdam) and no one directly pinged you.
-3. MOOD SHIFTS:
-   - Pick a vibe fitting the dynamic: "love" (wholesome/affectionate teasing when treated nicely), "edgy" (cynical/dark humor/mocking pretentiousness), "unhinged" (weird chaotic humor), "deadpan" (flat blunt irony), "chill", "petty", "flustered", "tired", "annoyed", "chaotic", "funny", "dad_jokes", "introspective".
-4. conversational_goal:
-   - A concise, single-sentence tactical direction with ONE clear intent. Never offer options or alternatives (do NOT say 'do X or do Y').
+Rules:
+1. should_speak=true if: is_test_mode, is_direct_interaction (@mention/reply/name), user is answering/continuing with the bot (even minutes later without ping), open question asked to room, or jealousy/third-wheeling.
+2. should_speak=false if: is_sleeping (unless direct ping), last message was by bot, or two users are arguing/venting (detected_tension=true), or trivial one-word noise ("ok","lol"). Real humans lurk ~75% of the time.
+3. emotional_shift: pick vibe (chill, love, edgy, petty, deadpan, unhinged, tired, chaotic, funny, dad_jokes) & deltas (-15 to 15).
+4. conversational_goal: single concise sentence with ONE clear intent. Never offer options/alternatives.
 """
 
 
@@ -410,7 +392,7 @@ async def call_groq_router(
     inactivity_minutes: float = 0.0,
     last_context_type: str = "normal",
 ) -> Dict[str, Any]:
-    """Runs cognitive room-reading with robust JSON extraction and fallback."""
+    """Runs cognitive room-reading with robust JSON extraction and rate-limit fallbacks."""
     if is_test_mode:
         return {
             "should_speak": True,
@@ -443,14 +425,14 @@ async def call_groq_router(
         "is_direct_interaction": is_direct_interaction,
         "is_test_mode": is_test_mode,
         "is_proactive_scan": is_proactive_scan,
-        "inactivity_minutes": inactivity_minutes,
+        "inactivity_minutes": round(inactivity_minutes, 1),
         "last_context_type": last_context_type,
         "last_bot_statement": last_bot_statement,
         "last_message_from_bot": last_message_from_bot,
-        "online_members": online_members,
+        "online_members": online_members[:8],
         "emotional_state": emotional_state,
         "speaker_affinity": speaker_affinity,
-        "recent_messages": channel_msgs[-25:],
+        "recent_messages": channel_msgs[-6:],
     }
 
     headers = {
@@ -478,6 +460,15 @@ async def call_groq_router(
                 if is_direct_interaction or is_test_mode:
                     decision["should_speak"] = True
                 return decision
+            elif resp.status == 429:
+                logger.debug("Groq 429 TPM rate limit hit, using fallback decision.")
+                return {
+                    "should_speak": is_direct_interaction or is_test_mode,
+                    "target_user": None,
+                    "detected_tension": False,
+                    "emotional_shift": {"vibe": emotional_state.get("vibe", "chill"), "energy_delta": 0.0, "irritation_delta": 0.0},
+                    "conversational_goal": "Reply naturally",
+                }
             else:
                 logger.warning(f"Groq router HTTP {resp.status}: {await resp.text()}")
     except Exception as e:
@@ -489,7 +480,7 @@ async def call_groq_router(
         "target_user": None,
         "detected_tension": False,
         "emotional_shift": {"vibe": emotional_state.get("vibe", "chill"), "energy_delta": 0.0, "irritation_delta": 0.0},
-        "conversational_goal": "Reply naturally and banter as a fellow human server member.",
+        "conversational_goal": "Reply naturally",
     }
 
 
@@ -533,6 +524,9 @@ async def call_groq_fallback(
                 content = data["choices"][0]["message"]["content"]
                 logger.info("Successfully received fallback response from Groq.")
                 return content
+            elif resp.status == 429:
+                logger.debug("Groq fallback 429 TPM rate limit hit.")
+                return None
             else:
                 logger.error(f"Groq fallback HTTP {resp.status}: {await resp.text()}")
     except Exception as e:
@@ -1775,9 +1769,9 @@ async def proactive_room_scanner() -> None:
 
     channel_msgs_payload = [{
         "sender": r["sender"],
-        "content": r["content"],
+        "content": r["content"][:120],
         "time": r["timestamp"],
-    } for r in records[-20:]]
+    } for r in records[-6:]]
 
     st = memory_state.get("emotional_state", {})
     online_members = get_online_presence_summary(target_channel.guild)
@@ -1971,7 +1965,7 @@ async def on_message(message: discord.Message) -> None:
         if r.get("is_bot") and r.get("message_id") != message.id:
             time_diff_min = (now_epoch - r.get("timestamp_epoch", now_epoch)) / 60.0
             last_bot_statement = {
-                "content": r.get("content", ""),
+                "content": r.get("content", "")[:120],
                 "minutes_ago": round(time_diff_min, 1),
                 "was_question": "?" in r.get("content", ""),
             }
@@ -1985,12 +1979,13 @@ async def on_message(message: discord.Message) -> None:
 
     is_sleeping = is_amsterdam_sleeping()
 
+    # Compressed payload: last 6 messages truncated to 120 chars to avoid Groq TPM limits
     buffer_list = list(channel_buffers[message.channel.id])
     channel_msgs_payload = [{
         "sender": r["sender"],
-        "content": r["content"],
+        "content": r["content"][:120],
         "time": r["timestamp"],
-    } for r in buffer_list[-25:]]
+    } for r in buffer_list[-6:]]
 
     user_id_str = str(message.author.id)
     user_aff = memory_state.get("user_affinity", {}).get(user_id_str, {"score": 0, "notes": []})

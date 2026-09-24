@@ -64,7 +64,7 @@ logger.info(f"Persistent memory file target: {MEMORY_FILE}")
 
 # Model Configuration
 GEMINI_MODEL = "gemini-3.5-flash-lite"
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
 # Anti-AI tropes blacklist

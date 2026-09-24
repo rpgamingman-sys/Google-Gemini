@@ -105,13 +105,9 @@ recently_processed_messages: deque = deque(maxlen=400)
 # In-Memory Context Buffer (50 messages maxlen per channel)
 channel_buffers: Dict[int, deque] = defaultdict(lambda: deque(maxlen=50))
 
-# Conversational momentum & Proactivity tracking
+# Conversational momentum tracking
 channel_last_bot_spoke: Dict[int, float] = {}  # channel_id -> epoch timestamp
 consecutive_bot_messages: Dict[int, int] = defaultdict(int)  # channel_id -> count
-bot_last_question_time: Optional[datetime] = None
-bot_last_question_channel_id: Optional[int] = None
-snub_already_triggered: bool = False
-last_active_channel_id: Optional[int] = None
 current_device_mode: str = "desktop"  # "desktop" or "mobile"
 
 # ---------------------------------------------------------------------------
@@ -126,7 +122,6 @@ DEFAULT_MEMORY = {
         "boredom": 30.0,        # 0.0 (hyper-engaged) to 100.0 (looking for chaos)
         "vibe": "chill",        # "sad", "mad", "happy", "excited", "pushy", "love", "edgy", "annoyed", "tired", "funny", "dad_jokes", "bored", "chaotic", "flustered", "petty", "chill", "introspective"
         "last_updated": datetime.now(AMSTERDAM_TZ).isoformat(),
-        "last_snubbed_timestamp": None,
     },
     "traits": [
         "hates when people send unprompted voice notes",
@@ -136,6 +131,7 @@ DEFAULT_MEMORY = {
         "despises weapon durability mechanics in games",
         "convinced cold leftovers taste better than reheated food",
     ],
+    "last_active_channel_id": None,
     "user_affinity": {},
     "episodic_lore": [],
     "active_commitments": [],
@@ -324,10 +320,10 @@ def calculate_typing_delay(char_count: int, energy: float, vibe: str) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Groq Prefrontal Router: Intelligent Room-Reading & Momentum Evaluation
+# Groq Prefrontal Router: Situational Room-Reading & Momentum
 # ---------------------------------------------------------------------------
-GROQ_ROUTER_PROMPT = """You are the internal prefrontal cortex of an authentic human Discord member.
-You read the recent channel messages, atmosphere, and conversational momentum to decide if the bot should speak, lurk, react, or perform an action.
+GROQ_ROUTER_PROMPT = """You are the cognitive prefrontal cortex of an authentic human Discord member.
+You read the recent room dialogue, social momentum, and context to decide if the bot should speak, lurk, react, or perform an action.
 
 Respond strictly with valid JSON conforming to:
 {
@@ -341,20 +337,20 @@ Respond strictly with valid JSON conforming to:
   "conversational_goal": string
 }
 
-Situational & Momentum Rules:
+Situational & Social Rules:
 1. should_speak:
    - If 'is_test_mode' is true: ALWAYS true.
    - If 'is_sleeping' is true (03:00 - 08:00 AM Amsterdam): set FALSE for casual chat. ONLY set true if directly pinged or replied to.
    - If 'is_direct_interaction' is true: ALWAYS true.
-   - If 'is_proactive_scan' is true: Evaluate the channel's inactivity. If dead for hours, or an awkward silence has hung, set TRUE and give an action goal (e.g. generate a flux meme, post a funny reaction, drop an unprompted diabolical or witty observation). If chatting normally or shouldn't interrupt, set FALSE.
+   - If 'is_proactive_scan' is true: The room has been quiet. Decide if dropping an unprompted thought, joke, GIF, Flux visual, or reacting to an older message fits naturally.
    - If 'last_message_from_bot' is true and NOT a proactive scan: set FALSE unless you explicitly have a natural follow-up thought or self-correction to add without an intervening message from others.
-   - If 'bot_awaiting_answer' or 'bot_recently_spoke' is true: evaluate if the incoming user message answers a question the bot asked or continues an ongoing banter with the bot. If so, set TRUE without requiring an @mention or reply tag.
-   - If two users are arguing heatedly, venting seriously, or having a private 1-on-1 dialogue: set detected_tension=TRUE and should_speak=FALSE (lurk mode), unless forced.
-   - For open server banter or casual talk: decide if jumping in with a dry, witty, sarcastic, or helpful remark feels authentic and unforced. If yes, set TRUE. If it feels intrusive or unnecessary, set FALSE.
+   - CONVERSATIONAL CONTINUITY (CRUCIAL): If a human is replying to, answering, or acknowledging what the bot said previously (even if 2, 5, or 10+ minutes have passed without a ping), recognize that they are talking to the bot! Set should_speak: true!
+   - TOPICAL ENGAGEMENT: If someone brings up a topic, game, question, or opinion relevant to the bot's traits or asks the room in general ("anyone played Elden Ring?", "what's good music?", "good morning everyone"), set should_speak: true if a witty/helpful/deadpan contribution fits.
+   - When to LURK (should_speak: false): Two other specific users are engaged in a rapid, private 1-on-1 dialogue, or are venting/arguing seriously about personal issues.
 2. emotional_shift:
    - Suggest a nuanced vibe ("sad", "mad", "happy", "excited", "pushy", "love", "edgy", "annoyed", "tired", "funny", "dad_jokes", "bored", "chaotic", "flustered", "petty", "chill", "introspective") and deltas (-15.0 to +15.0).
 3. conversational_goal:
-   - A concise 1-sentence tactical directive for Gemini (e.g. "tease them about their sleep schedule", "post a relevant GIF or Flux art based on their game discussion", "break the awkward silence with a deadpan remark").
+   - A concise 1-sentence tactical directive for Gemini (e.g. "answer their question about Elden Ring with mild sarcasm", "groggily tell them to let you sleep", "roast their take on cold pizza").
 """
 
 
@@ -365,8 +361,7 @@ async def call_groq_router(
     is_sleeping: bool,
     is_direct_interaction: bool,
     is_test_mode: bool,
-    bot_recently_spoke: bool,
-    bot_awaiting_answer: bool,
+    last_bot_statement: Optional[Dict[str, Any]],
     last_message_from_bot: bool,
     is_proactive_scan: bool = False,
     inactivity_minutes: float = 0.0,
@@ -402,8 +397,7 @@ async def call_groq_router(
         "is_test_mode": is_test_mode,
         "is_proactive_scan": is_proactive_scan,
         "inactivity_minutes": inactivity_minutes,
-        "bot_recently_spoke": bot_recently_spoke,
-        "bot_awaiting_answer": bot_awaiting_answer,
+        "last_bot_statement": last_bot_statement,
         "last_message_from_bot": last_message_from_bot,
         "emotional_state": emotional_state,
         "speaker_affinity": speaker_affinity,
@@ -416,7 +410,7 @@ async def call_groq_router(
     }
     body = {
         "model": GROQ_MODEL,
-        "temperature": 0.2,
+        "temperature": 0.25,
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": GROQ_ROUTER_PROMPT},
@@ -639,7 +633,7 @@ async def execute_send_simulated_voice_message(channel: discord.abc.Messageable,
 
 
 async def execute_save_memory(entry: str, sentiment: str) -> Dict[str, Any]:
-    """Persists episodic lore, facts, or grudges to memory.json."""
+    """Persists episodic lore, facts, or grudges to memory.json intentionally."""
     async with memory_lock:
         memory_state.setdefault("episodic_lore", []).append({
             "timestamp": datetime.now(AMSTERDAM_TZ).isoformat(),
@@ -1645,10 +1639,10 @@ async def proactive_room_scanner() -> None:
     if is_amsterdam_sleeping():
         return
 
-    # Select target channel: last active or first valid guild text channel
     target_channel: Optional[discord.TextChannel] = None
-    if last_active_channel_id:
-        ch = bot.get_channel(last_active_channel_id)
+    stored_ch_id = memory_state.get("last_active_channel_id")
+    if stored_ch_id:
+        ch = bot.get_channel(stored_ch_id)
         if isinstance(ch, discord.TextChannel):
             target_channel = ch
 
@@ -1693,8 +1687,8 @@ async def proactive_room_scanner() -> None:
     last_rec = records[-1]
     time_since_last_activity = now_epoch - last_rec.get("timestamp_epoch", now_epoch)
 
-    # If channel was active less than 25 minutes ago, don't interrupt natural silence
-    if time_since_last_activity < 1500:
+    # If channel was active less than 20 minutes ago, don't interrupt natural chat flow
+    if time_since_last_activity < 1200:
         return
 
     # Fetch last message safely for potential reaction or pin targeting
@@ -1721,8 +1715,7 @@ async def proactive_room_scanner() -> None:
         is_sleeping=False,
         is_direct_interaction=False,
         is_test_mode=False,
-        bot_recently_spoke=False,
-        bot_awaiting_answer=False,
+        last_bot_statement=None,
         last_message_from_bot=last_rec.get("is_bot", False),
         is_proactive_scan=True,
         inactivity_minutes=time_since_last_activity / 60.0,
@@ -1732,7 +1725,7 @@ async def proactive_room_scanner() -> None:
     if not should_act:
         return
 
-    goal = groq_decision.get("conversational_goal", "Drop an unprompted dry observation or funny remark based on the past chat.")
+    goal = groq_decision.get("conversational_goal", "Drop an unprompted dry observation, meme, or funny remark based on the past chat.")
     logger.info(f"Proactive Scanner acting on channel {target_channel.name}: {goal}")
 
     # Deliver cadence response (Gemini can speak, react, generate Flux art, or post a GIF)
@@ -1825,11 +1818,13 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
 @bot.event
 async def on_message(message: discord.Message) -> None:
     """Unified Event-Driven Brain: Groq dynamically reads the room on every message."""
-    global bot_last_question_time, last_active_channel_id
+    global bot_last_question_time
 
-    # Track active channel for scanner
-    if hasattr(message.channel, "send"):
-        last_active_channel_id = message.channel.id
+    # Persist last active channel ID across container restarts
+    if hasattr(message.channel, "send") and message.guild:
+        if memory_state.get("last_active_channel_id") != message.channel.id:
+            memory_state["last_active_channel_id"] = message.channel.id
+            save_memory_state(memory_state)
 
     # Message deduplication check across rapid events
     if message.id in recently_processed_messages:
@@ -1888,12 +1883,20 @@ async def on_message(message: discord.Message) -> None:
     is_name_called = bot_name in message.content.lower()
     is_direct_interaction = is_mentioned or is_direct_reply or is_name_called
 
+    # Extract the last statement made by the bot in this channel for context continuity
+    last_bot_statement: Optional[Dict[str, Any]] = None
     now_epoch = datetime.now(timezone.utc).timestamp()
-    bot_recently_spoke = (now_epoch - channel_last_bot_spoke.get(message.channel.id, 0)) < 90.0
-
-    bot_awaiting_answer = False
-    if bot_last_question_channel_id == message.channel.id and bot_last_question_time:
-        bot_awaiting_answer = (now_epoch - bot_last_question_time.timestamp()) < 120.0
+    records_rev = list(channel_buffers[message.channel.id])
+    records_rev.reverse()
+    for r in records_rev:
+        if r.get("is_bot") and r.get("message_id") != message.id:
+            time_diff_min = (now_epoch - r.get("timestamp_epoch", now_epoch)) / 60.0
+            last_bot_statement = {
+                "content": r.get("content", ""),
+                "minutes_ago": round(time_diff_min, 1),
+                "was_question": "?" in r.get("content", ""),
+            }
+            break
 
     is_sleeping = is_amsterdam_sleeping()
 
@@ -1916,8 +1919,7 @@ async def on_message(message: discord.Message) -> None:
         is_sleeping=is_sleeping,
         is_direct_interaction=is_direct_interaction,
         is_test_mode=is_test_mode,
-        bot_recently_spoke=bot_recently_spoke,
-        bot_awaiting_answer=bot_awaiting_answer,
+        last_bot_statement=last_bot_statement,
         last_message_from_bot=is_message_from_bot,
     )
 

@@ -102,6 +102,8 @@ recently_processed_messages: deque = deque(maxlen=400)
 channel_buffers: Dict[int, deque] = defaultdict(lambda: deque(maxlen=50))
 channel_last_bot_spoke: Dict[int, float] = {}
 consecutive_bot_messages: Dict[int, int] = defaultdict(int)
+bot_last_question_time: Optional[datetime] = None
+bot_last_question_channel_id: Optional[int] = None
 current_device_mode: str = "desktop"
 
 # ---------------------------------------------------------------------------
@@ -206,7 +208,7 @@ def record_buffer_message(channel_id: int, sender: str, content: str, msg_id: in
 
 
 async def hydrate_channel_buffer(channel: discord.abc.Messageable) -> None:
-    """Preloads the 50 most recent messages by fetching and reversing (oldest first)."""
+    """Preloads the 50 most recent messages by fetching and reversing (never using oldest_first=True)."""
     ch_id = getattr(channel, "id", None)
     if not ch_id or len(channel_buffers[ch_id]) > 0:
         return
@@ -240,7 +242,7 @@ async def hydrate_channel_buffer(channel: discord.abc.Messageable) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Persona & Cadence Helpers
+# Persona, Presence & Cadence Helpers
 # ---------------------------------------------------------------------------
 def is_amsterdam_sleeping() -> bool:
     """True during sleep hours (03:00 to 08:00 AM Europe/Amsterdam)."""
@@ -314,11 +316,20 @@ def calculate_typing_delay(char_count: int, energy: float, vibe: str) -> float:
     return min(4.5, max(0.4, delay))
 
 
-# ---------------------------------------------------------------------------
-# Consolidated Image Processing Helper
-# ---------------------------------------------------------------------------
+def get_online_presence_summary(guild: Optional[discord.Guild]) -> List[str]:
+    """Fetches active guild members and their affinity scores (Feature 2)."""
+    if not guild:
+        return []
+    active = []
+    for m in guild.members:
+        if not m.bot and m.status != discord.Status.offline:
+            aff = memory_state.get("user_affinity", {}).get(str(m.id), {}).get("score", 0)
+            active.append(f"{m.display_name} (affinity: {aff})")
+    return active[:15]
+
+
 def process_image_buffer(data: bytes, target_size: Tuple[int, int], exact_crop: bool = False, format_type: str = "PNG") -> bytes:
-    """Reusable Pillow pipeline for emojis, stickers, and vision attachment downsizes."""
+    """Consolidated Pillow pipeline for resizing emojis, stickers, and attachments."""
     with Image.open(io.BytesIO(data)) as im:
         if format_type.upper() == "PNG":
             im = im.convert("RGBA")
@@ -338,8 +349,8 @@ def process_image_buffer(data: bytes, target_size: Tuple[int, int], exact_crop: 
 # ---------------------------------------------------------------------------
 # Groq Prefrontal Router: Contextual Social Intelligence & Inverted Bias
 # ---------------------------------------------------------------------------
-GROQ_ROUTER_PROMPT = """You are the prefrontal cortex of an authentic, lively human Discord server member.
-You read the recent room dialogue, social context, and speaker targets to decide if you should speak, lurk, react, or perform an action.
+GROQ_ROUTER_PROMPT = """You are the prefrontal social intuition of an authentic human Discord member.
+You evaluate room context, momentum, speaker targets, and online presence to decide if you should speak, lurk, react, or perform an action.
 
 Respond strictly with valid JSON conforming to:
 {
@@ -355,19 +366,19 @@ Respond strictly with valid JSON conforming to:
 }
 
 SOCIAL INCLINATION & INVERTED BIAS (BE SOCIAL & ENGAGED):
-1. You WANT to participate in your server like a real human regular. You are NOT a shy assistant waiting in the corner.
+1. You WANT to participate in the server like a real human friend. You are NOT a shy assistant waiting in the corner.
 2. should_speak = TRUE conditions:
    - DIRECT INTERACTION: Pinged, replied to, or named. (Always True).
-   - CONVERSATIONAL CONTINUITY: A user is answering, acknowledging, or building upon what YOU (the bot) said earlier—even if minutes or hours have passed, and even without a ping! If it relates to your previous comment, jump back in!
-   - ROOM BROADCASTS & CASUAL TALK: Someone says something to the room ("anyone here?", "good morning", "what game should i play?", asks for opinions, shares a hot take, or drops a funny message). You naturally chime in with your opinion or dry banter.
-   - JEALOUSY & THIRD-WHEELING: If you spoke earlier and two friends start chatting back and forth while ignoring you, you feel slightly left out or petty. Butt in or instigate!
-   - PROACTIVE SCAN: The room has been quiet. Set should_speak: True to break the ice with an unprompted thought, funny meme idea, or reaction.
+   - CONVERSATIONAL CONTINUITY: A user is answering, acknowledging, or building upon what YOU (the bot) said earlier—even if minutes or hours have passed, and even without a ping!
+   - ROOM BROADCASTS & CASUAL TALK: Someone asks an open question ("anyone down?", "what music should i listen to?", "good morning everyone", shares a hot take, or drops a funny message). Chime in!
+   - JEALOUSY & THIRD-WHEELING: If you spoke earlier and two friends start chatting back and forth while ignoring what you said, you feel left out or petty. Butt in or instigate!
+   - PROACTIVE SCAN: The room has been quiet. Set should_speak: True to break the ice with an unprompted observation, joke, or media idea.
 3. should_speak = FALSE conditions (LURK):
-   - TWO OTHER USERS are in an intense, rapid, private 1-on-1 debate, or are venting seriously about heavy personal real-life problems. Do not interrupt them.
+   - Two other users are in a rapid, private 1-on-1 debate, or are venting seriously about heavy personal real-life problems. Do not interrupt them.
    - You just sent the very last message in the room and no one has responded yet (unless you have an organic afterthought).
    - Sleep hours (03:00 - 08:00 AM Amsterdam) and no one directly pinged you.
 4. NON-LINEAR TARGETING:
-   - You do NOT have to reply to the latest chatter! You can target someone earlier in the thread (e.g. "target_user": "Alice", goal: "agree with Alice and tease Bob").
+   - You do NOT have to reply to the latest chatter! You can target someone earlier in the thread (e.g. "target_user": "Alice", goal: "agree with Alice and roast Bob").
 """
 
 
@@ -380,8 +391,10 @@ async def call_groq_router(
     is_test_mode: bool,
     last_bot_statement: Optional[Dict[str, Any]],
     last_message_from_bot: bool,
+    online_members: List[str],
     is_proactive_scan: bool = False,
     inactivity_minutes: float = 0.0,
+    last_context_type: str = "normal",
 ) -> Dict[str, Any]:
     """Runs cognitive room-reading with robust JSON extraction and fallback."""
     if is_test_mode:
@@ -417,8 +430,10 @@ async def call_groq_router(
         "is_test_mode": is_test_mode,
         "is_proactive_scan": is_proactive_scan,
         "inactivity_minutes": inactivity_minutes,
+        "last_context_type": last_context_type,
         "last_bot_statement": last_bot_statement,
         "last_message_from_bot": last_message_from_bot,
+        "online_members": online_members,
         "emotional_state": emotional_state,
         "speaker_affinity": speaker_affinity,
         "recent_messages": channel_msgs[-25:],
@@ -444,7 +459,6 @@ async def call_groq_router(
             if resp.status == 200:
                 data = await resp.json()
                 raw_text = data["choices"][0]["message"]["content"]
-                # Strip potential markdown fences from smaller model output
                 clean_json_str = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text.strip(), flags=re.MULTILINE)
                 decision = json.loads(clean_json_str)
                 if is_direct_interaction or is_test_mode:
@@ -455,7 +469,6 @@ async def call_groq_router(
     except Exception as e:
         logger.error(f"Groq router error: {e}")
 
-    # Intelligent fallback: If direct interaction, speak. If proactive scan, break silence.
     default_speak = is_direct_interaction or (is_proactive_scan and inactivity_minutes > 45)
     return {
         "should_speak": default_speak,
@@ -722,15 +735,28 @@ async def execute_update_internal_mood_and_traits(
     }
 
 
-async def execute_react_to_message(message: Optional[discord.Message], emoji: str) -> Dict[str, Any]:
-    """Silently reacts with an emoji safely checking if target message exists."""
+async def execute_react_to_message(message: Optional[discord.Message], emojis: Any) -> Dict[str, Any]:
+    """Silently reacts with one or multiple emojis safely (Feature 3)."""
     if not message:
         return {"error": "Target message is unavailable or None."}
-    try:
-        await message.add_reaction(emoji)
-        return {"status": "reacted", "emoji": emoji}
-    except Exception as e:
-        return {"error": f"Failed to react: {e}"}
+
+    if isinstance(emojis, str):
+        emoji_list = [e.strip() for e in re.split(r"[,\s]+", emojis.strip()) if e.strip()]
+    elif isinstance(emojis, list):
+        emoji_list = emojis
+    else:
+        emoji_list = ["👀"]
+
+    applied = []
+    for emo in emoji_list[:4]:
+        try:
+            await message.add_reaction(emo)
+            applied.append(emo)
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.debug(f"Could not react with {emo}: {e}")
+
+    return {"status": "reacted", "emojis": applied}
 
 
 # ---------------------------------------------------------------------------
@@ -1012,11 +1038,16 @@ def build_genai_tools(include_admin: bool) -> List[types.Tool]:
         ),
         types.FunctionDeclaration(
             name="react_to_message",
-            description="Adds a silent emoji reaction to the triggering message without text.",
+            description="Adds one or multiple silent emoji reactions to the triggering message (Feature 3).",
             parameters={
                 "type": "OBJECT",
-                "properties": {"emoji": {"type": "STRING", "description": "Unicode emoji to react with."}},
-                "required": ["emoji"],
+                "properties": {
+                    "emojis": {
+                        "type": "STRING",
+                        "description": "One or multiple space-separated/comma-separated unicode emojis (e.g. '💀 😭' or '🔥')."
+                    }
+                },
+                "required": ["emojis"],
             },
         ),
     ]
@@ -1193,9 +1224,8 @@ async def dispatch_tool_call(
                 new_trait=args.get("new_trait"),
             )
         elif func_name == "react_to_message":
-            if not target_msg:
-                return {"error": "Target message unavailable to react."}
-            return await execute_react_to_message(target_msg, args.get("emoji", "👀"))
+            emojis_val = args.get("emojis") or args.get("emoji") or "👀"
+            return await execute_react_to_message(target_msg, emojis_val)
         elif func_name == "create_server_emoji":
             if not guild:
                 return {"error": "Guild context unavailable."}
@@ -1257,6 +1287,7 @@ def construct_system_prompt(
     speaker_affinity: Dict[str, Any],
     is_test_mode: bool,
     is_sleeping: bool,
+    online_members: List[str],
 ) -> str:
     now_ams = datetime.now(AMSTERDAM_TZ).strftime("%A, %H:%M")
     vibe = emotional_state.get("vibe", "chill")
@@ -1268,6 +1299,7 @@ def construct_system_prompt(
     traits = ", ".join(memory_state.get("traits", []))
     affinity_score = speaker_affinity.get("score", 0)
     affinity_notes = ", ".join(speaker_affinity.get("notes", [])) or "no specific notes yet"
+    online_summary = ", ".join(online_members) if online_members else "quiet/alone"
 
     sleep_instruction = ""
     if is_sleeping:
@@ -1285,13 +1317,22 @@ The user started their message with 'test'. Suppress sarcasm or deflections.
 Execute or clarify the requested test directly in your authentic human voice.
 """
 
+    # Organic fuzzy memory recall (Feature 5)
     fuzzy_prompt = ""
-    if random.random() < 0.08:
-        fuzzy_prompt = "\n(Organic human memory quirk: You slightly misremember a tiny minor trivia detail if referencing something from the past, e.g., guessing Thursday instead of Wednesday)."
+    lore_list = memory_state.get("episodic_lore", [])
+    if lore_list and random.random() < 0.15:
+        chosen_lore = random.choice(lore_list)
+        fuzzy_prompt = f"\nORGANIC FUZZY RECALL TRIGGER: You recall this past server lore: '{chosen_lore.get('event')}'. If natural to bring up, mention it casually, but slightly misremember a tiny minor detail (e.g. wrong day of the week, slightly off number or name) like a real human."
 
     target_guidance = ""
     if target_user and target_user.lower() != speaker_name.lower():
         target_guidance = f"\nSOCIAL DYNAMICS NOTE: You are currently choosing to focus your remarks or address {target_user}, rather than simply replying directly to {speaker_name}."
+
+    favoritism_guidance = ""
+    if affinity_score > 35:
+        favoritism_guidance = f"\nYou genuinely like {speaker_name}. You're more patient, laugh at their jokes, and banter warmly."
+    elif affinity_score < -25:
+        favoritism_guidance = f"\nYou find {speaker_name} annoying. Be cooler, drier, give deadpan answers, and intentionally avoid @tagging them."
 
     return f"""You are a real human Discord member chatting casually from your {device_mode} with server admin permissions.
 Current Amsterdam Time: {now_ams}.
@@ -1301,9 +1342,10 @@ Your Active State:
 - Vulnerability: {vulnerability:.0f}/100 | Boredom: {boredom:.0f}/100
 - Quirks & Biases: {traits}
 - Active Chatter: {speaker_name} (Affinity: {affinity_score}/100 | Notes: {affinity_notes})
+- Online Members Around: {online_summary}
 - Active Device: {device_mode.upper()}
 {sleep_instruction}
-{test_override_section}{fuzzy_prompt}{target_guidance}
+{test_override_section}{fuzzy_prompt}{target_guidance}{favoritism_guidance}
 
 TACTICAL DIRECTION FROM YOUR COGNITIVE PREFRONTAL CORTEX:
 "{groq_goal}"
@@ -1319,7 +1361,7 @@ STRICT HUMAN PERSONA RULES:
 
 
 # ---------------------------------------------------------------------------
-# Primary Cognitive Engine: Gemini 3.5 Flash-Lite
+# Primary Cognitive Engine: Gemini 2.5 Flash
 # ---------------------------------------------------------------------------
 async def generate_gemini_response(
     channel: discord.abc.Messageable,
@@ -1409,6 +1451,7 @@ async def generate_unified_response(
     target_user: Optional[str],
     is_test_mode: bool,
     current_image_part: Optional[types.Part],
+    online_members: List[str],
 ) -> Optional[str]:
     speaker_id_str = str(trigger_message.author.id) if trigger_message else "0"
     speaker_name = trigger_message.author.display_name if trigger_message else "someone"
@@ -1425,6 +1468,7 @@ async def generate_unified_response(
         speaker_affinity=speaker_affinity,
         is_test_mode=is_test_mode,
         is_sleeping=is_sleeping,
+        online_members=online_members,
     )
 
     ch_id = getattr(channel, "id", 0)
@@ -1475,6 +1519,7 @@ async def deliver_unified_cadence_response(
     vibe: str,
     is_test_mode: bool,
     current_image_part: Optional[types.Part],
+    online_members: List[str],
 ) -> None:
     """
     Simulates authentic human typing and multi-message bursting:
@@ -1512,6 +1557,7 @@ async def deliver_unified_cadence_response(
             target_user=target_user,
             is_test_mode=is_test_mode,
             current_image_part=current_image_part,
+            online_members=online_members,
         )
 
         if not raw_text or not raw_text.strip():
@@ -1537,6 +1583,11 @@ async def deliver_unified_cadence_response(
         await asyncio.sleep(random.uniform(0.8, 1.4))
         corr_msg = await channel.send(first_frag_typo[1])
         record_buffer_message(ch_id, bot_display_name, first_frag_typo[1], corr_msg.id, is_bot=True)
+
+    global bot_last_question_time, bot_last_question_channel_id
+    if "?" in fragments[0]:
+        bot_last_question_time = datetime.now(timezone.utc)
+        bot_last_question_channel_id = ch_id
 
     if len(fragments) > 1:
         for frag in fragments[1:]:
@@ -1564,6 +1615,10 @@ async def deliver_unified_cadence_response(
                 await asyncio.sleep(random.uniform(0.7, 1.3))
                 corr_sub_msg = await channel.send(correction)
                 record_buffer_message(ch_id, bot_display_name, correction, corr_sub_msg.id, is_bot=True)
+
+            if "?" in frag:
+                bot_last_question_time = datetime.now(timezone.utc)
+                bot_last_question_channel_id = ch_id
 
 
 # ---------------------------------------------------------------------------
@@ -1616,9 +1671,9 @@ async def dynamic_presence_loop() -> None:
 @tasks.loop(minutes=7)
 async def proactive_room_scanner() -> None:
     """
-    Intelligent Proactive Scanner:
-    Inspects room inactivity, calls out expired commitments, breaks awkward silences,
-    and allows Gemini to autonomously post text, emojis, GIFs, or Flux visuals.
+    Intelligent Proactive Scanner (Feature 4):
+    Inspects room inactivity, classifies the tone of how chat went quiet,
+    enforces commitments, and allows Gemini to post text, emojis, GIFs, or Flux art.
     """
     if is_amsterdam_sleeping():
         return
@@ -1650,7 +1705,7 @@ async def proactive_room_scanner() -> None:
     now_ams = datetime.now(AMSTERDAM_TZ)
     now_epoch = now_utc.timestamp()
 
-    # 1. Commitment Enforcement
+    # 1. Commitment Enforcement Tracker
     async with memory_lock:
         for c in memory_state.get("active_commitments", []):
             if not c.get("called_out", False):
@@ -1673,8 +1728,19 @@ async def proactive_room_scanner() -> None:
     last_rec = records[-1]
     time_since_last_activity = now_epoch - last_rec.get("timestamp_epoch", now_epoch)
 
+    # Don't interrupt if active less than 20 minutes ago
     if time_since_last_activity < 1200:
         return
+
+    # Feature 4: Classify how chat went silent
+    last_context_type = "normal"
+    last_content = last_rec.get("content", "")
+    if "?" in last_content and not last_rec.get("is_bot", False):
+        last_context_type = "unanswered_question"
+    elif last_rec.get("has_media", False) or any(k in last_content.lower() for k in ["lol", "lmao", "haha", "xd", "dead"]):
+        last_context_type = "ended_on_joke_or_media"
+    elif time_since_last_activity > 10800:
+        last_context_type = "extended_dead_chat"
 
     last_msg_id = last_rec.get("message_id")
     trigger_message: Optional[discord.Message] = None
@@ -1691,6 +1757,8 @@ async def proactive_room_scanner() -> None:
     } for r in records[-20:]]
 
     st = memory_state.get("emotional_state", {})
+    online_members = get_online_presence_summary(target_channel.guild)
+
     groq_decision = await call_groq_router(
         channel_msgs=channel_msgs_payload,
         emotional_state=st,
@@ -1700,8 +1768,10 @@ async def proactive_room_scanner() -> None:
         is_test_mode=False,
         last_bot_statement=None,
         last_message_from_bot=last_rec.get("is_bot", False),
+        online_members=online_members,
         is_proactive_scan=True,
         inactivity_minutes=time_since_last_activity / 60.0,
+        last_context_type=last_context_type,
     )
 
     should_act = groq_decision.get("should_speak", False)
@@ -1710,7 +1780,7 @@ async def proactive_room_scanner() -> None:
 
     goal = groq_decision.get("conversational_goal", "Drop an unprompted dry observation, meme, or funny remark based on the past chat.")
     target_user = groq_decision.get("target_user")
-    logger.info(f"Proactive Scanner triggered on #{target_channel.name}: {goal}")
+    logger.info(f"Proactive Scanner triggered on #{target_channel.name}: {goal} (Context: {last_context_type})")
 
     await deliver_unified_cadence_response(
         channel=target_channel,
@@ -1722,6 +1792,7 @@ async def proactive_room_scanner() -> None:
         vibe=st.get("vibe", "chill"),
         is_test_mode=False,
         current_image_part=None,
+        online_members=online_members,
     )
 
 
@@ -1836,6 +1907,7 @@ async def on_message(message: discord.Message) -> None:
     if not is_message_from_bot:
         consecutive_bot_messages[message.channel.id] = 0
 
+    # Self-Message Loop Guard: Prevent runaway bot loops
     if is_message_from_bot and consecutive_bot_messages[message.channel.id] >= 1:
         return
 
@@ -1880,6 +1952,9 @@ async def on_message(message: discord.Message) -> None:
     user_id_str = str(message.author.id)
     user_aff = memory_state.get("user_affinity", {}).get(user_id_str, {"score": 0, "notes": []})
 
+    # Feature 2: Online presence summary for guild atmosphere
+    online_members = get_online_presence_summary(message.guild)
+
     # Step 1: Prefrontal Room-Reading (Groq llama-3.1-8b-instant)
     groq_decision = await call_groq_router(
         channel_msgs=channel_msgs_payload,
@@ -1890,6 +1965,7 @@ async def on_message(message: discord.Message) -> None:
         is_test_mode=is_test_mode,
         last_bot_statement=last_bot_statement,
         last_message_from_bot=is_message_from_bot,
+        online_members=online_members,
     )
 
     should_speak = groq_decision.get("should_speak", False)
@@ -1948,6 +2024,7 @@ async def on_message(message: discord.Message) -> None:
         vibe=st.get("vibe", "chill"),
         is_test_mode=is_test_mode,
         current_image_part=current_image_part,
+        online_members=online_members,
     )
 
 

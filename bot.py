@@ -1,7 +1,4 @@
-
-### `bot.py`
-
-```python
+python
 import os
 import sys
 import io
@@ -1675,4 +1672,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Shutdown completed.")
-```

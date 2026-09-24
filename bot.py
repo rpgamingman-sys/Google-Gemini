@@ -255,7 +255,16 @@ def sanitize_blacklist(text: str) -> str:
     for pattern, replacement in BANNED_WORDS_MAP.items():
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
     return text
-
+    
+def apply_device_styling(text: str, device_mode: str) -> str:
+    """Simulates authentic platform styling differences."""
+    if not text:
+        return text
+    if device_mode == "desktop":
+        text = text.lower()
+        if text.endswith(".") and not text.endswith(".."):
+            text = text[:-1]
+    return text
 
 def split_thought_bursts(text: str) -> List[str]:
     """Default to 1 message; split on ||| or drop secondary newline drafts."""

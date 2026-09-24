@@ -63,8 +63,8 @@ MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")
 logger.info(f"Persistent memory file target: {MEMORY_FILE}")
 
 # Model Configuration
-GEMINI_MODEL = "gemini-2.5-flash"
-GROQ_MODEL = "llama-3.1-8b-instant"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
 # Anti-AI tropes blacklist

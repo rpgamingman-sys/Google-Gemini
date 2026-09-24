@@ -257,16 +257,22 @@ def sanitize_blacklist(text: str) -> str:
     return text
 
 
-def apply_device_styling(text: str, device_mode: str) -> str:
-    """Simulates authentic platform styling differences."""
+def split_thought_bursts(text: str) -> List[str]:
+    """Default to 1 message; split on ||| or drop secondary newline drafts."""
+    text = text.strip()
     if not text:
-        return text
-    if device_mode == "desktop":
-        text = text.lower()
-        if text.endswith(".") and not text.endswith(".."):
-            text = text[:-1]
-    return text
+        return []
+    if "|||" in text:
+        parts = [part.strip() for part in text.split("|||") if part.strip()]
+        return parts[:3] if parts else []
+    
+    # HARD CODE GUARD: Discard secondary paragraph drafts
+    if "\n" in text:
+        paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+        return [paragraphs[0]] if paragraphs else []
 
+    return [text]
+    
 
 def split_thought_bursts(text: str) -> List[str]:
     """

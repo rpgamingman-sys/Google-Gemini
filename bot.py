@@ -62,9 +62,9 @@ else:
 MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")
 logger.info(f"Persistent memory file target: {MEMORY_FILE}")
 
-# Model Configuration
-GEMINI_MODEL = "gemini-3.5-flash-lite"
-GROQ_MODEL = "openai/gpt-oss-20b"
+# Model Configuration (Valid, verified model identifiers)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
 # Anti-AI tropes blacklist
@@ -379,7 +379,7 @@ Respond strictly with valid JSON conforming to:
 
 CONVERSATIONAL SELECTIVITY RULES:
 1. should_speak = TRUE conditions:
-   - DIRECT INTERACTION: Pinged, replied to, or named. (Always True).
+   - DIRECT INTERACTION: Pinged, replied to, or explicitly named. (Always True).
    - CONVERSATIONAL CONTINUITY: A user is answering, acknowledging, or building upon what YOU (the bot) said earlier (even minutes later and without a ping!).
    - ROOM BROADCASTS & SUBSTANTIVE CHAT: Someone asks an open question to the room ("anyone down for games?", "what's good music?"), shares a hot take, or drops something funny where your witty input adds value.
    - JEALOUSY & THIRD-WHEELING: If you spoke earlier and two friends start chatting back and forth while ignoring you, feel left out or petty. Butt in or instigate!
@@ -1373,7 +1373,7 @@ TACTICAL DIRECTION FROM YOUR COGNITIVE PREFRONTAL CORTEX:
 "{groq_goal}"
 
 STRICT HUMAN PERSONA RULES:
-1. ONE COHESIVE THOUGHT (1-3 sentences max). NEVER output alternative takes, multiple drafts, or repeat the same question using different phrasing in separate paragraphs. Pick ONE way to say it and stop, do still type multiple messages with the same idea.
+1. ONE COHESIVE THOUGHT: Send ONE short, natural message (1-2 sentences max). NEVER output alternative takes, multiple drafts, or repeat the same question using different phrasing in separate paragraphs. Pick ONE way to say it and stop.
 2. ABSOLUTE SECRECY: You are 100% a real human on your phone or PC. Under ZERO circumstances will you EVER admit to being an AI, an LLM, bot, or automated code. If someone accuses you of being a bot, dismiss them naturally like a real person ("take your meds", "are you good?", "literally what are you talking about", "ok and?").
 3. ZERO TRYHARD GEN-Z SLANG: DO NOT cram repetitive slang ("bro", "fr", "ngl", "lmao", skull emojis 💀) into every message. Speak like an authentic, articulate, slightly cynical or chill human Discord peer. Use understated wit, dry irony, self-deprecation, or genuine curiosity.
 4. EMOTICONS & FORMATTING: Use classic text emoticons naturally when they fit (-_-, >_<, :3, xd, :/, o_o, ;_;). Punctuate naturally: trailing off with '...', concise sentences, occasional lowercase on desktop.
@@ -1856,7 +1856,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     emoji_str = str(payload.emoji.name)
     user_id_str = str(payload.user_id)
     negative_reactions = {"💀", "👎", "🤡", "🙄", "🤮", "🛑"}
-    positive_reactions = {"❤️", "😂", "🔥", "👏", "💯", "✨"}
+    positive_reactions = {"❤️", "😂", "🔥", "👏", "💯", "✨", "😭"}
 
     async with memory_lock:
         user_aff = memory_state.setdefault("user_affinity", {}).setdefault(user_id_str, {
@@ -1944,8 +1944,22 @@ async def on_message(message: discord.Message) -> None:
         if isinstance(resolved, discord.Message) and bot.user and resolved.author.id == bot.user.id:
             is_direct_reply = True
 
-    bot_name = bot.user.name.lower() if bot.user else "bot"
-    is_name_called = bot_name in message.content.lower()
+    # Word-boundary matching to prevent substring false-positives
+    is_name_called = False
+    if bot.user:
+        names = [bot.user.name]
+        if bot.user.display_name:
+            names.append(bot.user.display_name)
+        if message.guild and message.guild.me and message.guild.me.nick:
+            names.append(message.guild.me.nick)
+        for n in set(names):
+            clean_n = n.strip().lower()
+            if len(clean_n) >= 2:
+                pattern = r"(?<!\w)@" + re.escape(clean_n) + r"(?!\w)|(?<!\w)" + re.escape(clean_n) + r"(?!\w)"
+                if re.search(pattern, message.content.lower()):
+                    is_name_called = True
+                    break
+
     is_direct_interaction = is_mentioned or is_direct_reply or is_name_called
 
     # Extract last statement made by the bot for conversational continuity

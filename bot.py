@@ -1361,6 +1361,14 @@ Your Active State:
 {sleep_instruction}
 {test_override_section}{fuzzy_prompt}{target_guidance}{favoritism_guidance}{mood_flavor}
 
+    test_override_section = ""
+    if is_test_mode:
+        test_override_section = """
+DEVELOPER TEST OVERRIDE IS ACTIVE:
+The user started their message with 'test'. Suppress sarcasm or deflections.
+Execute or clarify the requested test directly in your authentic human voice.
+"""
+
 TACTICAL DIRECTION FROM YOUR COGNITIVE PREFRONTAL CORTEX:
 "{groq_goal}"
 

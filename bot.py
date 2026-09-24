@@ -48,8 +48,8 @@ if not GROQ_API_KEY:
 AMSTERDAM_TZ = ZoneInfo("Europe/Amsterdam")
 MEMORY_FILE = "/data/memory.json"
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
-GEMINI_MODEL = "gemini-2.5-flash"
+GROQ_MODEL = "llama-3.1-8b-instant"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 # Blacklist of fantasy / anime / AI tropes
 BANNED_WORDS_MAP = {

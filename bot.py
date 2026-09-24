@@ -103,7 +103,6 @@ memory_state: Dict[str, Any] = {}
 recently_processed_messages: deque = deque(maxlen=400)
 
 # In-Memory Context Buffer (Anti-Rate-Limit Architecture)
-# channel_id -> deque of recent message records (maxlen=60)
 channel_buffers: Dict[int, deque] = defaultdict(lambda: deque(maxlen=60))
 
 # Conversational & Presence tracking
@@ -115,7 +114,7 @@ bot_last_spoke_time: Optional[datetime] = None
 current_device_mode: str = "desktop"  # "desktop" or "mobile"
 
 # ---------------------------------------------------------------------------
-# Atomic Memory Management
+# Persistent Memory Management & Recursive Schema Migration
 # ---------------------------------------------------------------------------
 DEFAULT_MEMORY = {
     "emotional_state": {
@@ -143,18 +142,36 @@ DEFAULT_MEMORY = {
 }
 
 
+def recursive_merge_defaults(target: Dict[str, Any], defaults: Dict[str, Any]) -> bool:
+    """Recursively injects missing keys from defaults into target dictionary."""
+    modified = False
+    for key, val in defaults.items():
+        if key not in target:
+            target[key] = json.loads(json.dumps(val))
+            modified = True
+        elif isinstance(val, dict) and isinstance(target[key], dict):
+            if recursive_merge_defaults(target[key], val):
+                modified = True
+    return modified
+
+
 def load_memory_state() -> Dict[str, Any]:
+    """Loads memory state with automatic schema migration to prevent KeyError crashes."""
     global memory_state
     if os.path.exists(MEMORY_FILE):
         try:
             with open(MEMORY_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                for key, val in DEFAULT_MEMORY.items():
-                    if key not in data:
-                        data[key] = val
-                memory_state = data
+
+            # Deep merge defaults to migrate older schemas safely
+            modified = recursive_merge_defaults(data, DEFAULT_MEMORY)
+            memory_state = data
+            if modified:
+                logger.info(f"Schema migrated: Updated missing keys in {MEMORY_FILE}")
+                save_memory_state(memory_state)
+            else:
                 logger.info(f"Loaded memory state successfully from {MEMORY_FILE}")
-                return memory_state
+            return memory_state
         except Exception as e:
             logger.error(f"Error reading {MEMORY_FILE}: {e}. Creating recovery backup.")
             try:
@@ -169,6 +186,7 @@ def load_memory_state() -> Dict[str, Any]:
 
 
 def save_memory_state(state: Dict[str, Any]) -> None:
+    """Atomically writes memory to prevent corruption on sudden restarts."""
     tmp_path = f"{MEMORY_FILE}.tmp"
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -291,16 +309,16 @@ def calculate_typing_delay(char_count: int, energy: float, vibe: str) -> float:
     """Calculates human typing duration based on character count, energy, and vibe."""
     if energy > 75.0 or vibe in ("hyper", "chaotic", "excited"):
         speed = 0.012
-        base = 0.4
+        base = 0.3
     elif energy < 35.0 or vibe in ("tired", "deadpan", "petty", "bored"):
         speed = 0.028
-        base = 0.9
+        base = 1.0
     else:
         speed = 0.018
         base = 0.5
 
     delay = base + (char_count * speed)
-    return min(4.0, max(0.4, delay))
+    return min(4.5, max(0.4, delay))
 
 
 # ---------------------------------------------------------------------------
@@ -643,7 +661,7 @@ async def execute_update_internal_mood_and_traits(
 ) -> Dict[str, Any]:
     """Allows autonomous state adjustment and trait evolution."""
     async with memory_lock:
-        st = memory_state["emotional_state"]
+        st = memory_state.get("emotional_state", {})
         if new_vibe:
             valid_vibes = [
                 "sad", "mad", "happy", "excited", "pushy", "love", "edgy", "annoyed",
@@ -651,8 +669,8 @@ async def execute_update_internal_mood_and_traits(
                 "petty", "chill", "introspective"
             ]
             st["vibe"] = new_vibe if new_vibe in valid_vibes else "chill"
-        st["energy"] = max(0.0, min(100.0, st["energy"] + energy_delta))
-        st["irritation"] = max(0.0, min(100.0, st["irritation"] + irritation_delta))
+        st["energy"] = max(0.0, min(100.0, st.get("energy", 65.0) + energy_delta))
+        st["irritation"] = max(0.0, min(100.0, st.get("irritation", 10.0) + irritation_delta))
         st["last_updated"] = datetime.now(AMSTERDAM_TZ).isoformat()
 
         if new_trait and new_trait.strip():
@@ -665,9 +683,9 @@ async def execute_update_internal_mood_and_traits(
         save_memory_state(memory_state)
     return {
         "status": "updated",
-        "current_vibe": st["vibe"],
-        "energy": st["energy"],
-        "irritation": st["irritation"],
+        "current_vibe": st.get("vibe", "chill"),
+        "energy": st.get("energy", 65.0),
+        "irritation": st.get("irritation", 10.0),
         "traits": memory_state.get("traits", []),
     }
 
@@ -1159,6 +1177,8 @@ async def dispatch_tool_call(
                 new_trait=args.get("new_trait"),
             )
         elif func_name == "react_to_message":
+            if not target_msg:
+                return {"error": "Target message unavailable to react."}
             return await execute_react_to_message(target_msg, args.get("emoji", "👀"))
         elif func_name == "create_server_emoji":
             if not guild:
@@ -1199,6 +1219,8 @@ async def dispatch_tool_call(
                 return {"error": "Guild context unavailable."}
             return await execute_remove_role(guild, args.get("username", ""), args.get("role_name", ""))
         elif func_name == "pin_message":
+            if not target_msg:
+                return {"error": "Target message unavailable to pin."}
             return await execute_pin_message(target_msg, args.get("reason", ""))
     except Exception as e:
         logger.error(f"Error executing tool {func_name}: {e}")
@@ -1377,8 +1399,8 @@ async def generate_unified_response(
 ) -> Optional[str]:
     speaker_id_str = str(trigger_message.author.id) if trigger_message else "0"
     speaker_name = trigger_message.author.display_name if trigger_message else "someone"
-    speaker_affinity = memory_state["user_affinity"].get(speaker_id_str, {"score": 0, "notes": []})
-    emotional_state = memory_state["emotional_state"]
+    speaker_affinity = memory_state.get("user_affinity", {}).get(speaker_id_str, {"score": 0, "notes": []})
+    emotional_state = memory_state.get("emotional_state", {})
     is_sleeping = is_amsterdam_sleeping()
 
     system_instruction = construct_system_prompt(
@@ -1430,7 +1452,7 @@ async def generate_unified_response(
 
 
 # ---------------------------------------------------------------------------
-# Single Unified Typing Session & Cadence Delivery (No Double-Typing)
+# Realistic Multi-Message Burst Cadence & "Thinking" Pauses
 # ---------------------------------------------------------------------------
 async def deliver_unified_cadence_response(
     channel: discord.abc.Messageable,
@@ -1443,12 +1465,11 @@ async def deliver_unified_cadence_response(
     current_image_part: Optional[types.Part],
 ) -> None:
     """
-    Unified typing session:
-    1. Opens typing indicator once.
-    2. Generates the response.
-    3. Sleeps the calculated human typing delay for fragment 0 INSIDE the active typing block.
-    4. Sends fragment 0 and immediately logs it into channel_buffers to prevent amnesia.
-    5. Sends subsequent fragments with realistic burst pauses and logs them.
+    Simulates authentic human typing and multi-message bursting:
+    1. Opens typing session, generates text, types Fragment 1 with dynamic delay, and sends.
+    2. Immediately records to channel_buffers to prevent amnesia.
+    3. Handles simulated typos with rapid asterisk corrections.
+    4. For subsequent bursts (|||), pauses to simulate thinking/reading, then activates typing session again.
     """
     global bot_last_spoke_time, bot_last_question_time, bot_last_question_channel_id, snub_already_triggered
     ch_id = getattr(channel, "id", 0)
@@ -1468,8 +1489,9 @@ async def deliver_unified_cadence_response(
     fragments: List[str] = []
     first_frag_typo: Tuple[str, Optional[str]] = ("", None)
 
+    # Initial Fragment: Single unified typing context wrapping generation and typing
     async with channel.typing():
-        # Human read delay
+        # Human reading pause
         await asyncio.sleep(random.uniform(0.3, 0.6))
 
         # Generate response (Gemini or Groq fallback)
@@ -1493,7 +1515,7 @@ async def deliver_unified_cadence_response(
         frag_0 = apply_device_styling(fragments[0], current_device_mode)
         first_frag_typo = apply_simulated_typo(frag_0)
 
-        # Human typing delay for first fragment inside the SAME typing context
+        # Human typing delay for first fragment inside active typing context
         initial_delay = calculate_typing_delay(len(first_frag_typo[0]), energy, vibe)
         await asyncio.sleep(initial_delay)
         sent_msg_0 = await channel.send(first_frag_typo[0])
@@ -1513,16 +1535,24 @@ async def deliver_unified_cadence_response(
         bot_last_question_channel_id = ch_id
         snub_already_triggered = False
 
-    # Subsequent fragments (if any, max 1-2 splits)
+    # Multi-Message Thought Bursts: Realistic thinking/hesitation pause before Fragment 2+
     if len(fragments) > 1:
         for frag in fragments[1:]:
-            burst_pause = random.uniform(0.6, 1.2)
-            await asyncio.sleep(burst_pause)
+            # Simulated Thinking Pause (idle, not typing, hesitating or reading previous line)
+            if energy > 70.0 or vibe in ("hyper", "chaotic", "excited"):
+                thinking_pause = random.uniform(0.6, 1.2)
+            elif energy < 40.0 or vibe in ("tired", "deadpan", "petty", "bored"):
+                thinking_pause = random.uniform(1.4, 2.4)
+            else:
+                thinking_pause = random.uniform(0.8, 1.8)
+
+            await asyncio.sleep(thinking_pause)
 
             styled_frag = apply_device_styling(frag, current_device_mode)
             typo_text, correction = apply_simulated_typo(styled_frag)
             frag_delay = calculate_typing_delay(len(typo_text), energy, vibe)
 
+            # Re-engage typing indicator for the follow-up burst
             async with channel.typing():
                 await asyncio.sleep(frag_delay)
                 sub_msg = await channel.send(typo_text)
@@ -1548,18 +1578,18 @@ async def emotional_decay_and_snub_loop() -> None:
     """Smoothly decays irritation and detects snubs if bot questions go unanswered."""
     global snub_already_triggered
     async with memory_lock:
-        st = memory_state["emotional_state"]
-        # Irritation half-life ~20-30 mins
-        st["irritation"] = max(0.0, st["irritation"] * 0.965)
-        st["vulnerability"] = max(20.0, st["vulnerability"] * 0.98)
-        st["energy"] = max(20.0, min(95.0, st["energy"] * 0.99 + 0.3))
-        st["boredom"] = min(100.0, st["boredom"] + 0.5)
+        st = memory_state.get("emotional_state", {})
+        # Irritation half-life ~20-30 mins using defensive lookups
+        st["irritation"] = max(0.0, st.get("irritation", 10.0) * 0.965)
+        st["vulnerability"] = max(20.0, st.get("vulnerability", 40.0) * 0.98)
+        st["energy"] = max(20.0, min(95.0, st.get("energy", 65.0) * 0.99 + 0.3))
+        st["boredom"] = min(100.0, st.get("boredom", 30.0) + 0.5)
 
         # Snub check: if the bot asked something and was ignored for >5 minutes
         if bot_last_question_time is not None and not snub_already_triggered:
             elapsed = (datetime.now(timezone.utc) - bot_last_question_time).total_seconds()
             if elapsed > 300:
-                st["irritation"] = min(100.0, st["irritation"] + 18.0)
+                st["irritation"] = min(100.0, st.get("irritation", 10.0) + 18.0)
                 st["vibe"] = "petty"
                 st["last_snubbed_timestamp"] = datetime.now(AMSTERDAM_TZ).isoformat()
                 snub_already_triggered = True
@@ -1585,7 +1615,7 @@ async def dynamic_presence_loop() -> None:
         )
         return
 
-    vibe = memory_state["emotional_state"].get("vibe", "chill")
+    vibe = memory_state.get("emotional_state", {}).get("vibe", "chill")
     daytime_statuses = [
         ("desktop", discord.Activity(type=discord.ActivityType.playing, name="Elden Ring")),
         ("desktop", discord.Activity(type=discord.ActivityType.playing, name="Silksong")),
@@ -1634,7 +1664,7 @@ async def proactive_room_scanner() -> None:
                     record_buffer_message(channel.id, bot.user.display_name if bot.user else "me", callout_text, sent_callout.id)
                     return
 
-    # Check buffer for recent context
+    # Inactivity Tracking: Compare current time against the channel's actual last message
     records = list(channel_buffers[channel.id])
     if not records:
         return
@@ -1682,7 +1712,7 @@ async def proactive_room_scanner() -> None:
     # 4. Late callbacks (reference previous topics discussed earlier)
     if 7200 < time_since_last_activity < 10800 and random.random() < 0.20:
         callback_goal = "You haven't chatted in a couple hours. Drop a brief casual callback to what was discussed earlier or ask if they made progress."
-        st = memory_state["emotional_state"]
+        st = memory_state.get("emotional_state", {})
         await deliver_unified_cadence_response(
             channel=channel,  # type: ignore
             trigger_message=trigger_message,
@@ -1695,10 +1725,10 @@ async def proactive_room_scanner() -> None:
         )
         return
 
-    # 5. Dead chat reviver (>3 hours of total silence)
+    # 5. Dead chat reviver (>3 hours of total silence in the channel)
     if time_since_last_activity > 10800:
         reviver_goal = "The channel has been completely dead for over 3 hours. Drop an unprompted dry observation, a weird finding, or start a casual thought."
-        st = memory_state["emotional_state"]
+        st = memory_state.get("emotional_state", {})
         await deliver_unified_cadence_response(
             channel=channel,  # type: ignore
             trigger_message=trigger_message,
@@ -1751,19 +1781,19 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     positive_reactions = {"❤️", "😂", "🔥", "👏", "💯", "✨"}
 
     async with memory_lock:
-        user_aff = memory_state["user_affinity"].setdefault(user_id_str, {
+        user_aff = memory_state.setdefault("user_affinity", {}).setdefault(user_id_str, {
             "score": 0,
             "interaction_count": 0,
             "notes": [],
             "last_interaction": datetime.now(timezone.utc).isoformat(),
         })
-        st = memory_state["emotional_state"]
+        st = memory_state.get("emotional_state", {})
 
         if emoji_str in negative_reactions:
-            user_aff["score"] = max(-100, user_aff["score"] - 5)
-            st["irritation"] = min(100.0, st["irritation"] + 6.0)
+            user_aff["score"] = max(-100, user_aff.get("score", 0) - 5)
+            st["irritation"] = min(100.0, st.get("irritation", 10.0) + 6.0)
             st["vibe"] = "flustered"
-            memory_state["feedback_history"].append({
+            memory_state.setdefault("feedback_history", []).append({
                 "message": msg.content[:100],
                 "reaction": emoji_str,
                 "status": "cringed",
@@ -1772,11 +1802,11 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
             save_memory_state(memory_state)
 
         elif emoji_str in positive_reactions:
-            user_aff["score"] = min(100, user_aff["score"] + 5)
-            st["irritation"] = max(0.0, st["irritation"] - 4.0)
-            st["playfulness"] = min(100.0, st["playfulness"] + 4.0)
+            user_aff["score"] = min(100, user_aff.get("score", 0) + 5)
+            st["irritation"] = max(0.0, st.get("irritation", 10.0) - 4.0)
+            st["playfulness"] = min(100.0, st.get("playfulness", 55.0) + 4.0)
             st["vibe"] = "happy"
-            memory_state["feedback_history"].append({
+            memory_state.setdefault("feedback_history", []).append({
                 "message": msg.content[:100],
                 "reaction": emoji_str,
                 "status": "validated",
@@ -1828,16 +1858,16 @@ async def on_message(message: discord.Message) -> None:
         bot_last_question_time = None
         snub_already_triggered = False
 
-    # Update affinity interactions
+    # Update affinity interactions defensively
     user_id_str = str(message.author.id)
     async with memory_lock:
-        user_aff = memory_state["user_affinity"].setdefault(user_id_str, {
+        user_aff = memory_state.setdefault("user_affinity", {}).setdefault(user_id_str, {
             "score": 0,
             "interaction_count": 0,
             "notes": [],
             "last_interaction": datetime.now(timezone.utc).isoformat(),
         })
-        user_aff["interaction_count"] += 1
+        user_aff["interaction_count"] = user_aff.get("interaction_count", 0) + 1
         user_aff["last_interaction"] = datetime.now(timezone.utc).isoformat()
         save_memory_state(memory_state)
 
@@ -1863,9 +1893,8 @@ async def on_message(message: discord.Message) -> None:
         re.IGNORECASE,
     ))
 
-    # Ambient probability roll (~8-12%)
+    # Ambient probability roll (~10%)
     ambient_roll = random.random() < 0.10
-
     is_sleeping = is_amsterdam_sleeping()
 
     # Rule to invoke Groq Router: only when forced, broadcast, or ambient roll hits
@@ -1884,7 +1913,7 @@ async def on_message(message: discord.Message) -> None:
     # Step 1: Run Groq Prefrontal Cortex Router
     groq_decision = await call_groq_router(
         channel_msgs=channel_msgs_payload,
-        emotional_state=memory_state["emotional_state"],
+        emotional_state=memory_state.get("emotional_state", {}),
         speaker_affinity=user_aff,
         is_sleeping=is_sleeping,
         is_forced_trigger=is_forced_trigger,
@@ -1908,15 +1937,15 @@ async def on_message(message: discord.Message) -> None:
     if not should_speak and not is_forced_trigger:
         return
 
-    # Apply Groq's suggested emotional shift
+    # Apply Groq's suggested emotional shift defensively
     shift = groq_decision.get("emotional_shift", {})
     if shift:
         async with memory_lock:
-            st = memory_state["emotional_state"]
+            st = memory_state.get("emotional_state", {})
             if shift.get("vibe"):
                 st["vibe"] = shift["vibe"]
-            st["energy"] = max(0.0, min(100.0, st["energy"] + shift.get("energy_delta", 0.0)))
-            st["irritation"] = max(0.0, min(100.0, st["irritation"] + shift.get("irritation_delta", 0.0)))
+            st["energy"] = max(0.0, min(100.0, st.get("energy", 65.0) + shift.get("energy_delta", 0.0)))
+            st["irritation"] = max(0.0, min(100.0, st.get("irritation", 10.0) + shift.get("irritation_delta", 0.0)))
             save_memory_state(memory_state)
 
     # Step 2: Vision & Context Hygiene
@@ -1950,8 +1979,8 @@ async def on_message(message: discord.Message) -> None:
                 except Exception as e:
                     logger.debug(f"Attachment image ingestion error: {e}")
 
-    # Step 3: Single Unified Typing Session & Cadence Delivery (No Double-Typing)
-    st = memory_state["emotional_state"]
+    # Step 3: Single Unified Typing Session & Cadence Delivery
+    st = memory_state.get("emotional_state", {})
     await deliver_unified_cadence_response(
         channel=message.channel,
         trigger_message=message,

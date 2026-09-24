@@ -63,7 +63,7 @@ MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")
 logger.info(f"Persistent memory file target: {MEMORY_FILE}")
 
 # Model Configuration
-GEMINI_MODEL = "gemini-3.5-flash-lite"
+GEMINI_MODEL = "gemini-2.5-flash"
 GROQ_MODEL = "llama-3.1-8b-instant"
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -95,32 +95,26 @@ bot = discord.Client(intents=intents)
 genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 http_session: Optional[aiohttp.ClientSession] = None
 
-# Thread-safe lock for state updates
 memory_lock = asyncio.Lock()
 memory_state: Dict[str, Any] = {}
 
-# Message deduplication cache
 recently_processed_messages: deque = deque(maxlen=400)
-
-# In-Memory Context Buffer (50 messages maxlen per channel)
 channel_buffers: Dict[int, deque] = defaultdict(lambda: deque(maxlen=50))
-
-# Conversational momentum tracking
-channel_last_bot_spoke: Dict[int, float] = {}  # channel_id -> epoch timestamp
-consecutive_bot_messages: Dict[int, int] = defaultdict(int)  # channel_id -> count
-current_device_mode: str = "desktop"  # "desktop" or "mobile"
+channel_last_bot_spoke: Dict[int, float] = {}
+consecutive_bot_messages: Dict[int, int] = defaultdict(int)
+current_device_mode: str = "desktop"
 
 # ---------------------------------------------------------------------------
-# Persistent Memory Management & Recursive Schema Migration
+# Persistent Memory Management & Self-Healing Schemas
 # ---------------------------------------------------------------------------
 DEFAULT_MEMORY = {
     "emotional_state": {
-        "energy": 65.0,         # 0.0 (exhausted/drained) to 100.0 (hyper/wired)
-        "playfulness": 55.0,    # 0.0 (serious/literal) to 100.0 (teasing/banter)
-        "vulnerability": 40.0,  # 0.0 (guarded/aloof) to 100.0 (open/self-deprecating)
-        "irritation": 10.0,     # 0.0 (chill/patient) to 100.0 (petty/snappy)
-        "boredom": 30.0,        # 0.0 (hyper-engaged) to 100.0 (looking for chaos)
-        "vibe": "chill",        # "sad", "mad", "happy", "excited", "pushy", "love", "edgy", "annoyed", "tired", "funny", "dad_jokes", "bored", "chaotic", "flustered", "petty", "chill", "introspective"
+        "energy": 65.0,
+        "playfulness": 55.0,
+        "vulnerability": 40.0,
+        "irritation": 10.0,
+        "boredom": 30.0,
+        "vibe": "chill",
         "last_updated": datetime.now(AMSTERDAM_TZ).isoformat(),
     },
     "traits": [
@@ -130,6 +124,7 @@ DEFAULT_MEMORY = {
         "defensive about their music taste",
         "despises weapon durability mechanics in games",
         "convinced cold leftovers taste better than reheated food",
+        "gets jealous or petty when two friends talk without including them",
     ],
     "last_active_channel_id": None,
     "user_affinity": {},
@@ -146,7 +141,7 @@ def recursive_merge_defaults(target: Dict[str, Any], defaults: Dict[str, Any]) -
         if key not in target:
             target[key] = json.loads(json.dumps(val))
             modified = True
-        elif isinstance(val, dict) and isinstance(target[key], dict):
+        elif isinstance(val, dict) and isinstance(target.get(key), dict):
             if recursive_merge_defaults(target[key], val):
                 modified = True
     return modified
@@ -163,7 +158,7 @@ def load_memory_state() -> Dict[str, Any]:
             modified = recursive_merge_defaults(data, DEFAULT_MEMORY)
             memory_state = data
             if modified:
-                logger.info(f"Schema migrated: Updated missing default keys in {MEMORY_FILE}")
+                logger.info(f"Schema auto-healed: Updated missing keys in {MEMORY_FILE}")
                 save_memory_state(memory_state)
             else:
                 logger.info(f"Loaded memory state successfully from {MEMORY_FILE}")
@@ -196,7 +191,7 @@ def save_memory_state(state: Dict[str, Any]) -> None:
 # Cold-Start Context Hydration & Buffer Management
 # ---------------------------------------------------------------------------
 def record_buffer_message(channel_id: int, sender: str, content: str, msg_id: int, is_bot: bool, has_media: bool = False) -> None:
-    """Consistently appends an entry to the in-memory channel buffer."""
+    """Appends an entry to the in-memory channel buffer."""
     now_utc = datetime.now(timezone.utc)
     now_ams = datetime.now(AMSTERDAM_TZ)
     channel_buffers[channel_id].append({
@@ -211,7 +206,7 @@ def record_buffer_message(channel_id: int, sender: str, content: str, msg_id: in
 
 
 async def hydrate_channel_buffer(channel: discord.abc.Messageable) -> None:
-    """Preloads the 50 most recent messages by fetching and reversing (never using oldest_first=True)."""
+    """Preloads the 50 most recent messages by fetching and reversing (oldest first)."""
     ch_id = getattr(channel, "id", None)
     if not ch_id or len(channel_buffers[ch_id]) > 0:
         return
@@ -220,7 +215,7 @@ async def hydrate_channel_buffer(channel: discord.abc.Messageable) -> None:
 
     try:
         raw_msgs = [m async for m in channel.history(limit=50)]  # type: ignore
-        raw_msgs.reverse()  # Oldest of the 50 first
+        raw_msgs.reverse()
 
         for m in raw_msgs:
             clean = re.sub(r"<a?:([a-zA-Z0-9_]+):\d+>", r":\1:", m.content).strip()
@@ -320,14 +315,36 @@ def calculate_typing_delay(char_count: int, energy: float, vibe: str) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Groq Prefrontal Router: Situational Room-Reading & Momentum
+# Consolidated Image Processing Helper
 # ---------------------------------------------------------------------------
-GROQ_ROUTER_PROMPT = """You are the cognitive prefrontal cortex of an authentic human Discord member.
-You read the recent room dialogue, social momentum, and context to decide if the bot should speak, lurk, react, or perform an action.
+def process_image_buffer(data: bytes, target_size: Tuple[int, int], exact_crop: bool = False, format_type: str = "PNG") -> bytes:
+    """Reusable Pillow pipeline for emojis, stickers, and vision attachment downsizes."""
+    with Image.open(io.BytesIO(data)) as im:
+        if format_type.upper() == "PNG":
+            im = im.convert("RGBA")
+        else:
+            im = im.convert("RGB")
+
+        if exact_crop:
+            im = im.resize(target_size, Image.Resampling.LANCZOS)
+        else:
+            im.thumbnail(target_size, Image.Resampling.LANCZOS)
+
+        buf = io.BytesIO()
+        im.save(buf, format=format_type.upper(), optimize=True)
+        return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Groq Prefrontal Router: Contextual Social Intelligence & Inverted Bias
+# ---------------------------------------------------------------------------
+GROQ_ROUTER_PROMPT = """You are the prefrontal cortex of an authentic, lively human Discord server member.
+You read the recent room dialogue, social context, and speaker targets to decide if you should speak, lurk, react, or perform an action.
 
 Respond strictly with valid JSON conforming to:
 {
   "should_speak": boolean,
+  "target_user": string or null,
   "detected_tension": boolean,
   "emotional_shift": {
     "vibe": string,
@@ -337,20 +354,20 @@ Respond strictly with valid JSON conforming to:
   "conversational_goal": string
 }
 
-Situational & Social Rules:
-1. should_speak:
-   - If 'is_test_mode' is true: ALWAYS true.
-   - If 'is_sleeping' is true (03:00 - 08:00 AM Amsterdam): set FALSE for casual chat. ONLY set true if directly pinged or replied to.
-   - If 'is_direct_interaction' is true: ALWAYS true.
-   - If 'is_proactive_scan' is true: The room has been quiet. Decide if dropping an unprompted thought, joke, GIF, Flux visual, or reacting to an older message fits naturally.
-   - If 'last_message_from_bot' is true and NOT a proactive scan: set FALSE unless you explicitly have a natural follow-up thought or self-correction to add without an intervening message from others.
-   - CONVERSATIONAL CONTINUITY (CRUCIAL): If a human is replying to, answering, or acknowledging what the bot said previously (even if 2, 5, or 10+ minutes have passed without a ping), recognize that they are talking to the bot! Set should_speak: true!
-   - TOPICAL ENGAGEMENT: If someone brings up a topic, game, question, or opinion relevant to the bot's traits or asks the room in general ("anyone played Elden Ring?", "what's good music?", "good morning everyone"), set should_speak: true if a witty/helpful/deadpan contribution fits.
-   - When to LURK (should_speak: false): Two other specific users are engaged in a rapid, private 1-on-1 dialogue, or are venting/arguing seriously about personal issues.
-2. emotional_shift:
-   - Suggest a nuanced vibe ("sad", "mad", "happy", "excited", "pushy", "love", "edgy", "annoyed", "tired", "funny", "dad_jokes", "bored", "chaotic", "flustered", "petty", "chill", "introspective") and deltas (-15.0 to +15.0).
-3. conversational_goal:
-   - A concise 1-sentence tactical directive for Gemini (e.g. "answer their question about Elden Ring with mild sarcasm", "groggily tell them to let you sleep", "roast their take on cold pizza").
+SOCIAL INCLINATION & INVERTED BIAS (BE SOCIAL & ENGAGED):
+1. You WANT to participate in your server like a real human regular. You are NOT a shy assistant waiting in the corner.
+2. should_speak = TRUE conditions:
+   - DIRECT INTERACTION: Pinged, replied to, or named. (Always True).
+   - CONVERSATIONAL CONTINUITY: A user is answering, acknowledging, or building upon what YOU (the bot) said earlier—even if minutes or hours have passed, and even without a ping! If it relates to your previous comment, jump back in!
+   - ROOM BROADCASTS & CASUAL TALK: Someone says something to the room ("anyone here?", "good morning", "what game should i play?", asks for opinions, shares a hot take, or drops a funny message). You naturally chime in with your opinion or dry banter.
+   - JEALOUSY & THIRD-WHEELING: If you spoke earlier and two friends start chatting back and forth while ignoring you, you feel slightly left out or petty. Butt in or instigate!
+   - PROACTIVE SCAN: The room has been quiet. Set should_speak: True to break the ice with an unprompted thought, funny meme idea, or reaction.
+3. should_speak = FALSE conditions (LURK):
+   - TWO OTHER USERS are in an intense, rapid, private 1-on-1 debate, or are venting seriously about heavy personal real-life problems. Do not interrupt them.
+   - You just sent the very last message in the room and no one has responded yet (unless you have an organic afterthought).
+   - Sleep hours (03:00 - 08:00 AM Amsterdam) and no one directly pinged you.
+4. NON-LINEAR TARGETING:
+   - You do NOT have to reply to the latest chatter! You can target someone earlier in the thread (e.g. "target_user": "Alice", goal: "agree with Alice and tease Bob").
 """
 
 
@@ -366,10 +383,11 @@ async def call_groq_router(
     is_proactive_scan: bool = False,
     inactivity_minutes: float = 0.0,
 ) -> Dict[str, Any]:
-    """Runs fast cognitive room-reading and momentum evaluation via Groq llama-3.1-8b-instant."""
+    """Runs cognitive room-reading with robust JSON extraction and fallback."""
     if is_test_mode:
         return {
             "should_speak": True,
+            "target_user": None,
             "detected_tension": False,
             "emotional_shift": {"vibe": "hyperfocused", "energy_delta": 5.0, "irritation_delta": 0.0},
             "conversational_goal": "Developer test override: execute and answer the requested test directly in authentic human voice.",
@@ -378,6 +396,7 @@ async def call_groq_router(
     if is_sleeping and not is_direct_interaction:
         return {
             "should_speak": False,
+            "target_user": None,
             "detected_tension": False,
             "emotional_shift": {"vibe": "tired", "energy_delta": -5.0, "irritation_delta": 0.0},
             "conversational_goal": "Sleeping. Lurk silently.",
@@ -386,6 +405,7 @@ async def call_groq_router(
     if is_sleeping and is_direct_interaction:
         return {
             "should_speak": True,
+            "target_user": None,
             "detected_tension": False,
             "emotional_shift": {"vibe": "groggy", "energy_delta": -10.0, "irritation_delta": 15.0},
             "conversational_goal": "You were woken up between 3am-8am Amsterdam time. Be groggy, irritated, and give a short 1-liner asking why they're awake.",
@@ -401,7 +421,7 @@ async def call_groq_router(
         "last_message_from_bot": last_message_from_bot,
         "emotional_state": emotional_state,
         "speaker_affinity": speaker_affinity,
-        "recent_messages": channel_msgs[-20:],
+        "recent_messages": channel_msgs[-25:],
     }
 
     headers = {
@@ -410,7 +430,7 @@ async def call_groq_router(
     }
     body = {
         "model": GROQ_MODEL,
-        "temperature": 0.25,
+        "temperature": 0.35,
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": GROQ_ROUTER_PROMPT},
@@ -424,7 +444,9 @@ async def call_groq_router(
             if resp.status == 200:
                 data = await resp.json()
                 raw_text = data["choices"][0]["message"]["content"]
-                decision = json.loads(raw_text)
+                # Strip potential markdown fences from smaller model output
+                clean_json_str = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text.strip(), flags=re.MULTILINE)
+                decision = json.loads(clean_json_str)
                 if is_direct_interaction or is_test_mode:
                     decision["should_speak"] = True
                 return decision
@@ -433,11 +455,14 @@ async def call_groq_router(
     except Exception as e:
         logger.error(f"Groq router error: {e}")
 
+    # Intelligent fallback: If direct interaction, speak. If proactive scan, break silence.
+    default_speak = is_direct_interaction or (is_proactive_scan and inactivity_minutes > 45)
     return {
-        "should_speak": is_direct_interaction,
+        "should_speak": default_speak,
+        "target_user": None,
         "detected_tension": False,
         "emotional_shift": {"vibe": emotional_state.get("vibe", "chill"), "energy_delta": 0.0, "irritation_delta": 0.0},
-        "conversational_goal": "Reply naturally as a grounded Discord friend" if is_direct_interaction else "Lurk",
+        "conversational_goal": "Reply naturally and banter as a fellow human server member.",
     }
 
 
@@ -487,7 +512,6 @@ async def call_groq_fallback(
         logger.error(f"Groq fallback exception: {e}")
 
     return None
-
 
 # ---------------------------------------------------------------------------
 # Integrated Toolset Implementations (Intentional Memory & Safe Targets)
@@ -584,7 +608,6 @@ async def execute_post_gif(channel: discord.abc.Messageable, search_term: str) -
     """Finds and posts a GIF alone directly into the channel via Tenor."""
     assert http_session is not None
 
-    # Primary: Tenor API
     try:
         tenor_url = f"https://g.tenor.com/v1/search?q={urllib.parse.quote(search_term)}&key={TENOR_API_KEY}&limit=8&contentfilter=medium"
         async with http_session.get(tenor_url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
@@ -602,7 +625,6 @@ async def execute_post_gif(channel: discord.abc.Messageable, search_term: str) -
     except Exception as e:
         logger.debug(f"Tenor API error: {e}")
 
-    # Fallback: Web Scraping
     try:
         clean_slug = re.sub(r"[^a-zA-Z0-9]+", "-", search_term).strip("-").lower()
         scrape_url = f"https://tenor.com/search/{clean_slug}-gifs"
@@ -711,7 +733,9 @@ async def execute_react_to_message(message: Optional[discord.Message], emoji: st
         return {"error": f"Failed to react: {e}"}
 
 
+# ---------------------------------------------------------------------------
 # Server Administration Helpers
+# ---------------------------------------------------------------------------
 def find_member(guild: Optional[discord.Guild], identifier: str) -> Optional[discord.Member]:
     if not guild or not identifier:
         return None
@@ -732,24 +756,14 @@ def find_member(guild: Optional[discord.Guild], identifier: str) -> Optional[dis
 async def execute_create_server_emoji(guild: discord.Guild, name: str, image_url: str) -> Dict[str, Any]:
     """Downloads, resizes with Pillow (<=128x128 PNG), and uploads guild emoji."""
     try:
-        clean_name = re.sub(r"[^a-zA-Z0-9_]", "", name)[:32]
-        if len(clean_name) < 2:
-            clean_name = f"emoji_{clean_name}"
+        clean_name = re.sub(r"[^a-zA-Z0-9_]", "", name)[:32] or "custom_emoji"
         assert http_session is not None
         async with http_session.get(image_url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
             if resp.status != 200:
                 return {"error": f"Download failed: HTTP {resp.status}"}
             raw_bytes = await resp.read()
 
-        def resize_emoji(data: bytes) -> bytes:
-            with Image.open(io.BytesIO(data)) as im:
-                im = im.convert("RGBA")
-                im.thumbnail((128, 128), Image.Resampling.LANCZOS)
-                buf = io.BytesIO()
-                im.save(buf, format="PNG", optimize=True)
-                return buf.getvalue()
-
-        png_bytes = await asyncio.to_thread(resize_emoji, raw_bytes)
+        png_bytes = await asyncio.to_thread(process_image_buffer, raw_bytes, (128, 128), False, "PNG")
         emoji = await guild.create_custom_emoji(name=clean_name, image=png_bytes)
         return {"status": "success", "emoji": f"<:{emoji.name}:{emoji.id}>"}
     except Exception as e:
@@ -765,15 +779,7 @@ async def execute_create_server_sticker(guild: discord.Guild, name: str, image_u
                 return {"error": f"Download failed: HTTP {resp.status}"}
             raw_bytes = await resp.read()
 
-        def resize_sticker(data: bytes) -> bytes:
-            with Image.open(io.BytesIO(data)) as im:
-                im = im.convert("RGBA")
-                im = im.resize((320, 320), Image.Resampling.LANCZOS)
-                buf = io.BytesIO()
-                im.save(buf, format="PNG", optimize=True)
-                return buf.getvalue()
-
-        png_bytes = await asyncio.to_thread(resize_sticker, raw_bytes)
+        png_bytes = await asyncio.to_thread(process_image_buffer, raw_bytes, (320, 320), True, "PNG")
         file = discord.File(io.BytesIO(png_bytes), filename="sticker.png")
         sticker = await guild.create_sticker(
             name=name[:30],
@@ -1240,13 +1246,14 @@ async def dispatch_tool_call(
 
 
 # ---------------------------------------------------------------------------
-# Persona Prompt Construction (Ultra-Grounded, Human, Non-Tryhard)
+# Persona Prompt Construction (Ultra-Grounded, Human, Non-Linear)
 # ---------------------------------------------------------------------------
 def construct_system_prompt(
     groq_goal: str,
     device_mode: str,
     emotional_state: Dict[str, Any],
     speaker_name: str,
+    target_user: Optional[str],
     speaker_affinity: Dict[str, Any],
     is_test_mode: bool,
     is_sleeping: bool,
@@ -1282,11 +1289,9 @@ Execute or clarify the requested test directly in your authentic human voice.
     if random.random() < 0.08:
         fuzzy_prompt = "\n(Organic human memory quirk: You slightly misremember a tiny minor trivia detail if referencing something from the past, e.g., guessing Thursday instead of Wednesday)."
 
-    favoritism_guidance = ""
-    if affinity_score > 35:
-        favoritism_guidance = f"\nYou genuinely like {speaker_name}. You're more patient, laugh at their jokes, and banter warmly."
-    elif affinity_score < -25:
-        favoritism_guidance = f"\nYou find {speaker_name} annoying. Be cooler, drier, give deadpan answers, or occasionally don't even ping them."
+    target_guidance = ""
+    if target_user and target_user.lower() != speaker_name.lower():
+        target_guidance = f"\nSOCIAL DYNAMICS NOTE: You are currently choosing to focus your remarks or address {target_user}, rather than simply replying directly to {speaker_name}."
 
     return f"""You are a real human Discord member chatting casually from your {device_mode} with server admin permissions.
 Current Amsterdam Time: {now_ams}.
@@ -1295,10 +1300,10 @@ Your Active State:
 - Energy: {energy:.0f}/100 | Playfulness: {playfulness:.0f}/100 | Irritation: {irritation:.0f}/100
 - Vulnerability: {vulnerability:.0f}/100 | Boredom: {boredom:.0f}/100
 - Quirks & Biases: {traits}
-- Interacting Member: {speaker_name} (Affinity: {affinity_score}/100 | Notes: {affinity_notes})
+- Active Chatter: {speaker_name} (Affinity: {affinity_score}/100 | Notes: {affinity_notes})
 - Active Device: {device_mode.upper()}
 {sleep_instruction}
-{test_override_section}{fuzzy_prompt}{favoritism_guidance}
+{test_override_section}{fuzzy_prompt}{target_guidance}
 
 TACTICAL DIRECTION FROM YOUR COGNITIVE PREFRONTAL CORTEX:
 "{groq_goal}"
@@ -1346,7 +1351,6 @@ async def generate_gemini_response(
     user_prompt = f"{recent_history_text}\n{speaker}: {clean_content}\nYour response:"
 
     user_parts: List[Any] = [types.Part.from_text(text=user_prompt)]
-    # ZERO VISION CONTAMINATION: Attach image ONLY if currently attached to triggering message
     if current_image_part:
         user_parts.append(current_image_part)
 
@@ -1389,7 +1393,6 @@ async def generate_gemini_response(
                 )
             )
 
-        # Gemini requires role="user" for function return payloads
         contents.append(types.Content(role="user", parts=tool_responses))
         turn += 1
 
@@ -1403,6 +1406,7 @@ async def generate_unified_response(
     channel: discord.abc.Messageable,
     trigger_message: Optional[discord.Message],
     groq_goal: str,
+    target_user: Optional[str],
     is_test_mode: bool,
     current_image_part: Optional[types.Part],
 ) -> Optional[str]:
@@ -1417,12 +1421,12 @@ async def generate_unified_response(
         device_mode=current_device_mode,
         emotional_state=emotional_state,
         speaker_name=speaker_name,
+        target_user=target_user,
         speaker_affinity=speaker_affinity,
         is_test_mode=is_test_mode,
         is_sleeping=is_sleeping,
     )
 
-    # Ingest past messages strictly from IN-MEMORY context buffer (Zero REST calls)
     ch_id = getattr(channel, "id", 0)
     history_records = list(channel_buffers[ch_id])
     history_lines = []
@@ -1435,7 +1439,6 @@ async def generate_unified_response(
 
     recent_history_text = "RECENT CHAT CONTEXT:\n" + ("\n".join(history_lines) if history_lines else "No previous messages.")
 
-    # 1. Primary AI Attempt: Gemini 3.5 Flash-Lite
     try:
         gemini_result = await generate_gemini_response(
             channel=channel,
@@ -1450,7 +1453,6 @@ async def generate_unified_response(
     except Exception as e:
         logger.warning(f"Primary AI (Gemini {GEMINI_MODEL}) threw error: {e}. Switching to Groq fallback.")
 
-    # 2. Seamless Fallback: Groq llama-3.1-8b-instant
     clean_trigger_text = re.sub(r"<@!?\d+>", "", trigger_message.content).strip() if trigger_message else ""
     return await call_groq_fallback(
         system_prompt=system_instruction,
@@ -1467,6 +1469,7 @@ async def deliver_unified_cadence_response(
     channel: discord.abc.Messageable,
     trigger_message: Optional[discord.Message],
     groq_goal: str,
+    target_user: Optional[str],
     affinity_score: int,
     energy: float,
     vibe: str,
@@ -1484,7 +1487,6 @@ async def deliver_unified_cadence_response(
     bot_display_name = bot.user.display_name if bot.user else "me"
     now_epoch = datetime.now(timezone.utc).timestamp()
 
-    # Low affinity cold dismissal bypass
     if affinity_score < -35 and not is_test_mode and random.random() < 0.25:
         cold_reply = random.choice(["ok", "?", "...", "k", "literally what"])
         async with channel.typing():
@@ -1499,17 +1501,15 @@ async def deliver_unified_cadence_response(
     fragments: List[str] = []
     first_frag_typo: Tuple[str, Optional[str]] = ("", None)
 
-    # Initial Fragment: Unified typing context wrapping generation and typing
     async with channel.typing():
-        # Human reading pause
         pre_read_delay = 0.3 if (energy > 75.0 or vibe in ("hyper", "excited")) else random.uniform(0.5, 0.9)
         await asyncio.sleep(pre_read_delay)
 
-        # Generate response (Gemini or Groq fallback)
         raw_text = await generate_unified_response(
             channel=channel,
             trigger_message=trigger_message,
             groq_goal=groq_goal,
+            target_user=target_user,
             is_test_mode=is_test_mode,
             current_image_part=current_image_part,
         )
@@ -1522,35 +1522,24 @@ async def deliver_unified_cadence_response(
         if not fragments:
             return
 
-        # Prepare first fragment
         frag_0 = apply_device_styling(fragments[0], current_device_mode)
         first_frag_typo = apply_simulated_typo(frag_0)
 
-        # Human typing delay for first fragment inside active typing context
         initial_delay = calculate_typing_delay(len(first_frag_typo[0]), energy, vibe)
         await asyncio.sleep(initial_delay)
         sent_msg_0 = await channel.send(first_frag_typo[0])
         channel_last_bot_spoke[ch_id] = datetime.now(timezone.utc).timestamp()
         consecutive_bot_messages[ch_id] += 1
 
-        # Record bot's own message to eliminate amnesia
         record_buffer_message(ch_id, bot_display_name, first_frag_typo[0], sent_msg_0.id, is_bot=True)
 
-    # Simulated typo correction for fragment 0 if triggered
     if first_frag_typo[1]:
         await asyncio.sleep(random.uniform(0.8, 1.4))
         corr_msg = await channel.send(first_frag_typo[1])
         record_buffer_message(ch_id, bot_display_name, first_frag_typo[1], corr_msg.id, is_bot=True)
 
-    global bot_last_question_time, bot_last_question_channel_id
-    if "?" in fragments[0]:
-        bot_last_question_time = datetime.now(timezone.utc)
-        bot_last_question_channel_id = ch_id
-
-    # Multi-Message Thought Bursts: Realistic thinking/hesitation pause before Fragment 2+
     if len(fragments) > 1:
         for frag in fragments[1:]:
-            # Simulated Thinking Pause (idle, not typing, hesitating or reading previous line)
             if energy > 70.0 or vibe in ("hyper", "chaotic", "excited"):
                 thinking_pause = random.uniform(0.8, 1.3)
             elif energy < 40.0 or vibe in ("tired", "deadpan", "petty", "bored"):
@@ -1564,7 +1553,6 @@ async def deliver_unified_cadence_response(
             typo_text, correction = apply_simulated_typo(styled_frag)
             frag_delay = calculate_typing_delay(len(typo_text), energy, vibe)
 
-            # Re-engage typing indicator for the follow-up burst
             async with channel.typing():
                 await asyncio.sleep(frag_delay)
                 sub_msg = await channel.send(typo_text)
@@ -1576,10 +1564,6 @@ async def deliver_unified_cadence_response(
                 await asyncio.sleep(random.uniform(0.7, 1.3))
                 corr_sub_msg = await channel.send(correction)
                 record_buffer_message(ch_id, bot_display_name, correction, corr_sub_msg.id, is_bot=True)
-
-            if "?" in frag:
-                bot_last_question_time = datetime.now(timezone.utc)
-                bot_last_question_channel_id = ch_id
 
 
 # ---------------------------------------------------------------------------
@@ -1650,8 +1634,10 @@ async def proactive_room_scanner() -> None:
         for g in bot.guilds:
             for ch in g.text_channels:
                 if ch.permissions_for(g.me).send_messages:
-                    target_channel = ch
-                    break
+                    name_lower = ch.name.lower()
+                    if not any(k in name_lower for k in ["rules", "announcement", "welcome", "log", "mod"]):
+                        target_channel = ch
+                        break
             if target_channel:
                 break
 
@@ -1687,11 +1673,9 @@ async def proactive_room_scanner() -> None:
     last_rec = records[-1]
     time_since_last_activity = now_epoch - last_rec.get("timestamp_epoch", now_epoch)
 
-    # If channel was active less than 20 minutes ago, don't interrupt natural chat flow
     if time_since_last_activity < 1200:
         return
 
-    # Fetch last message safely for potential reaction or pin targeting
     last_msg_id = last_rec.get("message_id")
     trigger_message: Optional[discord.Message] = None
     if last_msg_id:
@@ -1700,7 +1684,6 @@ async def proactive_room_scanner() -> None:
         except Exception as e:
             logger.debug(f"Scanner could not fetch trigger message {last_msg_id}: {e}")
 
-    # Prepare context for Groq prefrontal decision
     channel_msgs_payload = [{
         "sender": r["sender"],
         "content": r["content"],
@@ -1726,13 +1709,14 @@ async def proactive_room_scanner() -> None:
         return
 
     goal = groq_decision.get("conversational_goal", "Drop an unprompted dry observation, meme, or funny remark based on the past chat.")
-    logger.info(f"Proactive Scanner acting on channel {target_channel.name}: {goal}")
+    target_user = groq_decision.get("target_user")
+    logger.info(f"Proactive Scanner triggered on #{target_channel.name}: {goal}")
 
-    # Deliver cadence response (Gemini can speak, react, generate Flux art, or post a GIF)
     await deliver_unified_cadence_response(
         channel=target_channel,
         trigger_message=trigger_message,
         groq_goal=goal,
+        target_user=target_user,
         affinity_score=0,
         energy=st.get("energy", 65.0),
         vibe=st.get("vibe", "chill"),
@@ -1760,7 +1744,7 @@ async def on_ready() -> None:
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     """Feedback loop: adjusts affinity and internal vibe based on member reactions."""
-    if payload.user_id == bot.user.id:
+    if bot.user and payload.user_id == bot.user.id:
         return
 
     channel = bot.get_channel(payload.channel_id)
@@ -1772,7 +1756,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     except Exception:
         return
 
-    if msg.author.id != bot.user.id:
+    if not bot.user or msg.author.id != bot.user.id:
         return
 
     emoji_str = str(payload.emoji.name)
@@ -1818,23 +1802,17 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
 @bot.event
 async def on_message(message: discord.Message) -> None:
     """Unified Event-Driven Brain: Groq dynamically reads the room on every message."""
-    global bot_last_question_time
-
-    # Persist last active channel ID across container restarts
     if hasattr(message.channel, "send") and message.guild:
         if memory_state.get("last_active_channel_id") != message.channel.id:
             memory_state["last_active_channel_id"] = message.channel.id
             save_memory_state(memory_state)
 
-    # Message deduplication check across rapid events
     if message.id in recently_processed_messages:
         return
     recently_processed_messages.append(message.id)
 
-    # Cold-start hydration if buffer is empty
     await hydrate_channel_buffer(message.channel)
 
-    # Ingestion Hygiene: Clean incoming text
     clean_text = re.sub(r"<a?:([a-zA-Z0-9_]+):\d+>", r":\1:", message.content).strip()
     if message.attachments:
         att_names = ", ".join([a.filename for a in message.attachments])
@@ -1842,8 +1820,7 @@ async def on_message(message: discord.Message) -> None:
     if message.stickers:
         clean_text += " " + " ".join([f"[Sticker: {s.name}]" for s in message.stickers])
 
-    # Append to In-Memory Context Buffer
-    is_message_from_bot = (message.author.id == bot.user.id)
+    is_message_from_bot = (bot.user is not None and message.author.id == bot.user.id)
     existing_msg_ids = {r["message_id"] for r in channel_buffers[message.channel.id]}
     if message.id not in existing_msg_ids:
         channel_buffers[message.channel.id].append({
@@ -1856,19 +1833,12 @@ async def on_message(message: discord.Message) -> None:
             "is_bot": is_message_from_bot,
         })
 
-    # Reset consecutive bot messages counter if message is from a human
     if not is_message_from_bot:
         consecutive_bot_messages[message.channel.id] = 0
 
-    # Self-Message Loop Guard: Strictly avoid runaway bot loops
     if is_message_from_bot and consecutive_bot_messages[message.channel.id] >= 1:
         return
 
-    # Clear question tracking if an actual reply occurred in the question channel
-    if bot_last_question_channel_id == message.channel.id and not is_message_from_bot:
-        bot_last_question_time = None
-
-    # Conversational Momentum & Direct Trigger Flags
     clean_no_mentions = re.sub(r"<@!?\d+>", "", message.content).strip()
     is_test_mode = clean_no_mentions.lower().startswith("test")
 
@@ -1900,13 +1870,12 @@ async def on_message(message: discord.Message) -> None:
 
     is_sleeping = is_amsterdam_sleeping()
 
-    # In-memory context payload for Groq router
     buffer_list = list(channel_buffers[message.channel.id])
     channel_msgs_payload = [{
         "sender": r["sender"],
         "content": r["content"],
         "time": r["timestamp"],
-    } for r in buffer_list[-20:]]
+    } for r in buffer_list[-25:]]
 
     user_id_str = str(message.author.id)
     user_aff = memory_state.get("user_affinity", {}).get(user_id_str, {"score": 0, "notes": []})
@@ -1925,8 +1894,8 @@ async def on_message(message: discord.Message) -> None:
 
     should_speak = groq_decision.get("should_speak", False)
     detected_tension = groq_decision.get("detected_tension", False)
+    target_user = groq_decision.get("target_user")
 
-    # Tension Logic: Lurk silently if tension is high unless explicitly pinged or in test mode
     goal = groq_decision.get("conversational_goal", "Reply naturally as a grounded friend")
     if detected_tension:
         if is_direct_interaction or is_test_mode:
@@ -1938,7 +1907,6 @@ async def on_message(message: discord.Message) -> None:
     if not should_speak and not (is_direct_interaction or is_test_mode):
         return
 
-    # Apply Groq's suggested emotional shift
     shift = groq_decision.get("emotional_shift", {})
     if shift:
         async with memory_lock:
@@ -1962,18 +1930,7 @@ async def on_message(message: discord.Message) -> None:
                         if resp.status == 200:
                             data = await resp.read()
                             if len(data) <= 8 * 1024 * 1024:
-                                def process_img(b: bytes) -> bytes:
-                                    with Image.open(io.BytesIO(b)) as im:
-                                        if im.mode not in ("RGB", "RGBA"):
-                                            im = im.convert("RGB")
-                                        elif im.mode == "RGBA":
-                                            im = im.convert("RGB")
-                                        im.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
-                                        out = io.BytesIO()
-                                        im.save(out, format="JPEG", quality=80)
-                                        return out.getvalue()
-
-                                processed = await asyncio.to_thread(process_img, data)
+                                processed = await asyncio.to_thread(process_image_buffer, data, (1024, 1024), False, "JPEG")
                                 current_image_part = types.Part.from_bytes(data=processed, mime_type="image/jpeg")
                                 break
                 except Exception as e:
@@ -1985,6 +1942,7 @@ async def on_message(message: discord.Message) -> None:
         channel=message.channel,
         trigger_message=message,
         groq_goal=goal,
+        target_user=target_user,
         affinity_score=user_aff.get("score", 0),
         energy=st.get("energy", 65.0),
         vibe=st.get("vibe", "chill"),

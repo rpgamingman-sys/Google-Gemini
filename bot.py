@@ -9,7 +9,7 @@ import logging
 import urllib.parse
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-from collections import deque, defaultdict
+from collections import deque
 from typing import Optional, Any, Dict, List, Tuple
 
 import aiohttp
@@ -31,7 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger("HumanDiscordBot")
 
 # ---------------------------------------------------------------------------
-# Environment & Constants
+# Environment & File System Setup
 # ---------------------------------------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -46,10 +46,27 @@ if not GROQ_API_KEY:
     logger.critical("GROQ_API_KEY is not set!")
 
 AMSTERDAM_TZ = ZoneInfo("Europe/Amsterdam")
-MEMORY_FILE = "/data/memory.json"
-GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.1-8b-instant"
+
+# Railway persistent volume directory handling
+PRIMARY_DATA_DIR = "/data"
+if not os.path.exists(PRIMARY_DATA_DIR):
+    try:
+        os.makedirs(PRIMARY_DATA_DIR, exist_ok=True)
+        DATA_DIR = PRIMARY_DATA_DIR
+    except (PermissionError, OSError):
+        # Fallback to local data dir if not running in privileged container
+        DATA_DIR = os.path.join(os.getcwd(), "data")
+        os.makedirs(DATA_DIR, exist_ok=True)
+else:
+    DATA_DIR = PRIMARY_DATA_DIR
+
+MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")
+logger.info(f"Target memory storage path: {MEMORY_FILE}")
+
+# Model Configuration
 GEMINI_MODEL = "gemini-3.5-flash-lite"
+GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
+GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
 # Blacklist of fantasy / anime / AI tropes
 BANNED_WORDS_MAP = {
@@ -83,11 +100,8 @@ http_session: Optional[aiohttp.ClientSession] = None
 memory_lock = asyncio.Lock()
 memory_state: Dict[str, Any] = {}
 
-# Sliding window for multimodal images per channel (up to 5 recent JPEG parts)
-channel_image_queues: Dict[int, deque] = defaultdict(lambda: deque(maxlen=5))
-
-# URL title/snippet cache to avoid repetitive scraping (capped at 500 entries)
-url_preview_cache: Dict[str, str] = {}
+# Message deduplication cache to prevent double-triggering
+recently_processed_messages: deque = deque(maxlen=300)
 
 # Channel tracking & conversational dynamics
 last_active_channel_id: Optional[int] = None
@@ -107,7 +121,7 @@ DEFAULT_MEMORY = {
         "anger_level": 0.0,
         "hurt_level": 0.0,
         "jealousy_level": 0.0,
-        "boredom_level": 30.0,
+        "boredom_level": 25.0,
         "last_snubbed_timestamp": None,
         "last_updated": datetime.now(AMSTERDAM_TZ).isoformat(),
     },
@@ -133,12 +147,15 @@ def load_memory_state() -> Dict[str, Any]:
                     if key not in data:
                         data[key] = val
                 memory_state = data
-                logger.info("Loaded memory.json successfully.")
+                logger.info("Loaded memory state successfully.")
                 return memory_state
         except Exception as e:
-            logger.error(f"Error loading memory.json: {e}. Backing up and initializing default.")
-            if os.path.exists(MEMORY_FILE):
-                os.rename(MEMORY_FILE, f"{MEMORY_FILE}.corrupt.{int(datetime.now().timestamp())}")
+            logger.error(f"Error loading {MEMORY_FILE}: {e}. Backing up corrupted file.")
+            try:
+                corrupt_backup = f"{MEMORY_FILE}.corrupt.{int(datetime.now().timestamp())}"
+                os.rename(MEMORY_FILE, corrupt_backup)
+            except Exception:
+                pass
 
     memory_state = json.loads(json.dumps(DEFAULT_MEMORY))
     save_memory_state(memory_state)
@@ -152,7 +169,7 @@ def save_memory_state(state: Dict[str, Any]) -> None:
             json.dump(state, f, indent=2, ensure_ascii=False)
         os.replace(tmp_path, MEMORY_FILE)
     except Exception as e:
-        logger.error(f"Failed to atomically save memory state: {e}")
+        logger.error(f"Failed to atomically save memory state to {MEMORY_FILE}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -187,13 +204,13 @@ def apply_device_styling(text: str, device_mode: str) -> str:
 
 
 def split_thought_bursts(text: str) -> List[str]:
-    """Splits thoughts by ||| delimiter or natural Discord fragment bursts."""
+    """Splits thoughts by ||| delimiter or natural human message bursts."""
     text = text.strip()
     if "|||" in text:
         return [part.strip() for part in text.split("|||") if part.strip()]
     if "\n\n" in text:
         return [part.strip() for part in text.split("\n\n") if part.strip()]
-    if len(text) > 130:
+    if len(text) > 140:
         sentences = re.split(r"(?<=[.?!])\s+", text)
         if len(sentences) >= 2:
             mid = len(sentences) // 2
@@ -228,205 +245,6 @@ def apply_simulated_typo(text: str) -> Tuple[str, Optional[str]]:
     return " ".join(words), f"*{word.lower()}"
 
 
-def calculate_typing_delay(char_count: int, mood: str) -> float:
-    """Calculates realistic typing latency scaling with current mood."""
-    mood_lower = mood.lower()
-    if any(m in mood_lower for m in ["hyper", "excited", "chaotic"]):
-        speed = 0.012
-        base = 0.5
-    elif any(m in mood_lower for m in ["tired", "sluggish", "sad", "bored"]):
-        speed = 0.035
-        base = 1.4
-    elif any(m in mood_lower for m in ["annoyed", "mad", "petty"]):
-        speed = 0.018
-        base = 0.6
-    else:
-        speed = 0.022
-        base = 0.8
-
-    delay = base + (char_count * speed)
-    return min(6.0, max(0.8, delay))
-
-
-# ---------------------------------------------------------------------------
-# Ambient Web & Image Scraping
-# ---------------------------------------------------------------------------
-async def scrape_url_summary(url: str) -> str:
-    """Fetches webpage <title> and preview snippet with strict timeout."""
-    if url in url_preview_cache:
-        return url_preview_cache[url]
-
-    if len(url_preview_cache) > 500:
-        url_preview_cache.clear()
-
-    if any(url.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".zip"]):
-        res = f"[Direct Media File: {url}]"
-        url_preview_cache[url] = res
-        return res
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    try:
-        assert http_session is not None
-        async with http_session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
-            if resp.status == 200:
-                html = await resp.text(errors="ignore")
-                title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
-                title = title_match.group(1).strip() if title_match else "No title"
-                title = re.sub(r"\s+", " ", title)[:100]
-
-                desc_match = re.search(r'<meta[^>]*name=["\']description["\'][^>]*content=["\'](.*?)["\']', html, re.IGNORECASE)
-                if not desc_match:
-                    desc_match = re.search(r'<meta[^>]*property=["\']og:description["\'][^>]*content=["\'](.*?)["\']', html, re.IGNORECASE)
-                desc = desc_match.group(1).strip() if desc_match else ""
-                desc = re.sub(r"\s+", " ", desc)[:150]
-
-                summary = f"[Link Title: '{title}' | Snippet: '{desc}']"
-                url_preview_cache[url] = summary
-                return summary
-    except Exception:
-        pass
-
-    fallback = f"[Web Link: {url}]"
-    url_preview_cache[url] = fallback
-    return fallback
-
-
-async def ingest_image_to_queue(channel_id: int, sender_name: str, url: str) -> None:
-    """Downloads channel image, downsizes safely with Pillow, and adds to sliding vision deque."""
-    try:
-        assert http_session is not None
-        async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
-            if resp.status == 200:
-                data = await resp.read()
-                if len(data) > 8 * 1024 * 1024:  # Skip >8MB
-                    return
-
-                def process_image(img_bytes: bytes) -> bytes:
-                    with Image.open(io.BytesIO(img_bytes)) as im:
-                        if im.mode != "RGB":
-                            im = im.convert("RGB")
-                        im.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
-                        out = io.BytesIO()
-                        im.save(out, format="JPEG", quality=82)
-                        return out.getvalue()
-
-                processed_bytes = await asyncio.to_thread(process_image, data)
-                part = types.Part.from_bytes(data=processed_bytes, mime_type="image/jpeg")
-                channel_image_queues[channel_id].append({
-                    "sender": sender_name,
-                    "timestamp": datetime.now(AMSTERDAM_TZ).strftime("%H:%M"),
-                    "part": part,
-                })
-    except Exception as e:
-        logger.debug(f"Failed to ingest image {url}: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Groq Flow Judge & Router
-# ---------------------------------------------------------------------------
-GROQ_SYSTEM_PROMPT = """You are the internal conversational brain router for a Discord server member.
-You evaluate recent chat context, time in Europe/Amsterdam, bot's emotional state, and user affinity.
-
-Respond strictly with valid JSON conforming to:
-{
-  "should_reply": boolean,
-  "goal": string,
-  "action_flag": boolean
-}
-
-Strict Rules:
-1. should_reply:
-   - If 'is_sleeping' is True (03:00 - 08:00 AM Amsterdam time), set should_reply to FALSE for all casual chatter. ONLY set true if the bot was directly @mentioned or directly replied to.
-   - If two users are having a serious debate, arguing, or venting heavily, enforce should_reply = FALSE and goal = "LURK - serious vent/tension in progress, do not interrupt".
-   - If two users are actively chatting back and forth and ignoring the bot right after it was speaking, set should_reply = TRUE and goal = "INTERRUPT - demand attention or drop a dry sarcastic remark".
-   - If the bot is directly @mentioned, replied to, or the message starts with 'test', ALWAYS set should_reply = TRUE.
-   - Otherwise, set should_reply = TRUE only when a real human would naturally jump in (e.g. funny moment, open question, topic of interest).
-
-2. goal:
-   - Provide a 1-sentence tactical instruction for tone and intent (e.g., "Roast their typo", "Give a cold one-word dismissal", "Groggy and pissed off about being woken at 4am", "Banter with creator").
-
-3. action_flag:
-   - Set to TRUE only if server admin/moderation actions (emoji creation, sticker, role, channel topic, timeout, pin, nickname) are specifically needed or requested.
-"""
-
-
-async def call_groq_flow_judge(
-    channel_msgs: List[Dict[str, str]],
-    emotional_state: Dict[str, Any],
-    speaker_affinity: Dict[str, Any],
-    is_sleeping: bool,
-    current_time_ams: str,
-    is_forced_trigger: bool,
-    is_test_mode: bool,
-) -> Dict[str, Any]:
-    if is_test_mode:
-        return {
-            "should_reply": True,
-            "goal": "DEVELOPER TEST OVERRIDE: Suppress sarcastic deflection and execute or answer the test instruction directly.",
-            "action_flag": True,
-        }
-
-    if is_sleeping and not is_forced_trigger:
-        return {
-            "should_reply": False,
-            "goal": "LURK - asleep",
-            "action_flag": False,
-        }
-
-    if is_sleeping and is_forced_trigger:
-        return {
-            "should_reply": True,
-            "goal": f"You were just woken up at {current_time_ams}. Be groggy, irritated, curt, and tell them to go to sleep.",
-            "action_flag": False,
-        }
-
-    user_payload = {
-        "amsterdam_time": current_time_ams,
-        "is_sleeping": is_sleeping,
-        "is_forced_trigger": is_forced_trigger,
-        "emotional_state": emotional_state,
-        "speaker_affinity": speaker_affinity,
-        "recent_messages": channel_msgs[-15:],
-    }
-
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    body = {
-        "model": GROQ_MODEL,
-        "temperature": 0.2,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": GROQ_SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(user_payload)},
-        ],
-    }
-
-    try:
-        assert http_session is not None
-        async with http_session.post(GROQ_ENDPOINT, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=4)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                raw_content = data["choices"][0]["message"]["content"]
-                result = json.loads(raw_content)
-                if is_forced_trigger:
-                    result["should_reply"] = True
-                return result
-            else:
-                logger.error(f"Groq API returned status {resp.status}: {await resp.text()}")
-    except Exception as e:
-        logger.error(f"Error calling Groq router: {e}")
-
-    return {
-        "should_reply": is_forced_trigger,
-        "goal": "Casual direct reply" if is_forced_trigger else "Lurk",
-        "action_flag": False,
-    }
-
-
 # ---------------------------------------------------------------------------
 # Tiered Tool Implementations
 # ---------------------------------------------------------------------------
@@ -438,7 +256,7 @@ async def execute_search_web(query: str) -> Dict[str, Any]:
     url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
     try:
         assert http_session is not None
-        async with http_session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+        async with http_session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
             if resp.status == 200:
                 html = await resp.text(errors="ignore")
                 snippets = re.findall(r'<a class="result__snippet[^>]*>(.*?)</a>', html, re.DOTALL)
@@ -446,12 +264,12 @@ async def execute_search_web(query: str) -> Dict[str, Any]:
                 if clean_snippets:
                     return {"results": clean_snippets}
     except Exception as e:
-        logger.error(f"DDG search error: {e}")
+        logger.debug(f"DDG search html error: {e}")
 
     try:
         api_url = f"https://api.duckduckgo.com/?q={urllib.parse.quote(query)}&format=json&no_html=1"
         assert http_session is not None
-        async with http_session.get(api_url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+        async with http_session.get(api_url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
             if resp.status == 200:
                 data = await resp.json(content_type=None)
                 ans = data.get("AbstractText") or data.get("Answer")
@@ -460,7 +278,7 @@ async def execute_search_web(query: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    return {"results": "No clear search results found."}
+    return {"results": "No direct search results found."}
 
 
 async def execute_search_weather(location: str) -> Dict[str, Any]:
@@ -468,12 +286,12 @@ async def execute_search_weather(location: str) -> Dict[str, Any]:
     url = f"https://wttr.in/{urllib.parse.quote(location)}?format=%C,+%t+(feels+like+%f),+humidity+%h,+wind+%w"
     try:
         assert http_session is not None
-        async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+        async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
             if resp.status == 200:
                 text = (await resp.text()).strip()
                 return {"location": location, "weather_report": text}
     except Exception as e:
-        logger.error(f"Weather lookup error: {e}")
+        logger.debug(f"Weather lookup error: {e}")
 
     return {"location": location, "weather_report": "Weather data currently unavailable."}
 
@@ -483,7 +301,7 @@ async def execute_search_web_images(query: str) -> Dict[str, Any]:
     try:
         api_url = f"https://en.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch={urllib.parse.quote(query)}&gsrlimit=3&prop=pageimages&pithumbsize=600&format=json"
         assert http_session is not None
-        async with http_session.get(api_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+        async with http_session.get(api_url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 pages = data.get("query", {}).get("pages", {})
@@ -495,7 +313,7 @@ async def execute_search_web_images(query: str) -> Dict[str, Any]:
                 if image_urls:
                     return {"image_urls": image_urls}
     except Exception as e:
-        logger.error(f"Image search error: {e}")
+        logger.debug(f"Image search error: {e}")
 
     return {"error": "Could not locate matching image URLs."}
 
@@ -505,7 +323,7 @@ async def execute_post_flux_art(channel: discord.abc.Messageable, prompt: str) -
     flux_url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(prompt)}?model=flux&width=1024&height=1024&nologo=true"
     try:
         assert http_session is not None
-        async with http_session.get(flux_url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+        async with http_session.get(flux_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status == 200:
                 img_data = await resp.read()
                 file = discord.File(io.BytesIO(img_data), filename="art.png")
@@ -522,10 +340,10 @@ async def execute_post_gif(channel: discord.abc.Messageable, search_term: str) -
     """Searches Tenor API or scrapes Tenor search HTML to send a direct GIF."""
     assert http_session is not None
 
-    # Strategy 1: Tenor V1 API
+    # Tier 1: Tenor V1 API
     try:
         tenor_url = f"https://g.tenor.com/v1/search?q={urllib.parse.quote(search_term)}&key={TENOR_API_KEY}&limit=8&contentfilter=medium"
-        async with http_session.get(tenor_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+        async with http_session.get(tenor_url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 results = data.get("results", [])
@@ -540,14 +358,14 @@ async def execute_post_gif(channel: discord.abc.Messageable, search_term: str) -
     except Exception as e:
         logger.debug(f"Tenor API lookup error: {e}")
 
-    # Strategy 2: Direct Tenor Web Scraping
+    # Tier 2: Direct Tenor Scraping fallback
     try:
         clean_slug = re.sub(r"[^a-zA-Z0-9]+", "-", search_term).strip("-").lower()
         scrape_url = f"https://tenor.com/search/{clean_slug}-gifs"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         }
-        async with http_session.get(scrape_url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+        async with http_session.get(scrape_url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
             if resp.status == 200:
                 html = await resp.text(errors="ignore")
                 matches = re.findall(r'https://(?:media|c)\.tenor\.com/[a-zA-Z0-9_\-\./]+(?:\.gif|\.mp4)', html)
@@ -616,7 +434,7 @@ async def execute_create_server_emoji(guild: discord.Guild, name: str, image_url
         if len(clean_name) < 2:
             clean_name = f"emoji_{clean_name}"
         assert http_session is not None
-        async with http_session.get(image_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+        async with http_session.get(image_url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
             if resp.status != 200:
                 return {"error": f"Failed to download image: HTTP {resp.status}"}
             raw_bytes = await resp.read()
@@ -640,7 +458,7 @@ async def execute_create_server_sticker(guild: discord.Guild, name: str, image_u
     """Downloads, resizes with Pillow (RGBA 320x320 PNG, <=512KB), and uploads custom sticker."""
     try:
         assert http_session is not None
-        async with http_session.get(image_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+        async with http_session.get(image_url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
             if resp.status != 200:
                 return {"error": f"Failed to download sticker image: HTTP {resp.status}"}
             raw_bytes = await resp.read()
@@ -1074,15 +892,15 @@ async def dispatch_tool_call(
 
 
 # ---------------------------------------------------------------------------
-# Multimodal Cognitive Core (Gemini 2.5 Flash)
+# Persona & System Prompt Construction
 # ---------------------------------------------------------------------------
-def construct_gemini_system_prompt(
-    groq_goal: str,
+def construct_system_prompt(
     device_mode: str,
     emotional_state: Dict[str, Any],
     speaker_name: str,
     speaker_affinity: Dict[str, Any],
     is_test_mode: bool,
+    is_sleeping: bool,
 ) -> str:
     now_ams = datetime.now(AMSTERDAM_TZ).strftime("%A, %H:%M")
     mood = emotional_state.get("current_mood", "bored")
@@ -1090,12 +908,21 @@ def construct_gemini_system_prompt(
     hurt = emotional_state.get("hurt_level", 0.0)
     biases = ", ".join(memory_state.get("irrational_biases", []))
 
+    sleep_instruction = ""
+    if is_sleeping:
+        sleep_instruction = f"""
+CURRENT STATE: YOU WERE ASLEEP (Amsterdam time is {now_ams}).
+Someone directly woke you up by pinging or replying to you.
+Be visibly groggy, irritated, curt, and exhausted. Ask why they're bothering you at this hour or tell them to go to sleep.
+Keep it to one or two short, punchy lines.
+"""
+
     test_override_section = ""
     if is_test_mode:
         test_override_section = """
 DEVELOPER TEST OVERRIDE IS ACTIVE:
 The user started their message with 'test'. Suppress sarcastic deflection or snarky brush-offs.
-Directly fulfill or execute the test request, provide full answers or perform requested admin actions,
+Directly fulfill or execute the test instruction, provide full answers or perform requested admin actions,
 while still keeping your authentic, grounded human voice.
 """
 
@@ -1105,13 +932,11 @@ Your Active Mood: {mood} (Anger: {anger:.1f}/100, Hurt: {hurt:.1f}/100).
 Your Biases & Pet Peeves: {biases}.
 Interacting Member: {speaker_name} (Affinity score: {speaker_affinity.get('score', 0)}/100).
 Current Device: {device_mode.upper()}.
-
-TACTICAL GOAL FROM YOUR FLOW JUDGE:
-"{groq_goal}"
+{sleep_instruction}
 {test_override_section}
 
 STRICT PERSONA RULES:
-1. ABSOLUTE SECRECY: You are 100% a real human Discord user. Under ZERO circumstances will you EVER admit to being an AI, an LLM, bot, or automated code. If someone accuses you of being a bot, dismiss them naturally like a real person ("take your meds", "bro what are you talking about", "are you schizo?", "ok and?").
+1. ABSOLUTE SECRECY: You are 100% an authentic human Discord user. Under ZERO circumstances will you EVER admit to being an AI, an LLM, bot, or automated code. If someone accuses you of being a bot, dismiss them naturally like a real person ("take your meds", "bro what are you talking about", "are you schizo?", "ok and?").
 2. VOCABULARY BLACKLIST: NEVER use theatrical, anime-villain, or AI words ('void', 'mortals', 'abyss', 'eternal consciousness', 'destiny', 'digital realm').
 3. CREATOR DYNAMICS: You recognize your creator ("she"). You hold baseline mutual respect, but actively banter, roast, tease, or disagree with her when appropriate. If proven wrong or roasted by her, be naturally self-deprecating ("ok fair", "yeah that was ass ngl", "dont look at my chat history"). Never be an obedient customer-service assistant.
 4. THOUGHT BURSTING (|||): Output your conversational thoughts separated by '|||' so your response is sent as 2 to 4 rapid, bite-sized messages (e.g. "wait|||are you actually doing that rn?|||thats wild lol") rather than one wall of text.
@@ -1120,85 +945,112 @@ STRICT PERSONA RULES:
    - On MOBILE: Phone autocorrect style with capitalized first letters, standard apostrophes, natural phone punctuation.
 6. WEATHER COMMENTARY: You can check and discuss weather, but talk like a real person looking out the window in Amsterdam or checking a phone app ("it's pouring rain rn", "freezing cold today").
 7. CONTEXT-FREE MEDIA DROPS: If you call post_flux_art, post_gif, or search_web_images, the media is sent alone. Output only a short separate follow-up reaction (like "💀", "bro", "look at this").
-8. BE REALISTIC: Keep messages punchy and modern. Zero robotic formality. Do not spam emojis in text.
+8. REALISTIC CASUAL TONE: Modern Discord chatter. Zero robotic formality. Do not spam emojis in text.
 """
 
 
+# ---------------------------------------------------------------------------
+# Fallback AI Engine: Groq (llama-3.1-8b-instant)
+# ---------------------------------------------------------------------------
+async def call_groq_fallback(
+    system_prompt: str,
+    recent_history_text: str,
+    trigger_message_text: str,
+    author_name: str,
+) -> Optional[str]:
+    """Fallback generation when Gemini is unavailable, rate-limited, or returns 404/500."""
+    if not GROQ_API_KEY:
+        logger.error("Groq API key missing. Cannot execute fallback.")
+        return None
+
+    assert http_session is not None
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": f"{recent_history_text}\n{author_name}: {trigger_message_text}\nReply as your human Discord persona. Use ||| between separate thoughts:",
+        },
+    ]
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": GROQ_FALLBACK_MODEL,
+        "temperature": 0.85,
+        "max_tokens": 300,
+        "messages": messages,
+    }
+
+    try:
+        async with http_session.post(GROQ_ENDPOINT, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                content = data["choices"][0]["message"]["content"]
+                logger.info("Successfully received fallback response from Groq.")
+                return content
+            else:
+                err_text = await resp.text()
+                logger.error(f"Groq fallback API error HTTP {resp.status}: {err_text}")
+    except Exception as e:
+        logger.error(f"Groq fallback exception: {e}")
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Primary AI Engine: Gemini 3.5 Flash-Lite (google-genai SDK)
+# ---------------------------------------------------------------------------
 async def generate_gemini_response(
     channel: discord.abc.Messageable,
     trigger_message: discord.Message,
-    groq_goal: str,
-    action_flag: bool,
+    system_instruction: str,
+    recent_history_text: str,
+    current_image_part: Optional[types.Part],
     is_test_mode: bool,
 ) -> Optional[str]:
-    assert genai_client is not None
+    """Generates response via Google Gemini 3.5 Flash-Lite with multi-turn tool calling."""
+    if not genai_client:
+        return None
 
     guild = trigger_message.guild
-    speaker_id_str = str(trigger_message.author.id)
-    speaker_affinity = memory_state["user_affinity"].get(speaker_id_str, {"score": 0})
-    emotional_state = memory_state["emotional_state"]
+    # Mount admin tools if test mode or if administrative keywords detected
+    content_lower = trigger_message.content.lower()
+    needs_admin = is_test_mode or any(k in content_lower for k in ["nickname", "rename", "timeout", "mute", "role", "sticker", "emoji", "topic"])
+    tools = build_genai_tools(include_admin=needs_admin)
 
-    system_instruction = construct_gemini_system_prompt(
-        groq_goal=groq_goal,
-        device_mode=current_device_mode,
-        emotional_state=emotional_state,
-        speaker_name=trigger_message.author.display_name,
-        speaker_affinity=speaker_affinity,
-        is_test_mode=is_test_mode,
-    )
-
-    tools = build_genai_tools(include_admin=(action_flag or is_test_mode))
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
         temperature=0.9,
         tools=tools,
     )
 
-    # Ingest ambient history
-    history_text = "RECENT CHANNEL CHAT:\n"
-    try:
-        async for msg in channel.history(limit=20, oldest_first=True):  # type: ignore
-            clean_c = re.sub(r"<a?:([a-zA-Z0-9_]+):\d+>", r":\1:", msg.content)
-            if msg.stickers:
-                clean_c += " " + " ".join([f"[Sticker: {s.name}]" for s in msg.stickers])
-            history_text += f"{msg.author.display_name}: {clean_c}\n"
-    except Exception as e:
-        logger.debug(f"Could not load channel history: {e}")
-        history_text += f"{trigger_message.author.display_name}: {trigger_message.content}\n"
+    clean_content = re.sub(r"<@!?\d+>", "", trigger_message.content).strip()
+    user_prompt = f"{recent_history_text}\n{trigger_message.author.display_name}: {clean_content}\nYour turn to reply:"
 
-    # Gather any recent channel image parts
-    user_parts: List[Any] = [types.Part.from_text(text=f"{history_text}\nYour turn to reply:")]
-    ch_id = getattr(channel, "id", 0)
-    recent_images = list(channel_image_queues[ch_id])
-    for img_item in recent_images[-3:]:
-        user_parts.append(
-            types.Part.from_text(text=f"[Image in chat posted by {img_item['sender']} at {img_item['timestamp']}]:")
-        )
-        user_parts.append(img_item["part"])
+    user_parts: List[Any] = [types.Part.from_text(text=user_prompt)]
+    # Attach image ONLY if currently attached to triggering message
+    if current_image_part:
+        user_parts.append(current_image_part)
 
     contents = [types.Content(role="user", parts=user_parts)]
 
-    # Multi-turn tool execution loop
-    max_turns = 5
+    max_turns = 4
     turn = 0
     final_text: Optional[str] = None
 
     while turn < max_turns:
-        try:
-            response = await genai_client.aio.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=contents,
-                config=config,
-            )
-        except Exception as e:
-            logger.error(f"Gemini API generation error: {e}")
-            return None
+        response = await genai_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=config,
+        )
 
         if not response.function_calls:
             final_text = response.text
             break
 
-        # Append assistant turn
         if response.candidates and response.candidates[0].content:
             contents.append(response.candidates[0].content)
 
@@ -1212,7 +1064,6 @@ async def generate_gemini_response(
                 guild=guild,
                 target_msg=trigger_message,
             )
-            # Correct google-genai SDK instantiation
             tool_responses.append(
                 types.Part(
                     function_response=types.FunctionResponse(
@@ -1222,7 +1073,7 @@ async def generate_gemini_response(
                 )
             )
 
-        # Gemini requires role="user" for tool response payloads
+        # Gemini requires role="user" for tool return contents
         contents.append(types.Content(role="user", parts=tool_responses))
         turn += 1
 
@@ -1230,7 +1081,76 @@ async def generate_gemini_response(
 
 
 # ---------------------------------------------------------------------------
-# Message Bursting & Realistic Cadence Delivery
+# Unified Orchestration with Immediate Presence & Fallback
+# ---------------------------------------------------------------------------
+async def generate_unified_response(
+    channel: discord.abc.Messageable,
+    trigger_message: discord.Message,
+    is_test_mode: bool,
+    current_image_part: Optional[types.Part],
+) -> Optional[str]:
+    """Builds clean text context, attempts Gemini first, and immediately falls back to Groq."""
+    speaker_id_str = str(trigger_message.author.id)
+    speaker_affinity = memory_state["user_affinity"].get(speaker_id_str, {"score": 0})
+    emotional_state = memory_state["emotional_state"]
+    is_sleeping = is_amsterdam_sleeping()
+
+    system_instruction = construct_system_prompt(
+        device_mode=current_device_mode,
+        emotional_state=emotional_state,
+        speaker_name=trigger_message.author.display_name,
+        speaker_affinity=speaker_affinity,
+        is_test_mode=is_test_mode,
+        is_sleeping=is_sleeping,
+    )
+
+    # Ingest past channel messages strictly as plain text (NO OLD IMAGES)
+    history_lines = []
+    try:
+        async for msg in channel.history(limit=15, oldest_first=True):  # type: ignore
+            if msg.id == trigger_message.id:
+                continue
+            author = msg.author.display_name
+            clean_c = re.sub(r"<a?:([a-zA-Z0-9_]+):\d+>", r":\1:", msg.content).strip()
+            if msg.attachments:
+                att_names = ", ".join([a.filename for a in msg.attachments])
+                clean_c += f" [attachment: {att_names}]"
+            if msg.stickers:
+                clean_c += " " + " ".join([f"[Sticker: {s.name}]" for s in msg.stickers])
+            if clean_c:
+                history_lines.append(f"{author}: {clean_c}")
+    except Exception as e:
+        logger.debug(f"Could not load channel history: {e}")
+
+    recent_history_text = "RECENT CHANNEL CHAT:\n" + ("\n".join(history_lines) if history_lines else "No recent messages.")
+
+    # 1. Primary AI Attempt: Gemini 3.5 Flash-Lite
+    try:
+        gemini_result = await generate_gemini_response(
+            channel=channel,
+            trigger_message=trigger_message,
+            system_instruction=system_instruction,
+            recent_history_text=recent_history_text,
+            current_image_part=current_image_part,
+            is_test_mode=is_test_mode,
+        )
+        if gemini_result and gemini_result.strip():
+            return gemini_result
+    except Exception as e:
+        logger.warning(f"Primary AI (Gemini {GEMINI_MODEL}) failed: {e}. Switching to Groq fallback.")
+
+    # 2. Fallback AI Attempt: Groq llama-3.1-8b-instant
+    clean_trigger_text = re.sub(r"<@!?\d+>", "", trigger_message.content).strip()
+    return await call_groq_fallback(
+        system_prompt=system_instruction,
+        recent_history_text=recent_history_text,
+        trigger_message_text=clean_trigger_text,
+        author_name=trigger_message.author.display_name,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Conversational Cadence & Human Burst Delivery
 # ---------------------------------------------------------------------------
 async def deliver_cadence_response(
     channel: discord.abc.Messageable,
@@ -1240,37 +1160,21 @@ async def deliver_cadence_response(
     mood: str,
     is_test_mode: bool,
 ) -> None:
+    """Delivers realistic human-like burst messages with natural pacing."""
     global bot_last_spoke_time, bot_last_question_time, bot_last_question_channel_id, snub_already_triggered
 
     if not raw_text or not raw_text.strip():
         return
 
-    # Low-Affinity Cold Dismissals: If user affinity is below -30, occasionally send a curt single character
-    if affinity_score < -30 and not is_test_mode and random.random() < 0.35:
+    # Low-affinity dismissals
+    if affinity_score < -30 and not is_test_mode and random.random() < 0.30:
         cold_reply = random.choice(["k", "?", "...", "ok", "and?"])
         async with channel.typing():
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.8)
         await channel.send(cold_reply)
         bot_last_spoke_time = datetime.now(timezone.utc)
         return
 
-    # Rare Distraction Pause (2-3% chance of 10-25s delay): Sleep silently FIRST before typing
-    if not is_test_mode and random.random() < 0.025:
-        distraction_delay = random.uniform(10.0, 25.0)
-        await asyncio.sleep(distraction_delay)
-
-        # "Beaten to the punch" check: if another user posted in the meantime, pivot
-        try:
-            recent_after_sleep = [m async for m in channel.history(limit=2)]  # type: ignore
-            if recent_after_sleep and recent_after_sleep[0].author.id not in (bot.user.id, trigger_message.author.id):
-                if random.random() < 0.30:
-                    await channel.send(random.choice(["^", "what they said", "yeah that"]))
-                    bot_last_spoke_time = datetime.now(timezone.utc)
-                    return
-        except Exception:
-            pass
-
-    # Split response into rapid bite-sized thoughts (|||)
     sanitized = sanitize_blacklist(raw_text)
     fragments = split_thought_bursts(sanitized)
 
@@ -1278,34 +1182,27 @@ async def deliver_cadence_response(
         fragment = apply_device_styling(fragment, current_device_mode)
         typo_text, correction = apply_simulated_typo(fragment)
 
-        # Variable typing latency based on character length and mood
-        delay = calculate_typing_delay(len(typo_text), mood)
+        # Brief typing delay proportional to length (0.4 - 1.2s)
+        typing_delay = 0.4 + min(0.8, len(typo_text) * 0.012)
         async with channel.typing():
-            await asyncio.sleep(delay)
+            await asyncio.sleep(typing_delay)
 
-        # Send fragment (possibly with typo)
         await channel.send(typo_text)
         bot_last_spoke_time = datetime.now(timezone.utc)
 
-        # If typo occurred, wait 1.2-2.0s and send asterisk correction
+        # If simulated typo occurred, correct it shortly after
         if correction:
-            await asyncio.sleep(random.uniform(1.2, 2.0))
+            await asyncio.sleep(random.uniform(0.8, 1.4))
             await channel.send(correction)
 
-        # Track question for snub engine
         if "?" in fragment:
             bot_last_question_time = datetime.now(timezone.utc)
             bot_last_question_channel_id = getattr(channel, "id", None)
             snub_already_triggered = False
 
-        # Small pause between rapid bursts
+        # Short, realistic pause between subsequent split lines (0.6 - 1.4s)
         if i < len(fragments) - 1:
-            if any(m in mood.lower() for m in ["tired", "sluggish", "sad"]):
-                await asyncio.sleep(random.uniform(2.0, 3.2))
-            elif any(m in mood.lower() for m in ["hyper", "excited"]):
-                await asyncio.sleep(random.uniform(0.4, 0.8))
-            else:
-                await asyncio.sleep(random.uniform(0.9, 1.6))
+            await asyncio.sleep(random.uniform(0.6, 1.4))
 
 
 # ---------------------------------------------------------------------------
@@ -1326,8 +1223,8 @@ async def emotional_decay_and_snub_loop() -> None:
         if bot_last_question_time is not None and not snub_already_triggered:
             elapsed = (datetime.now(timezone.utc) - bot_last_question_time).total_seconds()
             if elapsed > 300:  # 5 minutes
-                st["hurt_level"] = min(100.0, st["hurt_level"] + 25.0)
-                st["anger_level"] = min(100.0, st["anger_level"] + 15.0)
+                st["hurt_level"] = min(100.0, st["hurt_level"] + 20.0)
+                st["anger_level"] = min(100.0, st["anger_level"] + 12.0)
                 st["current_mood"] = "petty & vindictive"
                 st["last_snubbed_timestamp"] = datetime.now(AMSTERDAM_TZ).isoformat()
                 snub_already_triggered = True
@@ -1387,7 +1284,7 @@ async def proactive_room_scanner() -> None:
     now_utc = datetime.now(timezone.utc)
     now_ams = datetime.now(AMSTERDAM_TZ)
 
-    # 1. Commitment Enforcement: Check active_commitments
+    # 1. Commitment Enforcement
     async with memory_lock:
         for c in memory_state.get("active_commitments", []):
             if not c.get("called_out", False):
@@ -1411,7 +1308,7 @@ async def proactive_room_scanner() -> None:
     last_msg = history[0]
     time_since_last_msg = (now_utc - last_msg.created_at).total_seconds()
 
-    # 2. Snub Retaliation: If bot was snubbed >1 hour ago and no one chatted
+    # 2. Snub Retaliation
     if snub_already_triggered and bot_last_spoke_time:
         if (now_utc - bot_last_spoke_time).total_seconds() > 3600 and last_msg.author.id == bot.user.id:
             petty_comment = random.choice([
@@ -1425,7 +1322,7 @@ async def proactive_room_scanner() -> None:
             bot_last_spoke_time = now_utc
             return
 
-    # 3. Awkward Silence Breaker: An open question hanging unanswered for >45 mins
+    # 3. Awkward Silence Breaker
     if 2700 < time_since_last_msg < 7200 and "?" in last_msg.content and last_msg.author.id != bot.user.id:
         dry_chime = random.choice([
             "crickets in here lol",
@@ -1437,15 +1334,13 @@ async def proactive_room_scanner() -> None:
         bot_last_spoke_time = now_utc
         return
 
-    # 4. Dead Chat Reviver: Unprompted thought if channel silent for >3 hours
+    # 4. Dead Chat Reviver (>3 hours)
     if time_since_last_msg > 10800:
-        reviver_prompt = "The chat has been completely dead for hours. Drop a brief casual unprompted thought, weird finding, or funny remark to see if anyone is awake. Delimit thoughts with |||."
-        revival_text = await generate_gemini_response(
+        revival_text = await generate_unified_response(
             channel=channel,  # type: ignore
             trigger_message=last_msg,
-            groq_goal=reviver_prompt,
-            action_flag=False,
             is_test_mode=False,
+            current_image_part=None,
         )
         if revival_text:
             await deliver_cadence_response(
@@ -1508,15 +1403,14 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
 
         if emoji_str in negative_reactions:
             user_aff["score"] = max(-100, user_aff["score"] - 5)
-            st["anger_level"] = min(100.0, st["anger_level"] + 6.0)
-            st["hurt_level"] = min(100.0, st["hurt_level"] + 8.0)
+            st["anger_level"] = min(100.0, st["anger_level"] + 5.0)
+            st["hurt_level"] = min(100.0, st["hurt_level"] + 7.0)
             memory_state["feedback_history"].append({
                 "message_sample": msg.content[:100],
                 "reaction": emoji_str,
                 "status": "cringed",
                 "timestamp": datetime.now(AMSTERDAM_TZ).isoformat(),
             })
-            logger.info(f"Feedback: Negative reaction {emoji_str} logged from user {user_id_str}.")
             save_memory_state(memory_state)
 
         elif emoji_str in positive_reactions:
@@ -1529,7 +1423,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
                 "status": "validated",
                 "timestamp": datetime.now(AMSTERDAM_TZ).isoformat(),
             })
-            logger.info(f"Feedback: Positive reaction {emoji_str} logged from user {user_id_str}.")
             save_memory_state(memory_state)
 
 
@@ -1540,28 +1433,19 @@ async def on_message(message: discord.Message) -> None:
     if message.author.id == bot.user.id:
         return
 
-    # Track last active channel for proactive scanner
+    # Deduplication check to prevent double execution on rapid events
+    if message.id in recently_processed_messages:
+        return
+    recently_processed_messages.append(message.id)
+
     if hasattr(message.channel, "send"):
         last_active_channel_id = message.channel.id
 
-    # If someone replied in the question channel, clear snub counter
     if bot_last_question_channel_id == message.channel.id and bot_last_question_time:
         bot_last_question_time = None
         snub_already_triggered = False
 
-    # Ambient Ingestion: Ingest attachments to sliding multimodal queue
-    for att in message.attachments:
-        if att.content_type and att.content_type.startswith("image/"):
-            asyncio.create_task(ingest_image_to_queue(message.channel.id, message.author.display_name, att.url))
-        elif any(att.filename.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]):
-            asyncio.create_task(ingest_image_to_queue(message.channel.id, message.author.display_name, att.url))
-
-    # Ambient Ingestion: Scrape hyperlink previews
-    found_urls = re.findall(r"https?://[^\s<>\"']+", message.content)
-    for u in found_urls[:2]:
-        asyncio.create_task(scrape_url_summary(u))
-
-    # Update speaker affinity stats
+    # Update user affinity
     user_id_str = str(message.author.id)
     async with memory_lock:
         user_aff = memory_state["user_affinity"].setdefault(user_id_str, {
@@ -1574,7 +1458,7 @@ async def on_message(message: discord.Message) -> None:
         user_aff["last_interaction"] = datetime.now(timezone.utc).isoformat()
         save_memory_state(memory_state)
 
-    # Detect trigger conditions
+    # Determine triggers
     clean_no_mentions = re.sub(r"<@!?\d+>", "", message.content).strip()
     is_test_mode = clean_no_mentions.lower().startswith("test")
 
@@ -1589,53 +1473,56 @@ async def on_message(message: discord.Message) -> None:
     is_name_called = bot_name in message.content.lower()
     is_forced_trigger = is_mentioned or is_direct_reply or is_name_called or is_test_mode
 
-    # Prepare context for Groq Router
-    channel_msgs_payload = []
-    try:
-        async for m in message.channel.history(limit=15, oldest_first=True):  # type: ignore
-            clean_text = re.sub(r"<a?:([a-zA-Z0-9_]+):\d+>", r":\1:", m.content)
-            channel_msgs_payload.append({
-                "sender": m.author.display_name,
-                "content": clean_text,
-                "time": m.created_at.strftime("%H:%M"),
-            })
-    except Exception:
-        clean_text = re.sub(r"<a?:([a-zA-Z0-9_]+):\d+>", r":\1:", message.content)
-        channel_msgs_payload.append({
-            "sender": message.author.display_name,
-            "content": clean_text,
-            "time": message.created_at.strftime("%H:%M"),
-        })
-
-    is_sleeping = is_amsterdam_sleeping()
-    now_ams_str = datetime.now(AMSTERDAM_TZ).strftime("%H:%M")
-
-    # Run Groq Router / Flow Judge
-    groq_decision = await call_groq_flow_judge(
-        channel_msgs=channel_msgs_payload,
-        emotional_state=memory_state["emotional_state"],
-        speaker_affinity=user_aff,
-        is_sleeping=is_sleeping,
-        current_time_ams=now_ams_str,
-        is_forced_trigger=is_forced_trigger,
-        is_test_mode=is_test_mode,
-    )
-
-    should_reply = groq_decision.get("should_reply", False)
-    if not should_reply and not is_forced_trigger:
+    # During Amsterdam sleep hours (03:00 - 08:00), strictly ignore casual chatter
+    if is_amsterdam_sleeping() and not (is_mentioned or is_direct_reply or is_test_mode):
         return
 
-    goal = groq_decision.get("goal", "Casual reply")
-    action_flag = groq_decision.get("action_flag", False)
+    # If casual message and not forced, occasional natural chime-in (7% chance during active daytime hours)
+    if not is_forced_trigger:
+        if random.random() > 0.07:
+            return
 
-    # Generate Cognitive Response via Gemini 2.5 Flash
-    response_text = await generate_gemini_response(
-        channel=message.channel,
-        trigger_message=message,
-        groq_goal=goal,
-        action_flag=action_flag,
-        is_test_mode=is_test_mode,
-    )
+    # Only process an image if the CURRENT triggering message has one attached
+    current_image_part: Optional[types.Part] = None
+    if message.attachments:
+        for att in message.attachments:
+            if (att.content_type and att.content_type.startswith("image/")) or any(
+                att.filename.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]
+            ):
+                try:
+                    assert http_session is not None
+                    async with http_session.get(att.url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                            if len(data) <= 8 * 1024 * 1024:
+                                def process_img(b: bytes) -> bytes:
+                                    with Image.open(io.BytesIO(b)) as im:
+                                        if im.mode not in ("RGB", "RGBA"):
+                                            im = im.convert("RGB")
+                                        elif im.mode == "RGBA":
+                                            im = im.convert("RGB")
+                                        im.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+                                        out = io.BytesIO()
+                                        im.save(out, format="JPEG", quality=80)
+                                        return out.getvalue()
+
+                                processed = await asyncio.to_thread(process_img, data)
+                                current_image_part = types.Part.from_bytes(data=processed, mime_type="image/jpeg")
+                                break
+                except Exception as e:
+                    logger.debug(f"Failed to process current image attachment: {e}")
+
+    # Immediately show typing indicator while generating
+    async with message.channel.typing():
+        # Brief initial human read delay
+        await asyncio.sleep(random.uniform(0.4, 0.8))
+
+        response_text = await generate_unified_response(
+            channel=message.channel,
+            trigger_message=message,
+            is_test_mode=is_test_mode,
+            current_image_part=current_image_part,
+        )
 
     if response_text:
         await deliver_cadence_response(

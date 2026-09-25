@@ -339,13 +339,13 @@ def calculate_typing_delay(char_count: int, energy: float, vibe: str) -> float:
         if energy > 75.0 or vibe in ("hyper", "chaotic"):
         speed = 0.045
         base = 0.3
-    elif energy < 35.0 or vibe in ("tired", "deadpan"):
+        elif energy < 35.0 or vibe in ("tired", "deadpan"):
         speed = 0.100
         base = 0.9
-    elif vibe in ("edgy",):
+        elif vibe in ("edgy",):
         speed = 0.075
         base = 0.7
-    else:
+        else:
         speed = 0.065
         base = 0.45
 

@@ -550,8 +550,9 @@ async def call_groq_router(
                 if is_direct_interaction or is_test_mode:
                     decision["should_speak"] = True
                 return decision
-            elif resp.status == 429:
-                logger.debug("Groq 429 TPM rate limit hit, using fallback decision")
+             elif resp.status == 429:
+                err_msg = await resp.text()
+                print(f"[GROQ 429 ERROR] {err_msg}")
                 return {
                     "should_speak": is_direct_interaction or is_test_mode,
                     "reaction_emoji": None,

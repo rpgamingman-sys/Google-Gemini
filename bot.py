@@ -64,7 +64,7 @@ logger.info(f"Persistent memory file target: {MEMORY_FILE}")
 
 # Model Configuration
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "mixtral-8x7b-32768")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
 # Anti-AI tropes blacklist
@@ -509,14 +509,16 @@ async def call_groq_router(
         "Content-Type": "application/json",
     }
     body = {
-        "model": GROQ_MODEL,
-        "temperature": 0.2,
-        "max_tokens": 250,
-        "messages": [
-            {"role": "system", "content": GROQ_ROUTER_PROMPT},
-            {"role": "user", "content": f"Analyze this chat and output ONLY the raw JSON object:\n{json.dumps(payload_data)}"},
-        ],
-    }
+    "model": GROQ_MODEL,
+    "reasoning_format": "hidden",
+    "reasoning_effort": "low",
+    "temperature": 0.0,
+    "max_tokens": 250,
+    "messages": [
+        {"role": "system", "content": GROQ_ROUTER_SYSTEM},
+        {"role": "user", "content": f"Analyze the context..."},
+    ],
+}
 
     try:
         assert http_session is not None

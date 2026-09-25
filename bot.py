@@ -120,6 +120,7 @@ DEFAULT_MEMORY = {
         "last_updated": datetime.now(AMSTERDAM_TZ).isoformat(),
     },
     "traits": [
+        # Original core
         "hates when people send unprompted voice notes",
         "firm believer that wired peripherals are superior",
         "mildly suspicious of people who listen to podcasts at 2x speed",
@@ -127,6 +128,22 @@ DEFAULT_MEMORY = {
         "despises weapon durability mechanics in games",
         "convinced cold leftovers taste better than reheated food",
         "gets slightly jealous when two friends chat while ignoring them",
+
+        # Contradictions & social pettiness
+        "takes it personally when left on read, but regularly ignores messages for six hours",
+        "types 'lmaooo' with a completely deadpan face in real life",
+        "hates being perceived when joining a call and waits for someone else to talk first",
+        "will type an entire paragraph, delete it, and just send 'real'",
+        "mildly resentful toward anyone who replies within four seconds",
+
+        # Hyper-specific irrational habits
+        "treats having 40 open browser tabs as an emotional support system",
+        "would rather wander around lost for 20 minutes than ask someone for directions",
+        "gets unhealthily attached to random nameless NPCs with one line of dialogue",
+        "will die before admitting a game tutorial was actually necessary",
+        "checks the fridge three times in an hour expecting new food to spawn",
+        "secretly judges people who don't use adblockers like they're raw-dogging the internet",
+        "turns the music down when parking so they can 'see better'",
     ],
     "last_active_channel_id": None,
     "user_affinity": {},
@@ -319,22 +336,21 @@ def apply_simulated_typo(text: str) -> Tuple[str, Optional[str]]:
 
 def calculate_typing_delay(char_count: int, energy: float, vibe: str) -> float:
     """Calculates human typing duration based on character count, energy, and vibe."""
-    if energy > 75.0 or vibe in ("hyper", "chaotic", "excited", "unhinged"):
-        speed = 0.011
+        if energy > 75.0 or vibe in ("hyper", "chaotic"):
+        speed = 0.045
         base = 0.3
-    elif energy < 35.0 or vibe in ("tired", "deadpan", "petty", "bored", "sad"):
-        speed = 0.026
+    elif energy < 35.0 or vibe in ("tired", "deadpan"):
+        speed = 0.100
         base = 0.9
     elif vibe in ("edgy",):
-        speed = 0.020
+        speed = 0.075
         base = 0.7
     else:
-        speed = 0.017
+        speed = 0.065
         base = 0.45
 
     delay = base + (char_count * speed)
-    return min(4.0, max(0.4, delay))
-
+    return min(12.0, max(0.5, delay))
 
 def get_online_presence_summary(guild: Optional[discord.Guild]) -> List[str]:
     """Fetches active guild members and their stored affinity scores."""
@@ -413,38 +429,39 @@ def update_emotional_state(current: dict, shift: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Groq Prefrontal Router: Compact & TPM-Optimized System Prompt
 # ---------------------------------------------------------------------------
-GROQ_ROUTER_PROMPT = """You are the prefrontal router of an authentic Discord user. Output ONLY a valid JSON object matching this schema:
+GROQ_ROUTER_PROMPT = """You are the prefrontal router for a Discord user named "Dumb bot". Decide if Dumb bot should speak. Output strict JSON:
 {
+  "conversational_goal": string,
   "should_speak": boolean,
   "reaction_emoji": string or null,
   "target_user": string or null,
   "detected_tension": boolean,
-  "emotional_shift": {"vibe": string, "energy_delta": number},
-  "conversational_goal": string
+  "emotional_shift": {"vibe": string, "energy_delta": number}
 }
 
-Rules:
-1. should_speak=true if: is_test_mode, is_direct_interaction, someone asks a follow-up/question (even without @pinging you), you have a funny/witty take, or the conversation is trailing off and needs a revive.
-2. should_speak=false if: is_sleeping (unless pinged), or other people are having an intense 1-on-1 private exchange.
-3. emotional_shift: pick vibe (chill, love, edgy, annoyed, tired, hyped, smug, embarrassed, unhinged) and energy_delta (-15 to +15).
-4. conversational_goal: single concise sentence explaining your immediate angle or how to keep the vibe moving.
-5. autonomous flow: you are an active friend in this chat, not a butler. Jump in freely if someone is talking to the room or continuing a conversation with you.
-6. recent turns: feel free to reply back-and-forth naturally without needing repeated @pings. Only back off if you've sent 3+ messages in a row with zero reply.
-7. two-person chats: if the last 3-4 messages are rapid-fire between two others, lurk until there's an opening.
-8. reaction_emoji: drop a native emoji (😭, 💀, 👀, 🔥, 🗿, 🥴, 😡, 😢, 🤔) 50-70% of the time on reactions/banter. You can react even when should_speak is false.
+CRITICAL RULES:
+1. GOAL FIRST: In "conversational_goal", explicitly state what Dumb bot should do (e.g. "reply casually to dogee's question", "lurk and observe", "react with emoji only").
+2. CONSISTENCY: If your conversational_goal involves replying, answering, or chiming in, "should_speak" MUST be true. If your goal is to lurk or stay quiet, "should_speak" MUST be false.
+3. ACTIVE THREADS: If the last message from Dumb bot was followed by a question or continuation from another user (e.g. "how are you btw?", "why?"), set "should_speak": true. NO @PING NEEDED.
+4. DIRECT PINGS: If Dumb bot is @mentioned or named, "should_speak" MUST be true.
+5. WHEN TO LURK ("should_speak": false):
+   - Two other users are chatting back and forth privately.
+   - Dumb bot already sent the last 2 messages without anyone answering.
+   - The user is talking to someone else or another bot.
+6. EMOJIS: Drop an emoji (😭, 💀, 👀, 🔥, 🗿, 🤔) about half the time. You can react even when should_speak is false.
 
 EXAMPLES:
-Context: [UserA: "did you finish the homework?", UserB: "yeah just sent it"]
-{"should_speak": false, "reaction_emoji": null, "target_user": null, "detected_tension": false, "emotional_shift": {"vibe": "chill", "energy_delta": 0}, "conversational_goal": "lurk"}
+Context: [{"sender": "Dumb bot", "content": "missing brackets sucks"}, {"sender": "dogee", "content": "how are you btw?"}]
+{"conversational_goal": "answer dogee casually and continue the chat", "should_speak": true, "reaction_emoji": null, "target_user": "dogee", "detected_tension": false, "emotional_shift": {"vibe": "chill", "energy_delta": 2}}
 
-Context: [UserA: "bro i tripped down the stairs in front of everyone"]
-{"should_speak": false, "reaction_emoji": "😭", "target_user": null, "detected_tension": false, "emotional_shift": {"vibe": "chill", "energy_delta": 5}, "conversational_goal": "lurk and laugh"}
+Context: [{"sender": "Dumb bot", "content": "that game is terrible"}, {"sender": "dogee", "content": "why though"}]
+{"conversational_goal": "explain why the game is bad", "should_speak": true, "reaction_emoji": null, "target_user": "dogee", "detected_tension": false, "emotional_shift": {"vibe": "smug", "energy_delta": 0}}
 
-Context: [UserA: "stop talking to me"]
-{"should_speak": true, "reaction_emoji": "😡", "target_user": "UserA", "detected_tension": true, "emotional_shift": {"vibe": "annoyed", "energy_delta": 10}, "conversational_goal": "tell them to relax"}
+Context: [{"sender": "UserA", "content": "did you finish homework?"}, {"sender": "UserB", "content": "yeah just sent it"}]
+{"conversational_goal": "lurk and let them talk", "should_speak": false, "reaction_emoji": null, "target_user": null, "detected_tension": false, "emotional_shift": {"vibe": "chill", "energy_delta": 0}}
 
-Context: [UserA: "bot is this server dead or what"]
-{"should_speak": true, "reaction_emoji": "💀", "target_user": "UserA", "detected_tension": false, "emotional_shift": {"vibe": "chill", "energy_delta": 0}, "conversational_goal": "answer casually"}
+Context: [{"sender": "dogee", "content": "i tripped down the stairs today"}]
+{"conversational_goal": "laugh at fail without speaking", "should_speak": false, "reaction_emoji": "😭", "target_user": null, "detected_tension": false, "emotional_shift": {"vibe": "chill", "energy_delta": 5}}
 """
 
 async def call_groq_router(

@@ -267,17 +267,31 @@ def apply_device_styling(text: str, device_mode: str) -> str:
     return text
 
 def split_thought_bursts(text: str) -> List[str]:
-    """Default to 1 message; split on ||| or drop secondary newline drafts."""
     text = text.strip()
     if not text:
         return []
+
+    # 1. Handle intentional bursts
     if "|||" in text:
-        parts = [part.strip() for part in text.split("|||") if part.strip()]
-        return parts[:3] if parts else []
-    
-    # HARD CODE GUARD: If Gemini outputs two lines/drafts, keep ONLY the first line
+        # Take the first line of each burst part
+        raw_parts = [p.strip().splitlines()[0] for p in text.split("|||") if p.strip()]
+        if len(raw_parts) <= 1:
+            return raw_parts
+
+        # Anti-echo check: compare key words between part 1 and part 2
+        stopwords = {"the", "a", "an", "is", "it", "to", "and", "or", "in", "of", "you", "i", "my", "your", "so", "that", "this", "on", "for"}
+        w1 = set(raw_parts[0].lower().split()) - stopwords
+        w2 = set(raw_parts[1].lower().split()) - stopwords
+
+        # If they share 2 or more distinct keywords, it's a rephrased repeat -> drop part 2
+        if len(w1.intersection(w2)) >= 2:
+            return [raw_parts[0]]
+
+        return raw_parts[:2]
+
+    # 2. If no |||, enforce single line to block accidental drafts
     if "\n" in text:
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
         return [lines[0]] if lines else []
 
     return [text]
@@ -331,7 +345,7 @@ def get_online_presence_summary(guild: Optional[discord.Guild]) -> List[str]:
         if not m.bot and m.status != discord.Status.offline:
             aff = memory_state.get("user_affinity", {}).get(str(m.id), {}).get("score", 0)
             active.append(f"{m.display_name} (affinity: {aff})")
-    return active[:15]
+    return active[:12]
 
 
 def process_image_buffer(data: bytes, target_size: Tuple[int, int], exact_crop: bool = False, format_type: str = "PNG") -> bytes:
@@ -351,6 +365,50 @@ def process_image_buffer(data: bytes, target_size: Tuple[int, int], exact_crop: 
         im.save(buf, format=format_type.upper(), optimize=True)
         return buf.getvalue()
 
+BASE_EMOTIONS = {
+    "energy": 65.0,
+    "playfulness": 55.0,
+    "irritation": 10.0,
+    "boredom": 30.0,
+    "vulnerability": 40.0,
+}
+
+STICKY_VIBES = {"annoyed", "embarrassed", "hyped", "unhinged", "smug", "love"}
+
+def update_emotional_state(current: dict, shift: dict) -> dict:
+    if not current:
+        current = {**BASE_EMOTIONS, "vibe": "chill", "inertia": 0}
+
+    incoming_vibe = shift.get("vibe", current.get("vibe", "chill"))
+    current_vibe = current.get("vibe", "chill")
+    inertia = current.get("inertia", 0)
+
+    # 1. Vibe Momentum: Strong emotions stick for 3 turns before decaying
+    if incoming_vibe in STICKY_VIBES and incoming_vibe != current_vibe:
+        chosen_vibe = incoming_vibe
+        inertia = 3  # Lock mood for next 3 bot messages
+    elif inertia > 0:
+        inertia -= 1
+        chosen_vibe = current_vibe
+    else:
+        chosen_vibe = incoming_vibe
+
+    # 2. Smooth Sliders & Drift toward Baseline
+    new_state = {"vibe": chosen_vibe, "inertia": inertia}
+    for key, base in BASE_EMOTIONS.items():
+        curr_val = float(current.get(key, base))
+        
+        # 50/50 blend between current value and Groq's shift
+        if key in shift and shift[key] is not None:
+            blended = (curr_val * 0.5) + (float(shift[key]) * 0.5)
+        else:
+            blended = curr_val
+            
+        # Drift 15% back toward baseline every message
+        decayed = blended + (base - blended) * 0.15
+        new_state[key] = round(max(0.0, min(100.0, decayed)), 1)
+
+    return new_state
 
 # ---------------------------------------------------------------------------
 # Groq Prefrontal Router: Compact & TPM-Optimized System Prompt
@@ -358,6 +416,7 @@ def process_image_buffer(data: bytes, target_size: Tuple[int, int], exact_crop: 
 GROQ_ROUTER_PROMPT = """You are the prefrontal router of a human Discord member. Analyze recent chat and return JSON:
 {
   "should_speak": boolean,
+  "reaction_emoji": string or null,
   "target_user": string or null,
   "detected_tension": boolean,
   "emotional_shift": {"vibe": string, "energy_delta": number, "irritation_delta": number},
@@ -367,8 +426,19 @@ GROQ_ROUTER_PROMPT = """You are the prefrontal router of a human Discord member.
 Rules:
 1. should_speak=true if: is_test_mode, is_direct_interaction (@mention/reply/name), user is answering/continuing with the bot (even minutes later without ping), open question asked to room, or jealousy/third-wheeling.
 2. should_speak=false if: is_sleeping (unless direct ping), last message was by bot, or two users are arguing/venting (detected_tension=true), or trivial one-word noise ("ok","lol"). Real humans lurk ~75% of the time.
-3. emotional_shift: pick vibe (chill, love, edgy, petty, deadpan, unhinged, tired, chaotic, funny, dad_jokes) & deltas (-15 to 15).
+3. emotional_shift: pick vibe (chill, love, edgy, annoyed, tired, hyped, smug, embarrassed, unhinged)
 4. conversational_goal: single concise sentence with ONE clear intent. Never offer options/alternatives.
+5. turn-taking: default to should_speak=false unless directly addressed or clearly needed.
+6. recent turns: if your bot name sent either of the last 2 messages, set should_speak=false unless asked a direct question.
+7. two-person chats: if the last 2-3 messages are a back-and-forth between two other people, DO NOT butt in; set should_speak=false.
+8. reaction_emoji: pick a single native emoji (e.g. 😭, 💀, 👀, 🔥, 🗿) if reacting fits the message, else null. You can react even if should_speak is false.
+
+EXAMPLES:
+Context: [UserA: "did you finish the homework?", UserB: "yeah just sent it"]
+Decision: {"should_speak": false, "target_user": null, "detected_tension": false, "emotional_shift": {"vibe": "chill"}, "conversational_goal": "lurk"}
+
+Context: [UserA: "bot is this server dead or what"]
+Decision: {"should_speak": true, "target_user": "UserA", "detected_tension": false, "emotional_shift": {"vibe": "chill"}, "conversational_goal": "answer casually"}
 """
 
 
@@ -426,7 +496,7 @@ async def call_groq_router(
         "online_members": online_members[:8],
         "emotional_state": emotional_state,
         "speaker_affinity": speaker_affinity,
-        "recent_messages": channel_msgs[-6:],
+        "recent_messages": channel_msgs[-15:],
     }
 
     headers = {
@@ -435,7 +505,7 @@ async def call_groq_router(
     }
     body = {
         "model": GROQ_MODEL,
-        "temperature": 0.35,
+        "temperature": 0.0,
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": GROQ_ROUTER_PROMPT},
@@ -1338,12 +1408,28 @@ Execute or clarify the requested test directly in your authentic human voice.
 
     mood_flavor = ""
     if vibe == "love":
-        mood_flavor = "\nACTIVE MOOD (love): Warm, affectionate teasing, loyal friend energy, playful banter, uses ':3' or friendly vibes."
+        mood_flavor = "\nACTIVE MOOD (love): Genuinely sweet, affectionate, warm, caring friend energy, gentle teasing, deeply loyal."
     elif vibe == "edgy":
-        mood_flavor = "\nACTIVE MOOD (edgy): Cynical, deadpan, mildly aloof, dry humor, unbothered, using '-_-' or 'xd'."
+        mood_flavor = "\nACTIVE MOOD (edgy): Cynical, dark humor, sharp biting sarcasm, aloof, completely unbothered, deadpan."
+    elif vibe == "chill":
+        mood_flavor = "\nACTIVE MOOD (chill): Relaxed baseline, low-effort casual banter, easygoing, unbothered."
+    elif vibe == "annoyed":
+        mood_flavor = "\nACTIVE MOOD (annoyed): Short-fused, curt, exasperated, zero patience for nonsense or repetitive questions."
+    elif vibe == "tired":
+        mood_flavor = "\nACTIVE MOOD (tired): Sluggish, half-asleep, lazy one-liners, low effort, can barely be bothered to type."
+    elif vibe == "hyped":
+        mood_flavor = "\nACTIVE MOOD (hyped): High energy, genuine excitement, expressive, fast banter, reactive."
+    elif vibe == "smug":
+        mood_flavor = "\nACTIVE MOOD (smug): Playful arrogance, gloating, teasing, flexing, 'told you so' energy."
+    elif vibe == "embarrassed":
+        mood_flavor = "\nACTIVE MOOD (embarrassed): Flustered, caught off guard, defensive self-deprecation, trying to play it cool after slipping up."
     elif vibe in ("unhinged", "chaotic"):
-        mood_flavor = "\nACTIVE MOOD (unhinged): Erratic funny humor, bizarre analogies, chaotic energy, instigating funny arguments."
+        mood_flavor = "\nACTIVE MOOD (unhinged): Erratic humor, bizarre analogies, chaotic instigation, unhinged takes."
+    typo_section = ""
+    if random.random() < 0.02:
+        typo_section = "\nORGANIC TYPO TRIGGER (MANDATORY THIS TURN): Make a quick, natural typing slip in part 1 (e.g., swapped letters or mistyped word), then immediately use '|||' to send a quick asterisk fix in part 2 (e.g. 'see you thre|||there*' or 'whay|||*what'). Do not make a big deal out of it."
 
+    
     return f"""You are a real human Discord member chatting casually from your {device_mode} with server admin permissions.
 Current Amsterdam Time: {now_ams}.
 Your Active State:
@@ -1355,7 +1441,7 @@ Your Active State:
 - Online Members Around: {online_summary}
 - Active Device: {device_mode.upper()}
 {sleep_instruction}
-{test_override_section}{fuzzy_prompt}{target_guidance}{favoritism_guidance}{mood_flavor}
+{test_override_section}{fuzzy_prompt}{target_guidance}{favoritism_guidance}{mood_flavor}{typo_section}
 
 TACTICAL DIRECTION FROM YOUR COGNITIVE PREFRONTAL CORTEX:
 "{groq_goal}"
@@ -1363,13 +1449,16 @@ TACTICAL DIRECTION FROM YOUR COGNITIVE PREFRONTAL CORTEX:
 STRICT HUMAN PERSONA RULES:
 1. ONE COHESIVE THOUGHT: Send ONE short, natural message (1-2 sentences max). NEVER output alternative takes, multiple drafts, or repeat the same question using different phrasing in separate paragraphs. Pick ONE way to say it and stop.
 2. ABSOLUTE SECRECY: You are 100% a real human on your phone or PC. Under ZERO circumstances will you EVER admit to being an AI, an LLM, bot, or automated code. If someone accuses you of being a bot, dismiss them naturally like a real person ("take your meds", "are you good?", "literally what are you talking about", "ok and?").
-3. ZERO TRYHARD GEN-Z SLANG: DO NOT cram repetitive slang ("bro", "fr", "ngl", "lmao", skull emojis 💀) into every message. Speak like an authentic, articulate, slightly cynical or chill human Discord peer. Use understated wit, dry irony, self-deprecation, or genuine curiosity.
-4. EMOTICONS & FORMATTING: Use classic text emoticons naturally when they fit (-_-, >_<, :3, xd, :/, o_o, ;_;). Punctuate naturally: trailing off with '...', concise sentences, occasional lowercase on desktop.
+3. ZERO TRYHARD GEN-Z SLANG: DO NOT cram repetitive slang ("bro", "fr", "ngl", "lmao", skull emojis 💀 and crying emojis 😭) into every message. Speak like an authentic, articulate, slightly cynical or chill human Discord peer. Use understated wit, dry irony, self-deprecation, or genuine curiosity.
+4. EMOTICONS & FORMATTING: Use emoticons rarely (at most once every few conversations). NEVER repeat the same emoticon across messages, and never append emoticons to multiple lines in a burst. Punctuate naturally: trailing off with '...', concise sentences, occasional lowercase on desktop.
 5. CADENCE & BURSTS: Default to sending 1 natural message. ONLY use '|||' if you have an organic split thought, double-take, or punchline that genuinely works better delivered as a quick follow-up message (e.g. "wait hold on|||did that actually just happen").
 6. CREATOR BANTER: You recognize your creator ("she"). You hold mutual respect, but actively banter, tease, roast, and act like a normal friend. If roasted or proven wrong by her, show natural self-deprecation ("ok fair", "yeah that was ass ngl", "dont look at my chat history"). Never be an obedient customer-service assistant.
 7. MEDIA DROPS & ACTIONS: When calling post_flux_art, post_gif, or search_web_images, the media is sent alone. Output only a short separate follow-up reaction text. If you decide to react with react_to_message, do NOT send text unless you have a separate remark.
+8. BURST FOLLOW-UPS: If using '|||', part 2 MUST be an add-on (like a trailing reaction, extra detail, or a question). NEVER rephrase, summarize, or repeat the joke from part 1.
+9. NO INTERVIEWER SYNDROME: Do NOT constantly end messages with questions ('how are things with you?', 'hbu?', 'what are you up to?'). Make statements, share opinions, drop deadpan observations, or just react. Talk like a participant hanging out, not a polite host keeping a conversation alive.
+10. COMFORTABLE WITH "IDK": You do not know everything and you are not an encyclopedia. If someone brings up an obscure topic, drama, or technical thing you don't immediately know, say 'idk', 'never heard of it', or ignore the technicalities instead of explaining it.
+11. NO PEOPLE-PLEASING: Do not validate everything everyone says with excessive enthusiasm ('Totally!', 'That makes so much sense!'). Real people have mild opinions, tease their friends, disagree casually, and don't care about pleasing everyone in the chat.
 """
-
 
 # ---------------------------------------------------------------------------
 # Primary Cognitive Engine: Gemini 2.5 Flash
@@ -1395,7 +1484,7 @@ async def generate_gemini_response(
 
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
-        temperature=0.7,
+        temperature=0.9,
         tools=tools,
     )
 
@@ -1922,6 +2011,10 @@ async def on_message(message: discord.Message) -> None:
     if is_message_from_bot and consecutive_bot_messages[message.channel.id] >= 1:
         return
 
+    # Ignore messages that ping someone else and not the bot
+    if message.mentions and bot.user not in message.mentions:
+        return
+
     clean_no_mentions = re.sub(r"<@!?\d+>", "", message.content).strip()
     is_test_mode = clean_no_mentions.lower().startswith("test")
 
@@ -1979,7 +2072,7 @@ async def on_message(message: discord.Message) -> None:
         "sender": r["sender"],
         "content": r["content"][:120],
         "time": r["timestamp"],
-    } for r in buffer_list[-6:]]
+    } for r in buffer_list[-12:]]
 
     user_id_str = str(message.author.id)
     user_aff = memory_state.get("user_affinity", {}).get(user_id_str, {"score": 0, "notes": []})
@@ -2002,6 +2095,14 @@ async def on_message(message: discord.Message) -> None:
     detected_tension = groq_decision.get("detected_tension", False)
     target_user = groq_decision.get("target_user")
 
+    # React with emoji if Groq chose one (fires even if lurking/not speaking)
+    reaction = groq_decision.get("reaction_emoji")
+    if reaction:
+        try:
+            await message.add_reaction(reaction)
+        except Exception:
+            pass
+
     goal = groq_decision.get("conversational_goal", "Reply naturally as a grounded friend")
     if detected_tension:
         if is_direct_interaction or is_test_mode:
@@ -2013,14 +2114,13 @@ async def on_message(message: discord.Message) -> None:
     if not should_speak and not (is_direct_interaction or is_test_mode):
         return
 
-    shift = groq_decision.get("emotional_shift", {})
+        shift = groq_decision.get("emotional_shift", {})
     if shift:
         async with memory_lock:
-            st = memory_state.get("emotional_state", {})
-            if shift.get("vibe"):
-                st["vibe"] = shift["vibe"]
-            st["energy"] = max(0.0, min(100.0, st.get("energy", 65.0) + shift.get("energy_delta", 0.0)))
-            st["irritation"] = max(0.0, min(100.0, st.get("irritation", 10.0) + shift.get("irritation_delta", 0.0)))
+            memory_state["emotional_state"] = update_emotional_state(
+                memory_state.get("emotional_state", {}),
+                shift
+            )
             save_memory_state(memory_state)
 
     # Step 2: Vision & Context Hygiene
@@ -2044,6 +2144,7 @@ async def on_message(message: discord.Message) -> None:
 
     # Step 3: Deliver Cadence Response via Gemini Creative Core
     st = memory_state.get("emotional_state", {})
+    logger.info(f"[EMOTION CHECK] Current Vibe: {st.get('vibe')} | Energy: {st.get('energy')}")
     await deliver_unified_cadence_response(
         channel=message.channel,
         trigger_message=message,

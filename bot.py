@@ -2124,12 +2124,6 @@ async def on_message(message: discord.Message) -> None:
             }
             break
 
-    # Anti-Spam Gate: Ignore trivial one-word chatter ("k") unless directly pinged or replying to bot
-    is_trivial_noise = clean_no_mentions.lower() in ["k", "ye"]
-    bot_recently_asked = last_bot_statement and last_bot_statement.get("was_question") and last_bot_statement.get("minutes_ago", 99) < 10.0
-    if is_trivial_noise and not is_direct_interaction and not is_test_mode and not bot_recently_asked:
-        return
-
     is_sleeping = is_amsterdam_sleeping()
 
     # Compressed payload: last 6 messages truncated to 120 chars to avoid Groq TPM limits

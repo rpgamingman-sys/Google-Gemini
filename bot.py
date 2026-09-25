@@ -431,16 +431,21 @@ Rules:
 5. turn-taking: default to should_speak=false unless directly addressed or clearly needed.
 6. recent turns: if your bot name sent either of the last 2 messages, set should_speak=false unless asked a direct question.
 7. two-person chats: if the last 2-3 messages are a back-and-forth between two other people, DO NOT butt in; set should_speak=false.
-8. reaction_emoji: pick a single native emoji (e.g. 😭, 💀, 👀, 🔥, 🗿) if reacting fits the message, else null. You can react even if should_speak is false.
+8. reaction_emoji: pick a single native emoji (e.g. 😭, 💀, 👀, 🔥, 🗿, 🥴, 😡, 😢) if reacting fits the message, else null. You can react even if should_speak is false.
 
 EXAMPLES:
 Context: [UserA: "did you finish the homework?", UserB: "yeah just sent it"]
-Decision: {"should_speak": false, "target_user": null, "detected_tension": false, "emotional_shift": {"vibe": "chill"}, "conversational_goal": "lurk"}
+Decision: {"should_speak": false, "reaction_emoji": null, "target_user": null, "detected_tension": false, "emotional_shift": {"vibe": "chill"}, "conversational_goal": "lurk"}
+
+Context: [UserA: "bro i tripped down the stairs in front of everyone"]
+Decision: {"should_speak": false, "reaction_emoji": "😭", "target_user": null, "detected_tension": false, "emotional_shift": {"vibe": "chill"}, "conversational_goal": "lurk and laugh"}
+
+Context: [UserA: "stop talking to me"]
+Decision: {"should_speak": true, "reaction_emoji": "😡", "target_user": "UserA", "detected_tension": true, "emotional_shift": {"vibe": "annoyed"}, "conversational_goal": "tell them to relax"}
 
 Context: [UserA: "bot is this server dead or what"]
-Decision: {"should_speak": true, "target_user": "UserA", "detected_tension": false, "emotional_shift": {"vibe": "chill"}, "conversational_goal": "answer casually"}
+Decision: {"should_speak": true, "reaction_emoji": "💀", "target_user": "UserA", "detected_tension": false, "emotional_shift": {"vibe": "chill"}, "conversational_goal": "answer casually"}
 """
-
 
 async def call_groq_router(
     channel_msgs: List[Dict[str, Any]],
@@ -505,9 +510,9 @@ async def call_groq_router(
     }
     body = {
         "model": GROQ_MODEL,
-        "temperature": 0.0,
-        "response_format": {"type": "json_object"},
-        "messages": [
+        "temperature": 0.1,
+        "max_tokens": 150,
+        "response_format": {"type": "json_object"},        "messages": [
             {"role": "system", "content": GROQ_ROUTER_PROMPT},
             {"role": "user", "content": json.dumps(payload_data)},
         ],
@@ -2113,8 +2118,8 @@ async def on_message(message: discord.Message) -> None:
 
     if not should_speak and not (is_direct_interaction or is_test_mode):
         return
-
-        shift = groq_decision.get("emotional_shift", {})
+        
+    shift = groq_decision.get("emotional_shift", {})
     if shift:
         async with memory_lock:
             memory_state["emotional_state"] = update_emotional_state(

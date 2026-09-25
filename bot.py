@@ -64,7 +64,7 @@ logger.info(f"Persistent memory file target: {MEMORY_FILE}")
 
 # Model Configuration
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+GROQ_MODEL = os.getenv(GROQ_MODEL = "openai/gpt-oss-120b")
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
 # Anti-AI tropes blacklist
@@ -525,7 +525,7 @@ async def call_groq_router(
         "online_members": online_members[:8],
         "emotional_state": emotional_state,
         "speaker_affinity": speaker_affinity,
-        "recent_messages": channel_msgs[-15:],
+        "recent_messages": channel_msgs[-5:],
     }
 
     headers = {
@@ -540,7 +540,6 @@ async def call_groq_router(
     "max_tokens": 250,
     "messages": [
         {"role": "system", "content": GROQ_ROUTER_PROMPT},
-
         {"role": "user", "content": f"Analyze the context..."},
     ],
 }

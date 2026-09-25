@@ -2151,7 +2151,7 @@ async def on_message(message: discord.Message) -> None:
         online_members=online_members,
     )
 
-        print(f"[DEBUG] Groq router result: {groq_decision}")
+    print(f"[DEBUG] Groq router result: {groq_decision}")
 
     should_speak = groq_decision.get("should_speak", False)
     detected_tension = groq_decision.get("detected_tension", False)

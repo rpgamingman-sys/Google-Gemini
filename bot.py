@@ -435,16 +435,16 @@ Rules:
 
 EXAMPLES:
 Context: [UserA: "did you finish the homework?", UserB: "yeah just sent it"]
-Decision: {"should_speak": false, "reaction_emoji": null, "target_user": null, "detected_tension": false, "emotional_shift": {"vibe": "chill"}, "conversational_goal": "lurk"}
+{"should_speak": false, "reaction_emoji": null, "target_user": null, "detected_tension": false, "emotional_shift": {"vibe": "chill"}, "conversational_goal": "lurk"}
 
 Context: [UserA: "bro i tripped down the stairs in front of everyone"]
-Decision: {"should_speak": false, "reaction_emoji": "😭", "target_user": null, "detected_tension": false, "emotional_shift": {"vibe": "chill"}, "conversational_goal": "lurk and laugh"}
+{"should_speak": false, "reaction_emoji": "😭", "target_user": null, "detected_tension": false, "emotional_shift": {"vibe": "chill"}, "conversational_goal": "lurk and laugh"}
 
 Context: [UserA: "stop talking to me"]
-Decision: {"should_speak": true, "reaction_emoji": "😡", "target_user": "UserA", "detected_tension": true, "emotional_shift": {"vibe": "annoyed"}, "conversational_goal": "tell them to relax"}
+{"should_speak": true, "reaction_emoji": "😡", "target_user": "UserA", "detected_tension": true, "emotional_shift": {"vibe": "annoyed"}, "conversational_goal": "tell them to relax"}
 
 Context: [UserA: "bot is this server dead or what"]
-Decision: {"should_speak": true, "reaction_emoji": "💀", "target_user": "UserA", "detected_tension": false, "emotional_shift": {"vibe": "chill"}, "conversational_goal": "answer casually"}
+{"should_speak": true, "reaction_emoji": "💀", "target_user": "UserA", "detected_tension": false, "emotional_shift": {"vibe": "chill"}, "conversational_goal": "answer casually"}
 """
 
 async def call_groq_router(
@@ -508,13 +508,14 @@ async def call_groq_router(
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
-    body = {
+        body = {
         "model": GROQ_MODEL,
         "temperature": 0.1,
-        "max_tokens": 150,
-        "response_format": {"type": "json_object"},        "messages": [
+        "max_tokens": 350,
+        "response_format": {"type": "json_object"},
+        "messages": [
             {"role": "system", "content": GROQ_ROUTER_PROMPT},
-            {"role": "user", "content": json.dumps(payload_data)},
+            {"role": "user", "content": f"Analyze this chat data and return JSON:\n{json.dumps(payload_data)}"},
         ],
     }
 

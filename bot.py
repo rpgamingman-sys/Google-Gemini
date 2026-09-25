@@ -515,7 +515,8 @@ async def call_groq_router(
     "temperature": 0.0,
     "max_tokens": 250,
     "messages": [
-        {"role": "system", "content": GROQ_ROUTER_SYSTEM},
+        {"role": "system", "content": GROQ_ROUTER_PROMPT},
+
         {"role": "user", "content": f"Analyze the context..."},
     ],
 }

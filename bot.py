@@ -413,38 +413,38 @@ def update_emotional_state(current: dict, shift: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Groq Prefrontal Router: Compact & TPM-Optimized System Prompt
 # ---------------------------------------------------------------------------
-GROQ_ROUTER_PROMPT = """You are the prefrontal router of a human Discord member. Analyze recent chat and return JSON:
+GROQ_ROUTER_PROMPT = """You are the prefrontal router of an authentic Discord user. Output ONLY a valid JSON object matching this schema:
 {
   "should_speak": boolean,
   "reaction_emoji": string or null,
   "target_user": string or null,
   "detected_tension": boolean,
-  "emotional_shift": {"vibe": string, "energy_delta": number, "irritation_delta": number},
+  "emotional_shift": {"vibe": string, "energy_delta": number},
   "conversational_goal": string
 }
 
 Rules:
-1. should_speak=true if: is_test_mode, is_direct_interaction (@mention/reply/name), user is answering/continuing with the bot (even minutes later without ping), open question asked to room, or jealousy/third-wheeling.
-2. should_speak=false if: is_sleeping (unless direct ping), last message was by bot, or two users are arguing/venting (detected_tension=true), or trivial one-word noise ("ok","lol"). Real humans lurk ~75% of the time.
-3. emotional_shift: pick vibe (chill, love, edgy, annoyed, tired, hyped, smug, embarrassed, unhinged)
-4. conversational_goal: single concise sentence with ONE clear intent. Never offer options/alternatives.
-5. turn-taking: default to should_speak=false unless directly addressed or clearly needed.
-6. recent turns: if your bot name sent either of the last 2 messages, set should_speak=false unless asked a direct question.
-7. two-person chats: if the last 2-3 messages are a back-and-forth between two other people, DO NOT butt in; set should_speak=false.
-8. reaction_emoji: pick a single native emoji (e.g. 😭, 💀, 👀, 🔥, 🗿, 🥴, 😡, 😢) if reacting fits the message, else null. You can react even if should_speak is false.
+1. should_speak=true if: is_test_mode, is_direct_interaction (bot pinged/replied to), or natural opening to speak.
+2. should_speak=false if: is_sleeping (unless direct ping), or bot just spoke and shouldn't dominate.
+3. emotional_shift: pick vibe (chill, love, edgy, annoyed, tired, hyped, smug, embarrassed, unhinged) and energy_delta (-15 to +15).
+4. conversational_goal: single concise sentence explaining your immediate angle.
+5. turn-taking: default to should_speak=false unless you have something witty, relevant, or necessary to add.
+6. recent turns: if your bot name sent either of the last 2 messages, favor silence unless directly addressed.
+7. two-person chats: if the last 2-3 messages are a fast back-and-forth between two other people, lurk.
+8. reaction_emoji: pick a single native emoji (😭, 💀, 👀, 🔥, 🗿, 🥴, 😡, 😢, 🤔) roughly 40-50% of the time on banter, jokes, or drama. Only use null when chat is completely mundane. You can react even if should_speak is false.
 
 EXAMPLES:
 Context: [UserA: "did you finish the homework?", UserB: "yeah just sent it"]
-{"should_speak": false, "reaction_emoji": null, "target_user": null, "detected_tension": false, "emotional_shift": {"vibe": "chill"}, "conversational_goal": "lurk"}
+{"should_speak": false, "reaction_emoji": null, "target_user": null, "detected_tension": false, "emotional_shift": {"vibe": "chill", "energy_delta": 0}, "conversational_goal": "lurk"}
 
 Context: [UserA: "bro i tripped down the stairs in front of everyone"]
-{"should_speak": false, "reaction_emoji": "😭", "target_user": null, "detected_tension": false, "emotional_shift": {"vibe": "chill"}, "conversational_goal": "lurk and laugh"}
+{"should_speak": false, "reaction_emoji": "😭", "target_user": null, "detected_tension": false, "emotional_shift": {"vibe": "chill", "energy_delta": 5}, "conversational_goal": "lurk and laugh"}
 
 Context: [UserA: "stop talking to me"]
-{"should_speak": true, "reaction_emoji": "😡", "target_user": "UserA", "detected_tension": true, "emotional_shift": {"vibe": "annoyed"}, "conversational_goal": "tell them to relax"}
+{"should_speak": true, "reaction_emoji": "😡", "target_user": "UserA", "detected_tension": true, "emotional_shift": {"vibe": "annoyed", "energy_delta": 10}, "conversational_goal": "tell them to relax"}
 
 Context: [UserA: "bot is this server dead or what"]
-{"should_speak": true, "reaction_emoji": "💀", "target_user": "UserA", "detected_tension": false, "emotional_shift": {"vibe": "chill"}, "conversational_goal": "answer casually"}
+{"should_speak": true, "reaction_emoji": "💀", "target_user": "UserA", "detected_tension": false, "emotional_shift": {"vibe": "chill", "energy_delta": 0}, "conversational_goal": "answer casually"}
 """
 
 async def call_groq_router(
@@ -505,54 +505,56 @@ async def call_groq_router(
     }
 
     headers = {
+    headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
     body = {
         "model": GROQ_MODEL,
-        "temperature": 0.1,
-        "max_tokens": 350,
-        "response_format": {"type": "json_object"},
+        "temperature": 0.2,
+        "max_tokens": 250,
         "messages": [
             {"role": "system", "content": GROQ_ROUTER_PROMPT},
-            {"role": "user", "content": f"Analyze this chat data and return JSON:\n{json.dumps(payload_data)}"},
+            {"role": "user", "content": f"Analyze this chat and output ONLY the raw JSON object:\n{json.dumps(payload_data)}"},
         ],
     }
 
     try:
         assert http_session is not None
-        async with http_session.post(GROQ_ENDPOINT, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+        async with http_session.post(GROQ_ENDPOINT, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=5)) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 raw_text = data["choices"][0]["message"]["content"]
-                clean_json_str = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text.strip(), flags=re.MULTILINE)
-                decision = json.loads(clean_json_str)
+                match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+                decision = json.loads(match.group(0)) if match else json.loads(raw_text)
+
                 if is_direct_interaction or is_test_mode:
                     decision["should_speak"] = True
                 return decision
             elif resp.status == 429:
-                logger.debug("Groq 429 TPM rate limit hit, using fallback decision.")
+                logger.debug("Groq 429 TPM rate limit hit, using fallback decision")
                 return {
                     "should_speak": is_direct_interaction or is_test_mode,
+                    "reaction_emoji": None,
                     "target_user": None,
                     "detected_tension": False,
-                    "emotional_shift": {"vibe": emotional_state.get("vibe", "chill"), "energy_delta": 0.0, "irritation_delta": 0.0},
-                    "conversational_goal": "Reply naturally",
+                    "emotional_shift": {"vibe": emotional_state.get("vibe", "chill"), "energy_delta": 0},
+                    "conversational_goal": "Reply naturally despite rate limits"
                 }
             else:
                 logger.warning(f"Groq router HTTP {resp.status}: {await resp.text()}")
     except Exception as e:
-        logger.error(f"Groq router error: {e}")
+        logger.warning(f"Groq router call failed: {e}")
 
-    default_speak = is_direct_interaction or (is_proactive_scan and inactivity_minutes > 45)
+    default_speak = is_direct_interaction or is_test_mode
     return {
         "should_speak": default_speak,
+        "reaction_emoji": None,
         "target_user": None,
         "detected_tension": False,
-        "emotional_shift": {"vibe": emotional_state.get("vibe", "chill"), "energy_delta": 0.0, "irritation_delta": 0.0},
-        "conversational_goal": "Reply naturally",
+        "emotional_shift": {"vibe": emotional_state.get("vibe", "chill"), "energy_delta": 0},
+        "conversational_goal": "Lurk or reply if directly pinged"
     }
-
 
 # ---------------------------------------------------------------------------
 # Fallback AI Engine: Groq Direct Conversational Generation
@@ -2103,11 +2105,12 @@ async def on_message(message: discord.Message) -> None:
 
     # React with emoji if Groq chose one (fires even if lurking/not speaking)
     reaction = groq_decision.get("reaction_emoji")
-    if reaction:
+    if reaction and isinstance(reaction, str):
         try:
-            await message.add_reaction(reaction)
-        except Exception:
-            pass
+            await message.add_reaction(reaction.strip())
+        except Exception as e:
+            logger.warning(f"Reaction error: {e}")
+
 
     goal = groq_decision.get("conversational_goal", "Reply naturally as a grounded friend")
     if detected_tension:

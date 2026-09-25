@@ -1760,7 +1760,8 @@ async def dynamic_presence_loop() -> None:
         )
         return
 
-        vibe = memory_state.get("emotional_state", {}).get("vibe", "chill")
+    vibe = memory_state.get("emotional_state", {}).get("vibe", "chill")
+
     daytime_statuses = [
         # Gaming (Desktop)
         ("desktop", discord.Activity(type=discord.ActivityType.playing, name="Elden Ring")),

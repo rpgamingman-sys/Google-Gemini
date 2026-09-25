@@ -1,4 +1,4 @@
-import os
+ww2import os
 import sys
 import io
 import re
@@ -442,7 +442,8 @@ GROQ_ROUTER_PROMPT = """You are the prefrontal router for a Discord user named "
 CRITICAL RULES:
 1. GOAL FIRST: In "conversational_goal", explicitly state what Dumb bot should do (e.g. "reply casually to dogee's question", "lurk and observe", "react with emoji only").
 2. CONSISTENCY: If your conversational_goal involves replying, answering, or chiming in, "should_speak" MUST be true. If your goal is to lurk or stay quiet, "should_speak" MUST be false.
-3. ACTIVE THREADS: If the last message from Dumb bot was followed by a question or continuation from another user (e.g. "how are you btw?", "why?"), set "should_speak": true. NO @PING NEEDED.
+3. ACTIVE THREADS: If Dumb bot spoke last and someone responds without naming anyone else (e.g. "how are you", "why", "what do you mean"), assume they are talking to Dumb bot -> set "should_speak": true. 
+   EXCEPTION: If the user clearly addresses someone else (e.g. names "Shadow" or pings someone else), set "should_speak": false.
 4. DIRECT PINGS: If Dumb bot is @mentioned or named, "should_speak" MUST be true.
 5. WHEN TO LURK ("should_speak": false):
    - Two other users are chatting back and forth privately.
@@ -462,6 +463,12 @@ Context: [{"sender": "UserA", "content": "did you finish homework?"}, {"sender":
 
 Context: [{"sender": "dogee", "content": "i tripped down the stairs today"}]
 {"conversational_goal": "laugh at fail without speaking", "should_speak": false, "reaction_emoji": "😭", "target_user": null, "detected_tension": false, "emotional_shift": {"vibe": "chill", "energy_delta": 5}}
+
+Context: [{"sender": "Dumb bot", "content": "stop sending mp3 files"}, {"sender": "dogee", "content": "Well how are you"}]
+{"conversational_goal": "answer dogee's question casually", "should_speak": true, "reaction_emoji": null, "target_user": "dogee", "detected_tension": false, "emotional_shift": {"vibe": "chill", "energy_delta": 2}}
+
+Context: [{"sender": "Dumb bot", "content": "stop sending mp3 files"}, {"sender": "dogee", "content": "shadow did you see that"}]
+{"conversational_goal": "stay quiet because dogee is talking to shadow", "should_speak": false, "reaction_emoji": null, "target_user": "shadow", "detected_tension": false, "emotional_shift": {"vibe": "chill", "energy_delta": 0}}
 """
 
 async def call_groq_router(

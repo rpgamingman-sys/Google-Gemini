@@ -519,7 +519,6 @@ async def call_groq_router(
 
     payload_data = {
         "is_sleeping": is_sleeping,
-        "is_direct_interaction": is_direct_interaction,
         "is_test_mode": is_test_mode,
         "is_proactive_scan": is_proactive_scan,
         "inactivity_minutes": round(inactivity_minutes, 1),

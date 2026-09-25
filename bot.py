@@ -1760,110 +1760,45 @@ async def dynamic_presence_loop() -> None:
         )
         return
 
-    vibe = memory_state.get("emotional_state", {}).get("vibe", "chill")
+        vibe = memory_state.get("emotional_state", {}).get("vibe", "chill")
     daytime_statuses = [
+        # Gaming (Desktop)
         ("desktop", discord.Activity(type=discord.ActivityType.playing, name="Elden Ring")),
-        ("desktop", discord.Activity(type=discord.ActivityType.playing, name="Silksong")),
+        ("desktop", discord.Activity(type=discord.ActivityType.playing, name="Subnautica")),
+        ("desktop", discord.Activity(type=discord.ActivityType.playing, name="Minecraft")),
+        ("desktop", discord.Activity(type=discord.ActivityType.playing, name="Balatro")),
+        ("desktop", discord.Activity(type=discord.ActivityType.playing, name="Hades II")),
+        ("desktop", discord.Activity(type=discord.ActivityType.playing, name="Roblox")),
+        ("desktop", discord.Activity(type=discord.ActivityType.playing, name="Terraria")),
+        ("desktop", discord.Activity(type=discord.ActivityType.playing, name="Cyberpunk 2077")),
+
+        # Media & Music (Desktop & Mobile)
+        ("desktop", discord.Activity(type=discord.ActivityType.watching, name="YouTube")),
+        ("desktop", discord.Activity(type=discord.ActivityType.watching, name="a 3-hour video essay")),
+        ("desktop", discord.Activity(type=discord.ActivityType.watching, name="Twitch")),
         ("mobile", discord.Activity(type=discord.ActivityType.listening, name="Spotify")),
+        ("mobile", discord.Activity(type=discord.ActivityType.listening, name="music")),
+        ("desktop", discord.Activity(type=discord.ActivityType.listening, name="Spotify")),
+
+        # Natural Custom Statuses (Mobile & Desktop)
         ("mobile", discord.CustomActivity(name="Custom Status", state="making coffee")),
+        ("mobile", discord.CustomActivity(name="Custom Status", state="afk eating cold leftovers")),
+        ("mobile", discord.CustomActivity(name="Custom Status", state="touching grass momentarily")),
+        ("mobile", discord.CustomActivity(name="Custom Status", state="battery at 7%")),
+        ("mobile", discord.CustomActivity(name="Custom Status", state="on the bus")),
         ("mobile", discord.CustomActivity(name="Custom Status", state="reading notes")),
         ("desktop", discord.CustomActivity(name="Custom Status", state=f"feeling {vibe}")),
+        ("desktop", discord.CustomActivity(name="Custom Status", state="staring at 50 open tabs")),
+        ("desktop", discord.CustomActivity(name="Custom Status", state="cleaning my desk finally")),
+        ("desktop", discord.CustomActivity(name="Custom Status", state="organizing files")),
     ]
 
     mode, activity = random.choice(daytime_statuses)
     current_device_mode = mode
     await bot.change_presence(status=discord.Status.online, activity=activity)
 
-
-@tasks.loop(minutes=7)
-async def proactive_room_scanner() -> None:
-    """
-    Intelligent Proactive Scanner:
-    Inspects room inactivity, classifies silence tone, enforces commitments,
-    and allows Gemini to autonomously post text, emojis, GIFs, or Flux art.
-    """
-    if is_amsterdam_sleeping():
-        return
-
-    target_channel: Optional[discord.TextChannel] = None
-    stored_ch_id = memory_state.get("last_active_channel_id")
-    if stored_ch_id:
-        ch = bot.get_channel(stored_ch_id)
-        if isinstance(ch, discord.TextChannel):
-            target_channel = ch
-
-    if not target_channel:
-        for g in bot.guilds:
-            for ch in g.text_channels:
-                if ch.permissions_for(g.me).send_messages:
-                    name_lower = ch.name.lower()
-                    if not any(k in name_lower for k in ["rules", "announcement", "welcome", "log", "mod"]):
-                        target_channel = ch
-                        break
-            if target_channel:
-                break
-
-    if not target_channel:
-        return
-
-    await hydrate_channel_buffer(target_channel)
-
-    now_utc = datetime.now(timezone.utc)
-    now_ams = datetime.now(AMSTERDAM_TZ)
-    now_epoch = now_utc.timestamp()
-
-    # 1. Commitment Enforcement Tracker
-    async with memory_lock:
-        for c in memory_state.get("active_commitments", []):
-            if not c.get("called_out", False):
-                due_dt = datetime.fromisoformat(c["due_timestamp"])
-                if now_ams > due_dt:
-                    c["called_out"] = True
-                    save_memory_state(memory_state)
-                    target = f"<@{c['user_id']}>" if c.get("user_id") else c.get("username", "someone")
-                    callout_text = f"yo {target} didn't you promise you were gonna {c['promise']}? what happened with that"
-                    sent_callout = await target_channel.send(callout_text)
-                    channel_last_bot_spoke[target_channel.id] = now_epoch
-                    consecutive_bot_messages[target_channel.id] += 1
-                    record_buffer_message(target_channel.id, bot.user.display_name if bot.user else "me", callout_text, sent_callout.id, is_bot=True)
-                    return
-
-    records = list(channel_buffers[target_channel.id])
-    if not records:
-        return
-
-    last_rec = records[-1]
-    time_since_last_activity = now_epoch - last_rec.get("timestamp_epoch", now_epoch)
-
-    # Don't interrupt if active less than 20 minutes ago
-    if time_since_last_activity < 1200:
-        return
-
-    # Classify how chat went silent
-    last_context_type = "normal"
-    last_content = last_rec.get("content", "")
-    if "?" in last_content and not last_rec.get("is_bot", False):
-        last_context_type = "unanswered_question"
-    elif last_rec.get("has_media", False) or any(k in last_content.lower() for k in ["lol", "lmao", "haha", "xd", "dead"]):
-        last_context_type = "ended_on_joke_or_media"
-    elif time_since_last_activity > 10800:
-        last_context_type = "extended_dead_chat"
-
-    last_msg_id = last_rec.get("message_id")
-    trigger_message: Optional[discord.Message] = None
-    if last_msg_id:
-        try:
-            trigger_message = await target_channel.fetch_message(last_msg_id)
-        except Exception as e:
-            logger.debug(f"Scanner could not fetch trigger message {last_msg_id}: {e}")
-
-    channel_msgs_payload = [{
-        "sender": r["sender"],
-        "content": r["content"][:120],
-        "time": r["timestamp"],
 channel_next_proactive_epoch: Dict[int, float] = {}
 channel_retry_attempts: Dict[int, int] = defaultdict(int)
-
 @tasks.loop(minutes=5)
 async def proactive_room_scanner() -> None:
     """

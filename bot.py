@@ -275,33 +275,12 @@ def split_thought_bursts(text: str) -> List[str]:
         parts = [part.strip() for part in text.split("|||") if part.strip()]
         return parts[:3] if parts else []
     
-    # HARD CODE GUARD: Discard secondary paragraph drafts
+    # HARD CODE GUARD: If Gemini outputs two lines/drafts, keep ONLY the first line
     if "\n" in text:
-        paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
-        return [paragraphs[0]] if paragraphs else []
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return [lines[0]] if lines else []
 
     return [text]
-    
-
-def split_thought_bursts(text: str) -> List[str]:
-    """
-    Splits thoughts for realistic pacing:
-    - If text contains '|||', split normally on '|||' (max 3 parts).
-    - If no '|||' is present but text contains '\n\n', treat subsequent paragraphs
-      as discarded alternative drafts and return only the first paragraph.
-    - Otherwise, return [text].
-    """
-    text = text.strip()
-    if not text:
-        return []
-    if "|||" in text:
-        parts = [part.strip() for part in text.split("|||") if part.strip()]
-        return parts[:3] if parts else []
-    if "\n\n" in text:
-        paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-        return [paragraphs[0]] if paragraphs else []
-    return [text]
-
 
 def apply_simulated_typo(text: str) -> Tuple[str, Optional[str]]:
     """1.5% chance to simulate a character swap followed by an asterisk fix."""

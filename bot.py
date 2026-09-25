@@ -1861,6 +1861,111 @@ async def proactive_room_scanner() -> None:
         "sender": r["sender"],
         "content": r["content"][:120],
         "time": r["timestamp"],
+channel_next_proactive_epoch: Dict[int, float] = {}
+channel_retry_attempts: Dict[int, int] = defaultdict(int)
+
+@tasks.loop(minutes=5)
+async def proactive_room_scanner() -> None:
+    """
+    Periodically checks the room.
+    - Waits 8-25 mins of silence after someone stops chatting.
+    - Cooldown after speaking: 30m to 4h (weighted toward 3-4h via triangular distribution).
+    - If Groq skips speaking, it re-checks in exactly 20 mins.
+    - Consecutive skips increase the urge to revive chat so it doesn't stay stuck silent.
+    """
+    if is_amsterdam_sleeping():
+        return
+
+    target_channel: Optional[discord.TextChannel] = None
+    stored_ch_id = memory_state.get("last_active_channel_id")
+    if stored_ch_id:
+        ch = bot.get_channel(stored_ch_id)
+        if isinstance(ch, discord.TextChannel):
+            target_channel = ch
+
+    if not target_channel:
+        for g in bot.guilds:
+            for ch in g.text_channels:
+                if ch.permissions_for(g.me).send_messages:
+                    name_lower = ch.name.lower()
+                    if not any(k in name_lower for k in ["rules", "announcement", "welcome", "log", "mod"]):
+                        target_channel = ch
+                        break
+            if target_channel:
+                break
+
+    if not target_channel:
+        return
+
+    await hydrate_channel_buffer(target_channel)
+
+    now_utc = datetime.now(timezone.utc)
+    now_ams = datetime.now(AMSTERDAM_TZ)
+    now_epoch = now_utc.timestamp()
+
+    # 1. Commitment Enforcement Tracker
+    async with memory_lock:
+        for c in memory_state.get("active_commitments", []):
+            if not c.get("called_out", False):
+                due_dt = datetime.fromisoformat(c["due_timestamp"])
+                if now_ams > due_dt:
+                    c["called_out"] = True
+                    save_memory_state(memory_state)
+                    target = f"<@{c['user_id']}>" if c.get("user_id") else c.get("username", "someone")
+                    callout_text = f"yo {target} didn't you promise you were gonna {c['promise']}? what happened with that"
+                    sent_callout = await target_channel.send(callout_text)
+                    channel_last_bot_spoke[target_channel.id] = now_epoch
+                    consecutive_bot_messages[target_channel.id] += 1
+                    record_buffer_message(target_channel.id, bot.user.display_name if bot.user else "me", callout_text, sent_callout.id, is_bot=True)
+                    return
+
+    records = list(channel_buffers[target_channel.id])
+    if not records:
+        return
+
+    last_rec = records[-1]
+
+    # FAILSAFE 1: If bot spoke last, stop completely until someone else messages
+    if last_rec.get("is_bot", False):
+        channel_retry_attempts[target_channel.id] = 0
+        return
+
+    # FAILSAFE 2: Respect cooldown timer (either the 30m-4h window or the 20m retry delay)
+    next_allowed = channel_next_proactive_epoch.get(target_channel.id, 0)
+    if now_epoch < next_allowed:
+        return
+
+    # FAILSAFE 3: Must have at least 8 to 25 minutes of silence after a user stopped talking
+    time_since_last_activity = now_epoch - last_rec.get("timestamp_epoch", now_epoch)
+    required_inactivity = random.randint(480, 1500)
+    if time_since_last_activity < required_inactivity:
+        return
+
+    # Track how chat went quiet
+    last_context_type = "normal"
+    last_content = last_rec.get("content", "")
+    if "?" in last_content:
+        last_context_type = "unanswered_question"
+    elif last_rec.get("has_media", False) or any(k in last_content.lower() for k in ["lol", "lmao", "haha", "xd", "dead"]):
+        last_context_type = "ended_on_joke_or_media"
+    elif time_since_last_activity > 7200:
+        last_context_type = "extended_dead_chat"
+
+    attempts = channel_retry_attempts[target_channel.id]
+    context_desc = f"{last_context_type} (room quiet for {int(time_since_last_activity / 60)}m, passed {attempts} times)"
+
+    last_msg_id = last_rec.get("message_id")
+    trigger_message: Optional[discord.Message] = None
+    if last_msg_id:
+        try:
+            trigger_message = await target_channel.fetch_message(last_msg_id)
+        except Exception as e:
+            logger.debug(f"Scanner could not fetch message {last_msg_id}: {e}")
+
+    channel_msgs_payload = [{
+        "sender": r["sender"],
+        "content": r["content"][:120],
+        "time": r["timestamp"],
     } for r in records[-6:]]
 
     st = memory_state.get("emotional_state", {})
@@ -1874,20 +1979,36 @@ async def proactive_room_scanner() -> None:
         is_direct_interaction=False,
         is_test_mode=False,
         last_bot_statement=None,
-        last_message_from_bot=last_rec.get("is_bot", False),
+        last_message_from_bot=False,
         online_members=online_members,
         is_proactive_scan=True,
         inactivity_minutes=time_since_last_activity / 60.0,
-        last_context_type=last_context_type,
+        last_context_type=context_desc,
     )
 
     should_act = groq_decision.get("should_speak", False)
+
+    # Momentum escalation: if it held back 2+ times in dead silence, give a scaling 35%/70% bias to revive anyway
+    if not should_act and attempts >= 2:
+        revive_chance = 0.35 if attempts == 2 else 0.70
+        if random.random() < revive_chance:
+            should_act = True
+            logger.info(f"Proactive Scanner: overriding Groq passivity after {attempts} silent checks.")
+
+    # If it still chooses not to speak, re-check in exactly 20 minutes
     if not should_act:
+        channel_retry_attempts[target_channel.id] = attempts + 1
+        channel_next_proactive_epoch[target_channel.id] = now_epoch + 1200  # 20 mins
+        logger.debug(f"Proactive scan passed ({attempts + 1} skips). Retrying in 20 minutes.")
         return
 
-    goal = groq_decision.get("conversational_goal", "Drop an unprompted dry observation or funny remark based on the past chat.")
+    # It chose to speak: reset skips and roll a 30m - 4h cooldown (skewed heavily toward 3-4 hours)
+    channel_retry_attempts[target_channel.id] = 0
+    channel_next_proactive_epoch[target_channel.id] = now_epoch + random.triangular(1800, 14400, 14400)
+
+    goal = groq_decision.get("conversational_goal", "Drop an unprompted dry observation or bring up a topic.")
     target_user = groq_decision.get("target_user")
-    logger.info(f"Proactive Scanner triggered on #{target_channel.name}: {goal} (Context: {last_context_type})")
+    logger.info(f"Proactive Scanner triggered on #{target_channel.name}: {goal} (Context: {context_desc})")
 
     await deliver_unified_cadence_response(
         channel=target_channel,
@@ -1901,7 +2022,6 @@ async def proactive_room_scanner() -> None:
         current_image_part=None,
         online_members=online_members,
     )
-
 
 # ---------------------------------------------------------------------------
 # Discord Event Handlers
@@ -2065,8 +2185,8 @@ async def on_message(message: discord.Message) -> None:
             }
             break
 
-    # Anti-Spam Gate: Ignore trivial one-word chatter ("ok", "lol", "k") unless directly pinged or replying to bot
-    is_trivial_noise = clean_no_mentions.lower() in ["ok", "k", "lol", "lmao", "yeah", "nah", "idk", "ye", "nice", "cool"]
+    # Anti-Spam Gate: Ignore trivial one-word chatter ("k") unless directly pinged or replying to bot
+    is_trivial_noise = clean_no_mentions.lower() in ["k", "ye"]
     bot_recently_asked = last_bot_statement and last_bot_statement.get("was_question") and last_bot_statement.get("minutes_ago", 99) < 10.0
     if is_trivial_noise and not is_direct_interaction and not is_test_mode and not bot_recently_asked:
         return

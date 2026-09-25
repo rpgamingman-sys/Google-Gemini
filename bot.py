@@ -508,7 +508,7 @@ async def call_groq_router(
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
-        body = {
+    body = {
         "model": GROQ_MODEL,
         "temperature": 0.1,
         "max_tokens": 350,

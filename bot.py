@@ -545,12 +545,12 @@ async def call_groq_router(
                 data = await resp.json()
                 raw_text = data["choices"][0]["message"]["content"]
                 match = re.search(r"\{.*\}", raw_text, re.DOTALL)
-                decision = json.loads(match.group(0)) if match else json.loads(raw_text)
+                decision = json.loads(match.group(0))
 
                 if is_direct_interaction or is_test_mode:
                     decision["should_speak"] = True
                 return decision
-             elif resp.status == 429:
+            elif resp.status == 429:
                 err_msg = await resp.text()
                 print(f"[GROQ 429 ERROR] {err_msg}")
                 return {
@@ -558,11 +558,11 @@ async def call_groq_router(
                     "reaction_emoji": None,
                     "target_user": None,
                     "detected_tension": False,
-                    "emotional_shift": {"vibe": emotional_state.get("vibe", "chill"), "energy_delta": 0},
+                    "emotional_shift": {"vibe": "chill", "energy_delta": 0},
                     "conversational_goal": "Reply naturally despite rate limits"
                 }
             else:
-                logger.warning(f"Groq router HTTP {resp.status}: {await resp.text()}")
+                logger.warning(f"Groq router HTTP {resp.status}")
     except Exception as e:
         logger.warning(f"Groq router call failed: {e}")
 

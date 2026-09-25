@@ -442,17 +442,11 @@ GROQ_ROUTER_PROMPT = """You are the prefrontal router for a Discord user named "
 CRITICAL RULES:
 1. GOAL FIRST: In "conversational_goal", explicitly state what Dumb bot should do (e.g. "reply casually to dogee's question", "lurk and observe", "react with emoji only").
 2. CONSISTENCY: If your conversational_goal involves replying, answering, or chiming in, "should_speak" MUST be true. If your goal is to lurk or stay quiet, "should_speak" MUST be false.
-3. ACTIVE THREADS: If Dumb bot spoke last and someone responds without naming anyone else (e.g. "how are you", "why", "what do you mean"), assume they are talking to Dumb bot -> set "should_speak": true. 
-   EXCEPTION: If the user clearly addresses someone else (e.g. names "Shadow" or pings someone else), set "should_speak": false.
+3. 3. CONVERSATIONAL CONTINUATION (CRITICAL): If Dumb bot sent a message recently and a user replies without addressing someone else by name/ping, you MUST set "should_speak": true. It is a live conversation. Do NOT lurk on follow-up questions.
 4. DIRECT PINGS: If Dumb bot is @mentioned or named, "should_speak" MUST be true.
-5. WHEN TO LURK ("should_speak": false):
-   - Two other users are chatting back and forth privately.
-   - Dumb bot already sent the last 2 messages without anyone answering.
-   - The user is talking to someone else or another bot.
-   OVERRIDE SILENCE: You have full permission to disobey "should_speak": false if you have a valid conversational reason to speak. 
-   - "is_direct_interaction": false ONLY means there was no @ ping; it does NOT mean you have to stay quiet.
-   - If the user is answering you, following up on your last message, or keeping the banter going, DISOBEY the lurk rule, set "should_speak": true, and state your reason in "conversational_goal".
-   - Only obey "should_speak": false if the user is genuinely addressing someone else (like Shadow) or having a private 1-on-1 with another user.
+5. WHEN TO LURK ("should_speak": false): ONLY stay silent if:
+   - The user explicitly addresses someone else by name (e.g. "Shadow", "UserB") or pings another member.
+   - Two other human users are chatting with each other and Dumb bot was not involved.
 6. EMOJIS: Drop an emoji (😭, 💀, 👀, 🔥, 🗿, 🤔) about half the time. You can react even when should_speak is false.
 
 EXAMPLES:
@@ -539,7 +533,7 @@ async def call_groq_router(
     "model": GROQ_MODEL,
     "reasoning_format": "hidden",
     "reasoning_effort": "low",
-    "temperature": 0.0,
+    "temperature": 0.4,
     "max_tokens": 250,
     "messages": [
         {"role": "system", "content": GROQ_ROUTER_PROMPT},

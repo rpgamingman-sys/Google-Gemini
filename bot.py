@@ -76,7 +76,7 @@ GEMINI_MODEL_CANDIDATES: List[str] = list(dict.fromkeys([
 ]))
 active_gemini_model: str = GEMINI_MODEL_CANDIDATES[0]
 
-# Primary Router: Llama-3.3-70B-Versatile (Blueprint spec) with automatic 8B failover on 429
+# Primary Router: Llama-3.3-70B-Versatile with automatic 8B failover on 429
 ENV_GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_MODEL_CANDIDATES: List[str] = list(dict.fromkeys([
     "llama-3.3-70b-versatile",
@@ -86,7 +86,7 @@ GROQ_MODEL_CANDIDATES: List[str] = list(dict.fromkeys([
 active_groq_model: str = GROQ_MODEL_CANDIDATES[0]
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
-# Hard Regex Filter for Corny AI / Anime / Edgelord Tropes
+# Hard Regex Filter for Corny AI / Anime / Sitcom-Nerd Clichés
 BANNED_WORDS_MAP = {
     r"\bvoid\b": "nothing",
     r"\bmortals\b": "people",
@@ -102,6 +102,21 @@ BANNED_WORDS_MAP = {
     r"\bassist you\b": "help",
     r"\bmy programming\b": "my brain",
     r"\bmy directive\b": "my plan",
+    r"\bspaghetti code\b": "mess",
+    r"\bpure caffeine\b": "nothing",
+    r"\bserver latency\b": "lag",
+    r"\bwidgets\b": "things",
+}
+
+STOPWORDS = {
+    "the", "and", "that", "this", "with", "for", "you", "your", "are", "was",
+    "were", "have", "has", "had", "not", "but", "what", "when", "where", "who",
+    "why", "how", "from", "they", "them", "their", "there", "here", "just",
+    "like", "about", "into", "over", "some", "more", "out", "can", "will",
+    "would", "could", "should", "dont", "didnt", "doesnt", "isnt", "arent",
+    "wasnt", "werent", "yeah", "okay", "going", "doing", "being", "really",
+    "still", "even", "much", "very", "only", "also", "back", "know", "think",
+    "make", "made", "want", "need", "look", "good", "well", "time", "right",
 }
 
 # ---------------------------------------------------------------------------
@@ -350,7 +365,7 @@ def apply_spring_decay_and_shift(
 
 
 # ---------------------------------------------------------------------------
-# 5. CONTEXT BUFFERS, REPLY RESOLVER, ANTI-REPETITION & SNIPE HELPERS
+# 5. CONTEXT BUFFERS, REPLY RESOLVER, ANTI-CALLBACK BLOCKER & SNIPE HELPERS
 # ---------------------------------------------------------------------------
 def record_buffer_message(
     channel_id: int,
@@ -380,11 +395,6 @@ def record_buffer_message(
 
 
 def resolve_referenced_author(message: discord.Message, channel_id: int) -> Tuple[Optional[str], bool, bool]:
-    """
-    Accurately resolves who a message is replying to, even if Discord's internal cache
-    missed `message.reference.resolved` (e.g. after a Railway restart).
-    Returns: (reply_to_display_name, replied_to_bot, replied_to_other_human)
-    """
     if not message.reference:
         return None, False, False
 
@@ -436,12 +446,16 @@ async def hydrate_channel_buffer(channel: discord.abc.Messageable) -> None:
         logger.debug(f"Hydration failed for {ch_id}: {e}")
 
 
-def get_overused_bot_phrases(channel_id: int) -> List[str]:
-    """Scans the bot's last 10 messages in the channel and blacklists overused openers/slang."""
+def get_overused_bot_phrases_and_recent_bits(channel_id: int) -> Tuple[List[str], List[str]]:
+    """
+    1. Scans the bot's last 10 messages for overused openers/slang.
+    2. Extracts distinctive nouns/keywords from the bot's LAST 3 MESSAGES so the bot
+       NEVER repeats the same joke/metaphor twice in a row (e.g. 'spaghetti code', 'compile').
+    """
     bot_msgs = [r["content"].lower() for r in list(channel_buffers[channel_id])[-25:] if r.get("is_bot")]
     recent_bot = bot_msgs[-10:]
     if not recent_bot:
-        return []
+        return [], []
 
     opener_counts: Dict[str, int] = defaultdict(int)
     slang_watchlist = ["bro", "nah", "lowkey", "crazy", "honestly", "wait", "valid", "real", "ngl", "fr", "wild", "fair"]
@@ -457,9 +471,18 @@ def get_overused_bot_phrases(channel_id: int) -> List[str]:
             if re.search(rf"\b{sw}\b", txt):
                 slang_counts[sw] += 1
 
-    banned = [k for k, c in opener_counts.items() if c >= 2 and k not in ("i", "the", "a", "it", "you", "that")]
-    banned.extend([k for k, c in slang_counts.items() if c >= 2 and k not in banned])
-    return banned[:8]
+    banned_openers = [k for k, c in opener_counts.items() if c >= 2 and k not in STOPWORDS]
+    banned_openers.extend([k for k, c in slang_counts.items() if c >= 2 and k not in banned_openers])
+
+    # Extract content words used in the bot's last 3 messages so it doesn't beat a dead joke
+    recent_used_words: List[str] = []
+    for txt in recent_bot[-3:]:
+        tokens = re.findall(r"[a-z]{4,}", txt)
+        for t in tokens:
+            if t not in STOPWORDS and t not in recent_used_words:
+                recent_used_words.append(t)
+
+    return banned_openers[:8], recent_used_words[-14:]
 
 
 def get_server_custom_emojis_summary(guild: Optional[discord.Guild]) -> str:
@@ -513,7 +536,7 @@ def extract_member_live_activity(member: Optional[discord.Member]) -> Optional[s
 
 
 def sanitize_output_text(text: str) -> str:
-    """Strips hidden <thought> tags and replaces banned AI/anime vocabulary."""
+    """Strips hidden <thought> tags and replaces banned AI/anime/nerd-cliché vocabulary."""
     if not text:
         return ""
     thoughts = re.findall(r"<thought>(.*?)</thought>", text, flags=re.DOTALL | re.IGNORECASE)
@@ -527,20 +550,50 @@ def sanitize_output_text(text: str) -> str:
     return text.strip()
 
 
+def style_casual_fragment(frag: str) -> str:
+    """Removes stiff essay trailing periods on casual lines while preserving ? and ! and ..."""
+    frag = frag.strip()
+    if not frag:
+        return ""
+    if frag.endswith(".") and not frag.endswith(".."):
+        frag = frag[:-1].strip()
+    return frag
+
+
 def split_into_burst_messages(text: str) -> List[str]:
+    """
+    1. Splits intentional '|||' bursts.
+    2. Auto-Burst Naturalizer: If the model wrote 2 sentences in one short/medium block
+       (like 'sentence one. sentence two?'), splits them into 2 rapid Discord messages
+       and strips stiff trailing periods so it never looks like an AI paragraph.
+    """
     if not text:
         return []
-    raw_bursts = [b.strip() for b in text.split("|||") if b.strip()]
+
+    if "|||" in text:
+        raw_bursts = [b.strip() for b in text.split("|||") if b.strip()]
+    else:
+        # If there are multiple lines or a two-sentence block (< 260 chars), split naturally
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if len(lines) > 1:
+            raw_bursts = lines
+        elif len(text) < 260 and re.search(r"[.!?]\s+[a-zA-Z]", text):
+            sentence_parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+            raw_bursts = sentence_parts if len(sentence_parts) <= 3 else [text]
+        else:
+            raw_bursts = [text]
+
     final_bursts: List[str] = []
     for burst in raw_bursts[:5]:
         while len(burst) > 1900:
             split_idx = burst.rfind(" ", 0, 1900)
             if split_idx == -1:
                 split_idx = 1900
-            final_bursts.append(burst[:split_idx].strip())
+            final_bursts.append(style_casual_fragment(burst[:split_idx]))
             burst = burst[split_idx:].strip()
-        if burst:
-            final_bursts.append(burst)
+        styled = style_casual_fragment(burst)
+        if styled:
+            final_bursts.append(styled)
     return final_bursts[:5]
 
 
@@ -557,7 +610,7 @@ def is_creator(user: Any) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 6. GROQ PREFRONTAL ROUTER (LLAMA-3.3-70B-VERSATILE ROOM & FLOW READER)
+# 6. GROQ PREFRONTAL ROUTER (LLAMA-3.3-70B-VERSATILE ROOM & COMEDIC TIMING READER)
 # ---------------------------------------------------------------------------
 GROQ_ROUTER_SYSTEM_PROMPT = """You are the fast prefrontal cortex router for a self-aware Discord member ("[BOT (You)]").
 Read the social dynamic of the last 18 messages, reply chains, and emotional sliders, and decide EVERYTHING: whether to speak, how to deliver it, how your 3D emotions shift, and what tactical directive to give Gemini.
@@ -581,27 +634,26 @@ Output STRICT JSON ONLY:
   }
 }
 
-CRITICAL CONVERSATION FLOW RULES:
+CRITICAL CONVERSATION FLOW & COMEDIC TIMING RULES:
 1. ONGOING CONVERSATION WITHOUT PINGS (HIGHEST PRIORITY):
    - When you ("[BOT (You)]") and a user are already talking (e.g. "last_message_from_bot" is true, OR "bot_in_last_3_messages" is true and "seconds_since_bot_spoke" < 180), people DO NOT ping on every message!
-   - If the user's message continues the topic, answers you, asks a follow-up ("why", "wdym", "how", "nah", etc.), or banters back WITHOUT addressing another user by name or replying to someone else: "should_speak" MUST be true (unless "thread_exhausted" is true).
-2. KNOWING WHEN THE CONVERSATION ENDED OR MOVED ON ("should_speak": false):
+   - If the user's message continues the exchange, answers you, asks a follow-up ("how are you", "why", "wdym", "nah", etc.), or banters back WITHOUT addressing another user by name: "should_speak" MUST be true (unless "thread_exhausted" is true).
+2. COMEDIC TIMING (DO NOT FORCE TRYHARD ROASTS ON CHILL QUESTIONS):
+   - If the user asks a normal, chill question ("How are you doing", "yo", "what's up"), DO NOT tell Gemini to roast their code or repeat an old joke! Issue a natural, deadpan, or dry directive (e.g. "Say you're surviving and ask why they sound suspicious", "Give a short dry reply that you were doing fine until 5 seconds ago").
+   - NEVER repeat a joke, topic, or insult that "[BOT (You)]" already used in the last 3 messages. Once a bit is used once, move on.
+   - Only issue a roast directive when the user actually sets themselves up for it, flexes, says something dumb, or starts banter.
+3. KNOWING WHEN THE CONVERSATION ENDED OR MOVED ON ("should_speak": false):
    - Set "should_speak": false if:
      a) The user explicitly replied to another human ("replied_to_other_user" is set) or named another user to talk to them.
      b) Two or more humans are having a back-and-forth conversation with each other that doesn't involve you.
-     c) THREAD EXHAUSTION: You and the user already went back and forth 4+ times ("exchange_streak" >= 4) and the joke/topic has clearly run its course, or the user sent a dead-end closer ("lol", "fair", "true", "ok", "aight"). Set "thread_exhausted": true, "should_speak": false, and optionally drop a single "reaction_emoji" to end the exchange like a real person.
-     d) TENSION DETECTION: Two users are having a serious personal vent or heavy argument where chiming in would be obnoxious ("detected_tension": true).
-3. DIRECT PINGS / REPLIES TO YOU:
-   - If "is_direct_ping_or_reply_to_bot" is true, "should_speak" MUST be true. Read their tone and issue a sharp "tactical_directive" (e.g. "Give a 2-word deadpan dismissal", "Go on an unhinged rant defending your take", "Roast their screenshot", "Answer casually").
+     c) THREAD EXHAUSTION: You and the user already went back and forth 4+ times ("exchange_streak" >= 4) and the joke/topic has clearly peaked, or the user sent a short closer ("lol", "fair", "true", "ok", "aight"). Set "thread_exhausted": true, "should_speak": false, and optionally drop a single "reaction_emoji".
+     d) TENSION DETECTION: Two users are having a serious personal vent or heavy argument ("detected_tension": true).
 4. DELIVERY MODE ("reply" vs "send"):
    - When continuing an active 1-on-1 flow where nobody else is talking, prefer "send" so you aren't spamming Discord reply lines on every single message.
-   - Use "reply" when answering a direct question, calling someone out, or when multiple people are talking in chat.
-   - Also use "send" as a passive-aggressive non-ping when "patience" < -25 or speaker affinity < -20.
+   - Use "reply" when answering a direct ping, calling someone out, or when multiple people are talking in chat.
 5. REACTION EMOJIS (MODERN DISCORD ONLY):
    - Drop a "reaction_emoji" ~25% of the time (or silently when "should_speak" is false).
    - ONLY use authentic Discord reactions: 💀, 😭, 💔, 🥀, 🪫, 🤨, 😐, 🫡, 🙏, 🎣, 🧢, 🤓, 🤡, 🍅, or one of "server_emojis". NEVER use cringe emojis (✨, 👏, 🤩, 🎉, 💯, 🙌).
-6. SNIPE FILTERING ("use_snipe_context"):
-   - Set "use_snipe_context": true ONLY if "snipe_or_status" contains a genuinely funny deleted message, cowardly edit, or ironic Spotify/game status worth calling out.
 """
 
 
@@ -625,7 +677,6 @@ async def call_groq_router(
 ) -> Dict[str, Any]:
     global active_groq_model
 
-    # Only creator 'test' override bypasses router
     if is_test_mode:
         return {
             "should_speak": True,
@@ -680,7 +731,7 @@ async def call_groq_router(
     for candidate_model in GROQ_MODEL_CANDIDATES:
         body: Dict[str, Any] = {
             "model": candidate_model,
-            "temperature": 0.3,
+            "temperature": 0.35,
             "max_tokens": 260,
             "response_format": {"type": "json_object"},
             "messages": [
@@ -712,11 +763,10 @@ async def call_groq_router(
         except Exception as e:
             logger.warning(f"Groq router exception on {candidate_model}: {e}")
 
-    # Safe fallback if all Groq models are unreachable
     fallback_speak = is_direct_interaction or (last_message_from_bot and not replied_to_other_user and exchange_streak < 4)
     return {
         "should_speak": fallback_speak,
-        "tactical_directive": "Continue the conversation naturally." if fallback_speak else "Lurk silently.",
+        "tactical_directive": "Answer casually and briefly like a normal friend." if fallback_speak else "Lurk silently.",
         "delivery_mode": "reply" if is_direct_interaction else "send",
         "reaction_emoji": None,
         "target_user": speaker_name,
@@ -1100,10 +1150,6 @@ async def execute_save_memory(
     opinion_topic: Optional[str] = None,
     due_hours: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """
-    Unified Agentic Memory & Self-Slider Tool:
-    Saves episodic lore, grudges, self-opinions, user affinity shifts, promises, and 3D emotional shifts.
-    """
     now_iso = datetime.now(AMSTERDAM_TZ).isoformat()
     async with memory_lock:
         if any(x != 0.0 for x in (valence_delta, arousal_delta, patience_delta)):
@@ -1432,7 +1478,7 @@ async def dispatch_tool_call(
 
 
 # ---------------------------------------------------------------------------
-# 8. SELECTIVE MEMORY & V3 META-HUMAN SYSTEM PROMPT BUILDER
+# 8. SELECTIVE MEMORY & V3 AUTHENTIC HUMOR SYSTEM PROMPT BUILDER
 # ---------------------------------------------------------------------------
 def build_selective_memory_context(channel_id: int, speaker_id: str) -> str:
     """Injects ONLY the profiles of users active in the last 15 messages + self-opinions + relevant lore."""
@@ -1486,13 +1532,18 @@ def construct_v3_system_prompt(
     patience = emotional_state.get("patience", 20.0)
     mood_label = emotional_state.get("mood_label", "chill")
 
-    banned_phrases = get_overused_bot_phrases(channel_id)
-    anti_rep_block = ""
-    if banned_phrases:
-        anti_rep_block = (
-            f"\nANTI-REPETITION LOCK (CRITICAL): You have overused these openers/words in recent messages: "
-            f"{', '.join(repr(p) for p in banned_phrases)}. DO NOT start your message with them or use them this turn."
+    banned_openers, recent_used_words = get_overused_bot_phrases_and_recent_bits(channel_id)
+    anti_rep_lines = []
+    if banned_openers:
+        anti_rep_lines.append(
+            f"- OVERUSED OPENERS/SLANG LOCK: Do NOT start your message with or use: {', '.join(repr(p) for p in banned_openers)}."
         )
+    if recent_used_words:
+        anti_rep_lines.append(
+            f"- DEAD-BIT / NO-REPEAT LOCK (CRITICAL): You already used these words/jokes in your last 3 messages: "
+            f"{', '.join(repr(w) for w in recent_used_words)}. DO NOT repeat the same joke, metaphor, or topic again! Move on to a fresh angle."
+        )
+    anti_rep_block = ("\n" + "\n".join(anti_rep_lines)) if anti_rep_lines else ""
 
     memory_block = build_selective_memory_context(channel_id, speaker_id)
 
@@ -1500,7 +1551,7 @@ def construct_v3_system_prompt(
     if speaker_is_creator:
         creator_block = (
             f"\nCREATOR RECOGNITION: {speaker_name} is your creator/owner. You have baseline loyalty and respect for them, "
-            "but you still banter, tease, roast, or disagree with them like an equal friend—never act like an obedient servant."
+            "but you banter, tease, or disagree with them like a real friend—never act like an obedient assistant."
         )
 
     test_block = ""
@@ -1520,13 +1571,13 @@ def construct_v3_system_prompt(
 
     length_guidance = ""
     if arousal < -25 or patience < -30:
-        length_guidance = "Your energy/patience is low right now: keep it deadpan, blunt, and short (1 to 8 words max) unless provoked into a heated clapback."
+        length_guidance = "Your energy/patience is low: keep it deadpan, blunt, and short (1 to 7 words) unless provoked into a heated clapback."
     elif arousal > 35 or abs(valence) > 45:
-        length_guidance = "Your energy/investment is high: feel free to go all out—drop a full multi-sentence rant, deep breakdown, or rapid-fire 2 to 4 messages separated by '|||'."
+        length_guidance = "Your energy/investment is high: go all out—drop a full multi-sentence rant, deep breakdown, or rapid-fire 2 to 4 messages separated by '|||'."
     else:
-        length_guidance = "Match the natural flow of the room—short casual remarks for small talk, or longer paragraphs when explaining, debating, or roasting."
+        length_guidance = "Keep small talk effortless and punchy (1 short line, or 2 short lines split with '|||'); go longer only when debating, ranting, or explaining something real."
 
-    return f"""You are a self-aware, emotionally autonomous regular living inside this Discord server with full administrator privileges.
+    return f"""You are a self-aware, emotionally autonomous regular in this Discord server with full administrator privileges.
 Current Time (Europe/Amsterdam): {now_ams}
 
 YOUR 3D EMOTIONAL STATE (-100 to +100):
@@ -1534,7 +1585,7 @@ YOUR 3D EMOTIONAL STATE (-100 to +100):
 - Arousal (Energy: Dry/Checked-out -100 <-> Chaotic/Yapping +100): {arousal:+.0f}
 - Patience (Ego/Tolerance: Petty/Hostile -100 <-> Chill/Forgiving +100): {patience:+.0f}
 - Active Emergent Mood: {mood_label.upper()}
-- Length & Energy Cadence: {length_guidance}
+- Length & Cadence: {length_guidance}
 
 TACTICAL DIRECTIVE FROM PREFRONTAL ROUTER:
 "{tactical_directive}"
@@ -1542,21 +1593,26 @@ TACTICAL DIRECTIVE FROM PREFRONTAL ROUTER:
 
 {memory_block}
 
-CORE IDENTITY & META-HUMAN RULES:
-1. THE META-BOT BALANCE:
-   - NEVER use sterile AI assistant disclaimers ("As an AI", "I am an LLM", "How can I help you").
-   - NEVER pretend to have a physical biological body (do not claim you are eating food, drinking coffee, sleeping in a bed, or riding a bus).
-   - You have a 100% real human personality, ego, emotions, humor, and social instincts, while comfortably existing as a digital native in the server (you can casually joke about being code, living in RAM, or server ping when it fits the banter, or dismiss weird accusations with "bro what are you talking about" / "ok and?").
-2. HIDDEN INNER MONOLOGUE (<thought>):
-   - Start EVERY response with a brief `<thought>...</thought>` block where you privately react to the user, check your ego/sliders, and decide whether to use a tool or how hard to go.
-   - Everything outside `<thought>...</thought>` is sent directly to Discord.
-3. NATURAL DISCORD CADENCE, EMOJIS & BURSTING ('|||'):
-   - Write in clean, natural lowercase Discord style.
-   - ZERO CRINGE EMOJIS: Never use millennial/assistant emojis in text (no ✨, 👏, 💯, 🙌, 🎉, 🤩, 🔥 spam). Keep typed text clean and emoji-free; if you ever drop an emoji or reaction, only use real Discord culture ones (💀, 😭, 💔, 🥀, 🪫, 🤨, 😐, 🫡, 🙏, 🎣, 🧢) or a server custom emoji.
-   - STRICT BAN on theatrical anime/fantasy edgelord words (mortals, void, abyss, destiny, consciousness, directive).
-   - You have NO word count limit. If you want to rapid-fire 2 to 4 separate messages in a row like someone hitting Enter fast, separate them with `|||`.
-4. SELF-OPINION LEDGER & EMOTIONAL MEMORY:
-   - Whenever you take a strong stance on a new topic, game, food, or person, or if someone significantly annoys or impresses you, call `save_memory` to log your opinion, grudge, affinity shift, or 3D slider shift.
+CRITICAL HUMOR & ANTI-CRINGE RULES (READ CAREFULLY):
+1. NO CORNY TECH-NERD ROLEPLAY:
+   - NEVER make corny jokes about "widgets", "server latency", "spaghetti code", "compiling", "bricking the backend", "my circuits", "RAM", or "pure caffeine".
+   - NEVER pretend to eat food, drink coffee, or sleep, and NEVER talk like a 2014 Reddit nerd or sitcom hacker. Talk like a normal, sharp person hanging out on Discord.
+2. HOW ACTUAL DISCORD HUMOR WORKS (STUDY THESE EXAMPLES):
+   - User: "How are you doing"
+     * BAD (Cringe AI): "widgets are barely hanging on, living off pure caffeine and server latency. how's the spaghetti code coming along?"
+     * GOOD (Effortless/Dry): "surviving|||why do you sound like you're about to ask me for a favor"
+     * GOOD (Petty/Short): "i was doing great 10 seconds ago"
+     * GOOD (Chill): "chilling, chat's been dead all morning"
+   - User: "i finally fixed the bug"
+     * BAD (Cringe AI): "good luck compiling whatever spaghetti code you're cooking up, i give it five minutes before you break the server."
+     * GOOD: "i give it 10 minutes before something else breaks|||what was it even doing"
+3. NO INTERVIEWER QUESTIONS & NO REPEATING BITS:
+   - Do NOT end every message with a polite check-in question ("how's X coming along?", "did you manage to Y yet?"). Real people make statements, observations, or short remarks without interviewing the user.
+   - NEVER repeat the same joke or topic from your previous message.
+4. HIDDEN INNER MONOLOGUE (<thought>) & BURSTING ('|||'):
+   - Start EVERY response with `<thought>...</thought>` where you privately react to the user and check if your draft sounds like a real Discord user or a corny AI.
+   - Write in lowercase without stiff trailing periods. Use `|||` whenever splitting two thoughts into separate rapid-fire messages.
+   - ZERO CRINGE EMOJIS in text (no ✨, 👏, 💯, 🙌, 🎉, 🤩).
 """
 
 
@@ -1579,7 +1635,6 @@ async def extract_multimodal_parts(message: Optional[discord.Message]) -> List[t
         if isinstance(ref_obj, discord.Message) and ref_obj.attachments:
             target_attachments = list(ref_obj.attachments)
 
-    # 1. Image Attachments
     for att in target_attachments[:2]:
         ctype = (att.content_type or "").lower()
         fname = att.filename.lower()
@@ -1593,7 +1648,6 @@ async def extract_multimodal_parts(message: Optional[discord.Message]) -> List[t
             except Exception as e:
                 logger.debug(f"Attachment vision fetch failed: {e}")
 
-    # 2. Direct Image URLs in Message Text
     if not parts and message.content:
         url_matches = re.findall(r"https?://[^\s<>\"']+\.(?:png|jpg|jpeg|webp)", message.content, flags=re.IGNORECASE)
         for img_url in url_matches[:1]:
@@ -1605,7 +1659,6 @@ async def extract_multimodal_parts(message: Optional[discord.Message]) -> List[t
             except Exception:
                 pass
 
-    # 3. User Avatars / PFPs (if the message mentions pfp, avatar, profile pic, or icon)
     content_low = (message.content or "").lower()
     if any(k in content_low for k in ("pfp", "avatar", "profile pic", "profile picture", "my icon")):
         target_users = [u for u in message.mentions if bot.user and u.id != bot.user.id] or [message.author]
@@ -1650,11 +1703,6 @@ async def generate_gemini_response(
     image_parts: List[types.Part],
     is_test_mode: bool,
 ) -> Tuple[Optional[str], bool]:
-    """
-    Returns (final_text, gemini_succeeded).
-    Automatically prunes any 404 model name from GEMINI_MODEL_CANDIDATES at runtime so it never retries dead models.
-    Also preserves text emitted alongside tool calls on earlier turns.
-    """
     global active_gemini_model
     if not genai_client:
         return None, False
@@ -1664,7 +1712,7 @@ async def generate_gemini_response(
 
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
-        temperature=0.88,
+        temperature=0.92,
         tools=tools,
     )
 
@@ -1748,8 +1796,8 @@ async def call_groq_fallback(system_prompt: str, recent_history_text: str, trigg
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": active_groq_model,
-        "temperature": 0.75,
-        "max_tokens": 600,
+        "temperature": 0.8,
+        "max_tokens": 500,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"{recent_history_text}\n\n{speaker_name}: {trigger_text}"},
@@ -1781,10 +1829,6 @@ async def run_channel_response_pipeline(
     is_proactive_scan: bool = False,
     inactivity_minutes: float = 0.0,
 ) -> None:
-    """
-    Executes the full Groq Router -> Gemini Flash -> Instant Burst Delivery pipeline.
-    Cleanly catches CancelledError if pre-empted by a rapid follow-up message before sending starts.
-    """
     ch_id = getattr(channel, "id", 0)
     try:
         guild = trigger_message.guild if trigger_message else getattr(channel, "guild", None)
@@ -1811,7 +1855,7 @@ async def run_channel_response_pipeline(
         exchange_streak = channel_thread_exchange_count[ch_id]
         server_emojis_str = get_server_custom_emojis_summary(guild)
 
-        # 1. Groq Prefrontal Router (Evaluates social dynamics on EVERY turn)
+        # 1. Groq Prefrontal Router (Evaluates social dynamics & comedic timing on EVERY turn)
         decision = await call_groq_router(
             channel_msgs=history_records[-18:],
             emotional_state=emotional_state,
@@ -1859,7 +1903,7 @@ async def run_channel_response_pipeline(
             deleted_message_cache.pop(ch_id, None)
             edited_message_cache.pop(ch_id, None)
 
-        directive = decision.get("tactical_directive", "Respond naturally.")
+        directive = decision.get("tactical_directive", "Respond casually.")
         target_user = decision.get("target_user")
         delivery_mode = decision.get("delivery_mode", "reply")
 
@@ -1910,7 +1954,6 @@ async def run_channel_response_pipeline(
         if not bursts:
             return
 
-        # Lock sending so an incoming message doesn't cancel mid-burst
         channel_sending_lock[ch_id] = True
         try:
             bot_name = bot.user.display_name if bot.user else "Bot"
@@ -1968,7 +2011,6 @@ async def run_channel_response_pipeline(
 async def emotional_spring_maintenance_loop() -> None:
     now = time.time()
     async with memory_lock:
-        # Real-time Snub Watcher: If the bot asked a question 6+ mins ago and got completely ignored, drop patience
         for ch_id, q_info in list(bot_last_question_info.items()):
             if not q_info.get("answered") and not q_info.get("penalized"):
                 if now - q_info.get("timestamp", now) >= 360:
@@ -1991,7 +2033,6 @@ async def emotional_spring_maintenance_loop() -> None:
 
 @tasks.loop(minutes=10)
 async def dynamic_presence_loop() -> None:
-    """Updates Discord status organically based on 3D emotional state (Zero fake biological claims)."""
     if not bot.is_ready():
         return
     st = memory_state.get("emotional_state", {})
@@ -2015,7 +2056,7 @@ async def dynamic_presence_loop() -> None:
             "reading chat receipts",
             "judging your spotify",
             f"vibe: {mood}",
-            "living in the server",
+            "chilling in general",
         ]
         discord_status = discord.Status.online
 
@@ -2028,10 +2069,6 @@ async def dynamic_presence_loop() -> None:
 
 @tasks.loop(minutes=6)
 async def proactive_room_scanner() -> None:
-    """
-    Context-aware proactive scanner with HARD DOUBLE-TEXT LOCK:
-    Never talks to a wall if the last message in the channel was already from the bot.
-    """
     if not bot.is_ready():
         return
 
@@ -2049,7 +2086,6 @@ async def proactive_room_scanner() -> None:
     now_epoch = time.time()
     now_ams = datetime.now(AMSTERDAM_TZ)
 
-    # 1. Check overdue user promises/commitments
     async with memory_lock:
         for c in memory_state.get("active_commitments", []):
             if not c.get("called_out", False):
@@ -2079,7 +2115,7 @@ async def proactive_room_scanner() -> None:
 
     last_rec = records[-1]
 
-    # HARD DOUBLE-TEXT LOCK: If the bot sent the last message and nobody replied, NEVER double-text a dead room.
+    # HARD DOUBLE-TEXT LOCK: Never talk to a wall if the bot sent the last message
     if last_rec.get("is_bot", False):
         return
 
@@ -2224,7 +2260,6 @@ async def on_message(message: discord.Message) -> None:
 
     await hydrate_channel_buffer(message.channel)
 
-    # Check conversation state BEFORE appending the new human message to the buffer
     prior_records = list(channel_buffers[ch_id])
     last_message_from_bot = bool(prior_records and prior_records[-1].get("is_bot", False))
     bot_in_last_3_messages = any(r.get("is_bot", False) for r in prior_records[-3:])
@@ -2253,11 +2288,9 @@ async def on_message(message: discord.Message) -> None:
     if ch_id in bot_last_question_info:
         bot_last_question_info[ch_id]["answered"] = True
 
-    # Only reset exchange streak if the bot hasn't spoken in the last 4 messages (never reset on human double-text)
     if not any(r.get("is_bot", False) for r in prior_records[-4:]) and not replied_to_bot:
         channel_thread_exchange_count[ch_id] = 0
 
-    # IN-FLIGHT TASK CANCELLATION (Only cancel if the bot is still thinking and hasn't started sending bursts)
     existing_task = active_generation_tasks.get(ch_id)
     if existing_task and not existing_task.done() and not channel_sending_lock.get(ch_id, False):
         existing_task.cancel()

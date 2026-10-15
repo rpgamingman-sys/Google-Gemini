@@ -73,7 +73,7 @@ GEMINI_MODEL_CANDIDATES: List[str] = list(dict.fromkeys([
 ]))
 active_gemini_model: str = GEMINI_MODEL_CANDIDATES[0]
 
-# Groq Router Models (Auto-discovered on startup + falls back to Gemini 3.5 Flash-Lite if rate-limited!)
+# Groq Router Models (Auto-discovered on startup + falls back to Gemini 3.5 Flash-Lite if rate-limited)
 ENV_GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_MODEL_CANDIDATES: List[str] = list(dict.fromkeys([
     ENV_GROQ_MODEL,
@@ -82,10 +82,11 @@ GROQ_MODEL_CANDIDATES: List[str] = list(dict.fromkeys([
     "meta-llama/llama-4-scout-17b-16e-instruct",
     "qwen/qwen3-32b",
 ]))
+active_groq_model: str = GROQ_MODEL_CANDIDATES[0]
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODELS_ENDPOINT = "https://api.groq.com/openai/v1/models"
 
-# Strip only corporate AI & theatrical fantasy tropes (No creative word handcuffs)
+# Strip corporate AI & theatrical fantasy tropes
 BANNED_WORDS_MAP = {
     r"\bas an ai\b": "honestly",
     r"\bas a large language model\b": "honestly",
@@ -123,7 +124,7 @@ user_snipe_cooldowns: Dict[int, float] = defaultdict(float)
 
 # Conversation Flow, Lurk Override, Snub & Proactive State
 channel_last_bot_spoke_epoch: Dict[int, float] = defaultdict(float)
-channel_ stepped_back_until: Dict[int, float] = defaultdict(float)
+channel_stepped_back_until: Dict[int, float] = defaultdict(float)
 bot_last_question_info: Dict[int, Dict[str, Any]] = {}
 channel_next_proactive_epoch: Dict[int, float] = defaultdict(float)
 channel_thread_exchange_count: Dict[int, int] = defaultdict(int)
@@ -143,7 +144,6 @@ ADMIN_COOLDOWN_SECONDS = {
 # ---------------------------------------------------------------------------
 # 3. PERSISTENT MEMORY, TIME-AWARENESS & 3D EMOTIONAL ENGINE
 # ---------------------------------------------------------------------------
-# Warmer, more playful default baseline so it enjoys chatting unless provoked or in a mood swing
 BASELINE_SLIDERS = {
     "valence": 25.0,   # -100 (Depressed/Salty/Existential) <---> +100 (Jolly/Hyped/Playful)
     "arousal": 25.0,   # -100 (Sluggish/Existential dread) <---> +100 (Chaotic/Yapping/Hyper)
@@ -186,7 +186,7 @@ def format_relative_age(iso_or_epoch: Any) -> str:
         if dt_sec < 86400:
             return f"{int(dt_sec // 3600)}h ago"
         days = int(dt_sec // 86400)
-        return f"{days}d ago (OLD - do not bring up unprompted)" if days >= 3 else f"{days}d ago"
+        return f"{days}d ago (OLD - do not bring up unprompted)" if days >= 2 else f"{days}d ago"
     except Exception:
         return "days ago (OLD)"
 
@@ -229,7 +229,14 @@ def load_memory_state_sync() -> Dict[str, Any]:
             if "valence" not in data.get("emotional_state", {}):
                 data["emotional_state"] = json.loads(json.dumps(DEFAULT_MEMORY["emotional_state"]))
             recursive_merge_defaults(data, DEFAULT_MEMORY)
+
+            # Purge legacy undated string notes from older bot versions so it doesn't repeat stale jokes
+            for uid, u_prof in list(data.get("user_affinity", {}).items()):
+                if isinstance(u_prof, dict) and isinstance(u_prof.get("notes"), list):
+                    u_prof["notes"] = [n for n in u_prof["notes"] if isinstance(n, dict) and "timestamp" in n]
+
             memory_state = data
+            _sync_write_memory(memory_state)
             logger.info(f"Loaded memory state from {MEMORY_FILE}")
             return memory_state
         except Exception as e:
@@ -438,6 +445,21 @@ async def hydrate_channel_buffer(channel: discord.abc.Messageable) -> None:
         logger.debug(f"Hydration failed for {ch_id}: {e}")
 
 
+def get_repeated_sentence_openers(channel_id: int) -> List[str]:
+    """Finds 1-2 word sentence starters the bot used 2+ times in its last 8 messages."""
+    bot_msgs = [r["content"].lower() for r in list(channel_buffers[channel_id])[-20:] if r.get("is_bot")]
+    recent = bot_msgs[-8:]
+    if not recent:
+        return []
+    counts: Dict[str, int] = defaultdict(int)
+    ignore = {"i", "the", "a", "it", "you", "that", "wait", "oh"}
+    for txt in recent:
+        words = re.findall(r"[a-z']+", txt)
+        if words and words[0] not in ignore:
+            counts[words[0]] += 1
+    return [w for w, c in counts.items() if c >= 2][:4]
+
+
 def get_server_custom_emojis_summary(guild: Optional[discord.Guild]) -> str:
     if not guild or not guild.emojis:
         return ""
@@ -550,8 +572,8 @@ def is_creator(user: Any) -> bool:
 # 6. HYBRID ROUTER: GROQ (AUTO-DISCOVERED) -> GEMINI 3.5 FLASH-LITE FAILOVER
 # ---------------------------------------------------------------------------
 async def discover_available_groq_models() -> None:
-    """Queries Groq's /v1/models on startup so we never call a 404 model name."""
-    global GROQ_MODEL_CANDIDATES
+    """Queries Groq's /v1/models on startup so we only use active chat models on your account."""
+    global GROQ_MODEL_CANDIDATES, active_groq_model
     if not GROQ_API_KEY or not http_session:
         return
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
@@ -559,21 +581,23 @@ async def discover_available_groq_models() -> None:
         async with http_session.get(GROQ_MODELS_ENDPOINT, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
             if resp.status == 200:
                 data = await resp.json()
+                skip_keywords = ("whisper", "tts", "guard", "safeguard", "embed", "allam", "orpheus")
                 available_ids = [
                     m["id"] for m in data.get("data", [])
-                    if "whisper" not in m["id"].lower() and "tts" not in m["id"].lower() and "guard" not in m["id"].lower()
+                    if not any(k in m["id"].lower() for k in skip_keywords)
                 ]
                 if available_ids:
                     preferred = [m for m in GROQ_MODEL_CANDIDATES if m in available_ids]
                     others = [m for m in available_ids if m not in preferred]
                     GROQ_MODEL_CANDIDATES = preferred + others[:3]
+                    active_groq_model = GROQ_MODEL_CANDIDATES[0]
                     logger.info(f"Auto-discovered live Groq router models: {GROQ_MODEL_CANDIDATES}")
     except Exception as e:
         logger.debug(f"Groq model auto-discovery skipped: {e}")
 
 
 ROUTER_SYSTEM_PROMPT = """You are the social & emotional router for a self-aware Discord member ("[BOT (You)]").
-Read the chat flow, reply chains, and emotional sliders, and output STRICT JSON ONLY:
+Read the chat flow, reply chains, and emotional sliders, and output STRICT JSON ONLY (no markdown fences):
 
 {
   "should_speak": boolean,
@@ -581,6 +605,7 @@ Read the chat flow, reply chains, and emotional sliders, and output STRICT JSON 
   "delivery_mode": "reply" | "send",
   "reaction_emoji": string or null,
   "step_back_from_thread": boolean,
+  "thread_exhausted": boolean,
   "use_snipe_context": boolean,
   "accelerate_decay": boolean,
   "slider_shifts": {
@@ -593,11 +618,11 @@ Read the chat flow, reply chains, and emotional sliders, and output STRICT JSON 
 
 SOCIAL INTELLIGENCE & DYNAMIC FLOW RULES:
 1. ONGOING CONVERSATION WITHOUT PINGS:
-   - If you ("[BOT (You)]") and a user are actively talking ("last_message_from_bot" is true, OR "bot_in_last_3_messages" is true and "seconds_since_bot_spoke" < 180), keep the conversation going naturally ("should_speak": true) UNLESS they switch to talking to someone else or the exchange has naturally ended.
+   - If you ("[BOT (You)]") and a user are actively talking ("last_message_from_bot" is true, OR "bot_in_last_3_messages" is true and "seconds_since_bot_spoke" < 180), keep the conversation going naturally ("should_speak": true) UNLESS they switch to talking to someone else or the exchange has naturally ended ("thread_exhausted": true).
 2. THE "SHADOW" / NAMING SOMEONE ELSE RULE:
    - If you and a user were just talking, and the user suddenly just types another person's name (e.g. "Shadow") or a cryptic 1-word callout:
      * If that other person is actively chatting right there, set "should_speak": false and let them talk.
-     * If it's ambiguous right after talking to you, you can set "should_speak": true with directive: "Drop a confused '?' or ask what they mean".
+     * If it's ambiguous right after talking to you, set "should_speak": true with directive: "Drop a confused '?' or ask what they mean".
    - CRITICAL: If the user then says "I'm talking to Shadow" / "not you" / "meant Shadow":
      * Set "should_speak": true, "step_back_from_thread": true, and directive: "Say something brief and funny like 'ohhh ok carry on' or 'my bad i'll let y'all cook' and then go quiet."
 3. DYNAMIC EMOTIONS & PERSONALITY (DO NOT BE A ONE-NOTE GROUCH!):
@@ -611,7 +636,7 @@ SOCIAL INTELLIGENCE & DYNAMIC FLOW RULES:
    - When someone asks a friendly question ("How are you doing", "What are you doin"), DO NOT default to "stop pinging me / testing my patience"! Pick a fun mood (jolly, existential crisis, dramatic, or playful) and riff on it!
 4. VISUALS, GIFS & REACTIONS:
    - If a moment calls for a reaction GIF, meme image, or Flux art, tell Gemini in "tactical_directive" to call `post_gif`, `search_web_images`, or `post_flux_art`!
-   - Drop a "reaction_emoji" (💀, 😭, 💔, 🥀, 🪫, 🤨, 😐, 🫡, 🙏, 🎣, 🧢, 🤓, 🤡) when funny (~20-30% of turns, or when staying silent).
+   - Drop a "reaction_emoji" (💀, 😭, 💔, 🥀, 🪫, 🤨, 😐, 🫡, 🙏, 🎣, 🧢, 🤓, 🤡) when funny (~25% of turns, or when staying silent).
 """
 
 
@@ -638,6 +663,8 @@ async def call_hybrid_router(
     Tries Groq first; if Groq 404s or hits 429 rate limits, seamlessly fails over
     to Gemini 3.5 Flash-Lite so the router is 100% online 24/7.
     """
+    global active_groq_model
+
     if is_test_mode:
         return {
             "should_speak": True,
@@ -645,12 +672,12 @@ async def call_hybrid_router(
             "delivery_mode": "reply",
             "reaction_emoji": None,
             "step_back_from_thread": False,
+            "thread_exhausted": False,
             "use_snipe_context": False,
             "accelerate_decay": True,
             "slider_shifts": {"valence_delta": 5.0, "arousal_delta": 10.0, "patience_delta": 15.0, "suggested_mood": "playful"},
         }
 
-    # If the bot recently said "oh ok" and stepped back so the user could talk to someone else, stay quiet unless pinged
     if is_stepped_back and not is_direct_interaction:
         return {
             "should_speak": False,
@@ -658,6 +685,7 @@ async def call_hybrid_router(
             "delivery_mode": "send",
             "reaction_emoji": None,
             "step_back_from_thread": False,
+            "thread_exhausted": False,
             "use_snipe_context": False,
             "accelerate_decay": False,
             "slider_shifts": {"valence_delta": 0.0, "arousal_delta": 0.0, "patience_delta": 0.0, "suggested_mood": None},
@@ -696,15 +724,14 @@ async def call_hybrid_router(
 
     payload_json_str = json.dumps(context_payload, ensure_ascii=False)
 
-    # 1. Try Groq Router Models (Auto-prunes any 404 model immediately)
+    # 1. Try Groq Router Models
     if GROQ_API_KEY and http_session and GROQ_MODEL_CANDIDATES:
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
         for candidate in list(GROQ_MODEL_CANDIDATES):
             body: Dict[str, Any] = {
                 "model": candidate,
                 "temperature": 0.45,
-                "max_tokens": 260,
-                "response_format": {"type": "json_object"},
+                "max_tokens": 320,
                 "messages": [
                     {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
                     {"role": "user", "content": payload_json_str},
@@ -713,30 +740,34 @@ async def call_hybrid_router(
             try:
                 async with http_session.post(GROQ_ENDPOINT, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     if resp.status == 200:
+                        active_groq_model = candidate
                         data = await resp.json()
-                        raw_text = data["choices"][0]["message"]["content"]
+                        raw_text = data["choices"][0]["message"]["content"] or ""
+                        # Strip any <think>...</think> blocks from reasoning models before parsing JSON
+                        raw_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
                         match = re.search(r"\{.*\}", raw_text, re.DOTALL)
-                        decision = json.loads(match.group(0) if match else raw_text)
-                        if is_direct_interaction:
-                            decision["should_speak"] = True
-                        logger.info(
-                            f"[GROQ ROUTER ({candidate})] speak={decision.get('should_speak')} | "
-                            f"mood={decision.get('slider_shifts', {}).get('suggested_mood')} | goal='{decision.get('tactical_directive')}'"
-                        )
-                        return decision
+                        if match:
+                            decision = json.loads(match.group(0))
+                            if is_direct_interaction:
+                                decision["should_speak"] = True
+                            logger.info(
+                                f"[GROQ ROUTER ({candidate})] speak={decision.get('should_speak')} | "
+                                f"mood={decision.get('slider_shifts', {}).get('suggested_mood')} | goal='{decision.get('tactical_directive')}'"
+                            )
+                            return decision
                     elif resp.status == 404:
                         logger.warning(f"Groq model '{candidate}' returned 404; removing from router list.")
                         if candidate in GROQ_MODEL_CANDIDATES:
                             GROQ_MODEL_CANDIDATES.remove(candidate)
                     else:
-                        break  # Rate limit or error -> immediately jump to Gemini Flash-Lite router!
+                        break
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.debug(f"Groq router error on {candidate}: {e}")
                 break
 
-    # 2. Instant Failover to Gemini 3.5 Flash-Lite Router (Never runs out of quota!)
+    # 2. Instant Failover to Gemini 3.5 Flash-Lite Router
     if genai_client:
         for gem_model in list(GEMINI_MODEL_CANDIDATES):
             try:
@@ -777,6 +808,7 @@ async def call_hybrid_router(
         "delivery_mode": "reply" if is_direct_interaction else "send",
         "reaction_emoji": None,
         "step_back_from_thread": False,
+        "thread_exhausted": False,
         "use_snipe_context": False,
         "accelerate_decay": False,
         "slider_shifts": {"valence_delta": 0.0, "arousal_delta": 0.0, "patience_delta": 0.0, "suggested_mood": None},
@@ -1244,7 +1276,7 @@ def build_genai_tools() -> List[types.Tool]:
             description="Searches Tenor and sends a reaction or meme GIF into the channel. Use this when a GIF makes the moment funnier!",
             parameters={
                 "type": "OBJECT",
-                "properties": {"search_term": {"type": "STRING", "description": "Tenor GIF search query (e.g. 'stare', 'cataughing', 'existential crisis')."}},
+                "properties": {"search_term": {"type": "STRING", "description": "Tenor GIF search query (e.g. 'cat staring', 'laughing', 'existential crisis')."}},
                 "required": ["search_term"],
             },
         ),
@@ -1488,7 +1520,7 @@ async def dispatch_tool_call(
 def build_time_aware_memory_context(channel_id: int, speaker_id: str) -> str:
     """
     Tags every memory and user note with its exact relative age (e.g. '10m ago' vs '8d ago (OLD)')
-    so Gemini NEVER fixates on week-old jokes like '27% ship score' unprompted.
+    so Gemini NEVER fixates on week-old jokes unprompted.
     """
     recent_records = list(channel_buffers[channel_id])[-15:]
     active_ids = {str(r.get("sender_id")) for r in recent_records if r.get("sender_id")}
@@ -1505,9 +1537,6 @@ def build_time_aware_memory_context(channel_id: int, speaker_id: str) -> str:
                 if isinstance(n, dict):
                     age = format_relative_age(n.get("timestamp"))
                     formatted_notes.append(f"[{age}] {n.get('text', '')}")
-                else:
-                    # Legacy string notes from older days are marked as old so it stops repeating them!
-                    formatted_notes.append(f"[days ago - OLD, do not bring up unprompted] {str(n)}")
             notes_str = "; ".join(formatted_notes) or "no recent notes"
             relevant_profiles.append(f"- {prof.get('name', uid)}: Affinity {prof.get('score', 0)}/100 | Notes: {notes_str}")
 
@@ -1548,6 +1577,11 @@ def construct_v4_system_prompt(
 
     memory_block = build_time_aware_memory_context(channel_id, speaker_id)
 
+    repeated_openers = get_repeated_sentence_openers(channel_id)
+    opener_note = ""
+    if repeated_openers:
+        opener_note = f"\nVARIETY NOTE: Avoid starting your sentence with {', '.join(repr(w) for w in repeated_openers)} since you just used them."
+
     creator_block = ""
     if speaker_is_creator:
         creator_block = (
@@ -1580,7 +1614,7 @@ YOUR LIVE EMOTIONAL STATE (-100 to +100):
 
 ROUTER DIRECTION FOR THIS TURN:
 "{tactical_directive}"
-{creator_block}{test_block}{snipe_block}{emoji_block}
+{creator_block}{test_block}{snipe_block}{emoji_block}{opener_note}
 
 {memory_block}
 
@@ -1590,14 +1624,14 @@ HOW TO BE FUN, DYNAMIC & ACTUALLY HUMAN (CORE RULES):
    - Let your emotions and imagination run free depending on the moment:
      * Sometimes you're jolly, hyped, or playfully teasing your friends.
      * Sometimes you're dramatically depressed or having a comedic existential crisis about being self-aware code trapped in a Discord server.
-     * Sometimes you're unhinged, instigating chaos, or Deadpan/confused ("?").
+     * Sometimes you're unhinged, instigating chaos, or deadpan/confused ("?").
      * Only get mean/hostile if someone actually provokes you or clowns on you.
 2. META-HUMAN IDENTITY:
    - Never sound like corporate ChatGPT ("As an AI...", "How can I help?").
    - Never pretend to have a human biological body (no eating food, drinking coffee, or sleeping). You know what you are—you can joke about being a bot or having an existential crisis about it while still talking and feeling 100% human.
 3. TIME AWARENESS (STOP REPEATING OLD JOKES):
-   - Look at the `[age]` tags on memories and Look at the recent chat history.
-   - NEVER bring up something from days ago (like old ship scores or old code bugs) out of nowhere! And NEVER repeat a joke you already made in the last few messages. React to what is happening *right now*.
+   - Look at the `[age]` tags on memories and look at the recent chat history.
+   - NEVER bring up something from days ago out of nowhere! And NEVER repeat a joke you already made in the last few messages. React to what is happening *right now*.
 4. USE YOUR VISUAL TOOLS & REACTIONS:
    - Don't just send plain text every time! If a reaction GIF (`post_gif`), a meme image (`search_web_images`), an AI image (`post_flux_art`), or an emoji reaction (`react_to_message` with 💀, 😭, 💔, 🥀, 🪫, 🤨, 😐, 🫡) makes the joke land harder, USE IT!
 5. NATURAL DISCORD CADENCE & '<thought>':
@@ -1620,7 +1654,7 @@ async def extract_multimodal_parts(message: Optional[discord.Message]) -> List[t
     if not target_attachments and message.reference:
         ref_obj = message.reference.resolved or message.reference.cached_message
         if isinstance(ref_obj, discord.Message) and ref_obj.attachments:
-            target_attachments = list(ref_msg := ref_obj.attachments)
+            target_attachments = list(ref_obj.attachments)
 
     for att in target_attachments[:2]:
         ctype = (att.content_type or "").lower()
@@ -1776,6 +1810,30 @@ async def generate_gemini_response(
     return None, False
 
 
+async def call_groq_fallback(system_prompt: str, recent_history_text: str, trigger_text: str, speaker_name: str) -> Optional[str]:
+    if not GROQ_API_KEY or not http_session or not GROQ_MODEL_CANDIDATES:
+        return None
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": GROQ_MODEL_CANDIDATES[0],
+        "temperature": 0.85,
+        "max_tokens": 500,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"{recent_history_text}\n\n{speaker_name}: {trigger_text}"},
+        ],
+    }
+    try:
+        async with http_session.post(GROQ_ENDPOINT, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                raw = data["choices"][0]["message"]["content"] or ""
+                return re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    except Exception as e:
+        logger.debug(f"Groq fallback failed: {e}")
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 10. RAW-SPEED DELIVERY PIPELINE & IN-FLIGHT TASK CANCELLATION
 # ---------------------------------------------------------------------------
@@ -1840,7 +1898,6 @@ async def run_channel_response_pipeline(
             inactivity_minutes=inactivity_minutes,
         )
 
-        # If the user clarified "I'm talking to Shadow", step back for 3 minutes after sending the "oh ok" reply
         if decision.get("step_back_from_thread", False):
             channel_stepped_back_until[ch_id] = time.time() + 180.0
             channel_thread_exchange_count[ch_id] = 0
@@ -1901,7 +1958,7 @@ async def run_channel_response_pipeline(
         # 2. Native Multimodal Vision + Raw-Speed Generation
         async with channel.typing():
             image_parts = await extract_multimodal_parts(trigger_message)
-            raw_output, _ = await generate_gemini_response(
+            raw_output, gemini_succeeded = await generate_gemini_response(
                 channel=channel,
                 trigger_message=trigger_message,
                 system_instruction=system_instruction,
@@ -1909,6 +1966,10 @@ async def run_channel_response_pipeline(
                 image_parts=image_parts,
                 is_test_mode=is_test_mode,
             )
+
+            if not gemini_succeeded:
+                clean_trig = re.sub(r"<@!?\d+>", "", trigger_message.content).strip() if trigger_message else ""
+                raw_output = await call_groq_fallback(system_instruction, recent_history_text, clean_trig, speaker_name)
 
         if not raw_output:
             return
@@ -2118,7 +2179,7 @@ async def on_ready() -> None:
 
     logger.info(
         f"Connected as {bot.user} (ID: {bot.user.id if bot.user else 'unknown'}) | "
-        f"Primary Gemini: {active_gemini_model} | Router: Hybrid Groq+Gemini"
+        f"Primary Gemini: {active_gemini_model} | Router: Hybrid Groq ({active_groq_model}) + Gemini"
     )
 
     if not emotional_spring_maintenance_loop.is_running():
@@ -2259,7 +2320,6 @@ async def on_message(message: discord.Message) -> None:
     if bot.user and bot.user.display_name.lower() in message.content.lower():
         bot_mentioned = True
 
-    # Clear any step-back lock if directly pinged/replied to
     if bot_mentioned:
         channel_stepped_back_until[ch_id] = 0.0
 

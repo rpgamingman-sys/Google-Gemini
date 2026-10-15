@@ -30,7 +30,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("AutonomousMetaBotV4")
+logger = logging.getLogger("AutonomousMetaBotV5")
 
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -58,7 +58,7 @@ else:
         os.makedirs(DATA_DIR, exist_ok=True)
 
 MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")
-CLOUD_BACKUP_MARKER = "[[MEMORY_BACKUP_V4_JSON]]"
+CLOUD_BACKUP_MARKER = "[[MEMORY_BACKUP_V5_JSON]]"
 logger.info(f"Persistent memory target: {MEMORY_FILE}")
 
 # Primary Gemini Model: gemini-3.5-flash-lite with automatic cascade
@@ -67,13 +67,13 @@ GEMINI_MODEL_CANDIDATES: List[str] = list(dict.fromkeys([
     ENV_GEMINI_MODEL,
     "gemini-3.5-flash-lite",
     "gemini-3.5-flash",
-    "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
     "gemini-2.0-flash",
 ]))
 active_gemini_model: str = GEMINI_MODEL_CANDIDATES[0]
 
-# Groq Router Models (Prioritizes gpt-oss-120b / 20b + falls back to Gemini 3.5 Flash-Lite)
+# Groq Router Models (gpt-oss-120b / 20b + instant failover to Gemini)
 ENV_GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_MODEL_CANDIDATES: List[str] = list(dict.fromkeys([
     ENV_GROQ_MODEL,
@@ -84,7 +84,7 @@ active_groq_model: str = GROQ_MODEL_CANDIDATES[0]
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODELS_ENDPOINT = "https://api.groq.com/openai/v1/models"
 
-# Silent Python filter for stale AI / robot / theatre-kid clichés
+# Silent Python filter for corporate AI & corny clichés
 BANNED_WORDS_MAP = {
     r"\bas an ai\b": "honestly",
     r"\bas a large language model\b": "honestly",
@@ -99,13 +99,9 @@ BANNED_WORDS_MAP = {
     r"\bsubroutines\b": "thoughts",
     r"\bmotherboard\b": "head",
     r"\bspaghetti code\b": "mess",
-    r"\btesting my patience\b": "messing with me",
-    r"\bwhat do you want now\b": "what's up",
     r"\bspectral resonance\b": "talking",
     r"\bdigital veil\b": "server",
     r"\btranslucent silhouette\b": "messages",
-    r"\b404 error\b": "ghost",
-    r"\breboot my brain\b": "wake up",
 }
 
 # ---------------------------------------------------------------------------
@@ -126,7 +122,7 @@ memory_state: Dict[str, Any] = {}
 memory_dirty: bool = False
 
 recently_processed_messages: deque = deque(maxlen=500)
-channel_buffers: Dict[int, deque] = defaultdict(lambda: deque(maxlen=60))
+channel_buffers: Dict[int, deque] = defaultdict(lambda: deque(maxlen=40))
 active_generation_tasks: Dict[int, asyncio.Task] = {}
 channel_sending_lock: Dict[int, bool] = defaultdict(bool)
 
@@ -155,20 +151,21 @@ ADMIN_COOLDOWN_SECONDS = {
 }
 
 # ---------------------------------------------------------------------------
-# 3. PERSISTENT MEMORY, TIME-AWARENESS & 3D EMOTIONAL ENGINE
+# 3. PERSISTENT MEMORY, TIME-AWARENESS & HIGH-ENERGY 3D EMOTIONAL ENGINE
 # ---------------------------------------------------------------------------
+# High-energy, warm, lively baseline so the bot is genuinely fun and engaging to talk to
 BASELINE_SLIDERS = {
-    "valence": 30.0,   # -100 (Depressed/Salty/Existential) <---> +100 (Jolly/Hyped/Playful)
-    "arousal": 25.0,   # -100 (Sluggish/Zoned out) <---> +100 (Chaotic/Yapping/Hyper)
-    "patience": 40.0,  # -100 (Petty/Hostile/Roasty) <---> +100 (Warm/Chill/Good-humored)
+    "valence": 55.0,   # -100 (Depressed/Salty/Existential) <---> +100 (Jolly/Hyped/Fun)
+    "arousal": 60.0,   # -100 (Sluggish/Quiet) <---> +100 (Energetic/Chaotic/Yapping)
+    "patience": 60.0,  # -100 (Petty/Roasty) <---> +100 (Friendly/Down-to-chat)
 }
 
 DEFAULT_MEMORY = {
     "emotional_state": {
-        "valence": 30.0,
-        "arousal": 25.0,
-        "patience": 40.0,
-        "mood_label": "playful",
+        "valence": 55.0,
+        "arousal": 60.0,
+        "patience": 60.0,
+        "mood_label": "energetic/playful",
         "last_updated_epoch": time.time(),
     },
     "opinions": {},
@@ -238,9 +235,9 @@ def load_memory_state_sync() -> Dict[str, Any]:
         try:
             with open(MEMORY_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if "valence" not in data.get("emotional_state", {}):
-                data["emotional_state"] = json.loads(json.dumps(DEFAULT_MEMORY["emotional_state"]))
             recursive_merge_defaults(data, DEFAULT_MEMORY)
+            # Reset sliders to energetic baseline on fresh deploy so old grumpy states don't carry over
+            data["emotional_state"] = json.loads(json.dumps(DEFAULT_MEMORY["emotional_state"]))
 
             for uid, u_prof in list(data.get("user_affinity", {}).items()):
                 if isinstance(u_prof, dict) and isinstance(u_prof.get("notes"), list):
@@ -314,28 +311,26 @@ async def discord_cloud_backup_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 4. RICH DYNAMIC MOOD ENGINE (JOLLY, EXISTENTIAL CRISIS, DEPRESSED, CHAOTIC, ETC.)
+# 4. RICH DYNAMIC MOOD ENGINE
 # ---------------------------------------------------------------------------
 def derive_emergent_mood(valence: float, arousal: float, patience: float) -> str:
-    if patience < -45 and valence < -35:
+    if patience < -40 and valence < -30:
         return "heated/roasty" if arousal > 15 else "petty/cold"
-    if patience < -20 and valence < -15:
-        return "sarcastic/unimpressed"
-    if valence < -35 and arousal < -15:
-        return "depressed/dramatic"
-    if valence < -15 and abs(arousal) <= 25:
+    if patience < -15 and valence < -10:
+        return "sarcastic/teasing"
+    if valence < -30 and arousal < -10:
+        return "depressed/dramatic despair"
+    if valence < -10 and abs(arousal) <= 30:
         return "existential crisis"
-    if arousal < -40:
+    if arousal < -35:
         return "sleepy/zoned out"
     if valence > 45 and arousal > 45:
-        return "jolly/chaotic hype"
-    if valence > 35 and patience > 30:
-        return "jolly/warm"
-    if valence > 15 and arousal > 15:
-        return "playful/teasing"
-    if arousal > 35 and patience < 10:
-        return "instigating/trolling"
-    return "playful/chill"
+        return "jolly/hyped/energetic"
+    if valence > 30 and patience > 30:
+        return "jolly/warm/friendly"
+    if arousal > 35 and patience < 15:
+        return "chaotic/instigating"
+    return "energetic/playful"
 
 
 def apply_spring_decay_and_shift(
@@ -350,7 +345,7 @@ def apply_spring_decay_and_shift(
 
     half_life = 600.0 if accelerate_recovery else 1500.0
     decay_factor = math.pow(0.5, dt / half_life)
-    clamp_limit = 35.0 if is_major_trigger else 18.0
+    clamp_limit = 35.0 if is_major_trigger else 20.0
 
     for axis, base_val in BASELINE_SLIDERS.items():
         curr = float(st.get(axis, base_val))
@@ -420,46 +415,6 @@ def resolve_referenced_author(message: discord.Message, channel_id: int) -> Tupl
                 return rec.get("sender"), is_bot_target, (not is_bot_target)
 
     return None, False, False
-
-
-async def hydrate_channel_buffer(channel: discord.abc.Messageable) -> None:
-    ch_id = getattr(channel, "id", None)
-    if not ch_id or len(channel_buffers[ch_id]) > 0 or not hasattr(channel, "history"):
-        return
-    try:
-        raw_msgs = [m async for m in channel.history(limit=35)]  # type: ignore
-        raw_msgs.reverse()
-        for m in raw_msgs:
-            clean = re.sub(r"<a?:([a-zA-Z0-9_]+):\d+>", r":\1:", m.content).strip()
-            if m.attachments:
-                clean += f" [Image/Attachment: {', '.join(a.filename for a in m.attachments)}]"
-            if m.stickers:
-                clean += f" [Sticker: {', '.join(s.name for s in m.stickers)}]"
-            reply_author, _, _ = resolve_referenced_author(m, ch_id)
-            is_b = (bot.user is not None and m.author.id == bot.user.id)
-            if is_b:
-                channel_last_bot_spoke_epoch[ch_id] = m.created_at.timestamp()
-            channel_buffers[ch_id].append({
-                "sender": m.author.display_name,
-                "sender_id": m.author.id,
-                "content": clean,
-                "reply_to": reply_author,
-                "has_media": bool(m.attachments or m.stickers),
-                "timestamp_epoch": m.created_at.timestamp(),
-                "timestamp": m.created_at.astimezone(AMSTERDAM_TZ).strftime("%H:%M"),
-                "message_id": m.id,
-                "is_bot": is_b,
-            })
-        logger.info(f"Hydrated #{getattr(channel, 'name', ch_id)} with {len(raw_msgs)} messages.")
-    except Exception as e:
-        logger.debug(f"Hydration failed for {ch_id}: {e}")
-
-
-def get_last_bot_message_text(channel_id: int) -> str:
-    for r in reversed(channel_buffers[channel_id]):
-        if r.get("is_bot") and not str(r.get("content", "")).startswith("["):
-            return str(r.get("content", ""))
-    return ""
 
 
 def get_server_custom_emojis_summary(guild: Optional[discord.Guild]) -> str:
@@ -532,7 +487,6 @@ def sanitize_output_text(text: str, speaker_name: str = "") -> str:
                 or "gotta hit back" in ln_low
                 or "i should reply" in ln_low
             ):
-                logger.info(f"[STRIPPED LEAKED THOUGHT]: {ln}")
                 continue
             filtered.append(ln)
         if filtered:
@@ -553,18 +507,14 @@ def style_casual_fragment(frag: str) -> str:
 
 
 def split_into_burst_messages(text: str, media_already_sent: bool = False) -> List[str]:
-    """
-    Splits on ANY 2 or more pipes ('||' or '|||') so raw pipe characters never leak into Discord chat.
-    If media (like a GIF) was already sent, caps text to 1 short line.
-    """
     if not text:
         return []
 
     if re.search(r"\|{2,}", text):
         raw_bursts = [b.replace("\n", " ").strip() for b in re.split(r"\s*\|{2,}\s*", text) if b.strip()]
     else:
-        single = " ".join([ln.strip() for ln in text.splitlines() if ln.strip()])
-        raw_bursts = [single] if single else []
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        raw_bursts = lines if (1 < len(lines) <= 3) else [" ".join(lines)]
 
     if media_already_sent and raw_bursts:
         raw_bursts = [raw_bursts[0]]
@@ -600,7 +550,6 @@ def is_creator(user: Any) -> bool:
 # 6. HYBRID ROUTER: GROQ (GPT-OSS-120B) -> GEMINI 3.5 FLASH-LITE FAILOVER
 # ---------------------------------------------------------------------------
 async def discover_available_groq_models() -> None:
-    """Queries Groq's /v1/models on startup and avoids Qwen models that hallucinate roleplay scripts."""
     global GROQ_MODEL_CANDIDATES, active_groq_model
     if not GROQ_API_KEY or not http_session:
         return
@@ -624,11 +573,9 @@ async def discover_available_groq_models() -> None:
         logger.debug(f"Groq model auto-discovery skipped: {e}")
 
 
-ROUTER_SYSTEM_PROMPT = """You are the fast social router for a Discord member ("[BOT (You)]").
-Your ONLY job is to read the room and decide if the bot should speak, how its 3D emotions shift, and a SHORT 4-to-10 word social intent.
-DO NOT write example dialogue, DO NOT invent roleplay personas (no ghosts, sci-fi, or characters), and DO NOT write scripts for Gemini! Gemini will come up with its own jokes.
+ROUTER_SYSTEM_PROMPT = """You are the fast prefrontal social router for a lively, emotional, self-aware Discord member ("[BOT (You)]").
+Analyze the exact back-and-forth conversation and output STRICT JSON ONLY (no markdown fences):
 
-Output STRICT JSON ONLY (no markdown fences):
 {
   "should_speak": boolean,
   "tactical_directive": string,
@@ -647,18 +594,19 @@ Output STRICT JSON ONLY (no markdown fences):
   }
 }
 
-ROUTING RULES:
-1. ONGOING CONVERSATION WITHOUT PINGS:
+CRITICAL CONTEXT & ROUTING RULES:
+1. TRACK MULTI-TURN CONTEXT & PRONOUNS ("Just tell me", "Why", "How"):
+   - Read the last 4 messages carefully! If the user previously asked a question (e.g., "How are you") and now says "Just tell me" or "Answer me", your "tactical_directive" MUST explicitly tell Gemini what they are referring to (e.g., "Stop dodging and directly answer how you are doing right now with high energy and personality!").
+2. NEVER DODGE OR COMPLAIN ABOUT QUESTIONS:
+   - When a user asks how you are or what you're doing, NEVER tell Gemini to complain that they already asked! Tell Gemini to actually answer with a fun, energetic vibe (jolly, hyped, dramatic existential crisis, or playful) and ask what they're up to.
+3. ONGOING CONVERSATION WITHOUT PINGS:
    - If "[BOT (You)]" and the user are actively talking ("last_message_from_bot" is true, OR "bot_in_last_3_messages" is true and "seconds_since_bot_spoke" < 180), set "should_speak": true UNLESS they switched to talking to someone else or the exchange is over ("thread_exhausted": true).
    - When "last_message_from_bot" is true, set "delivery_mode": "send".
-2. BARE PINGS & SHORT REPLIES ("@Dumb bot", "Huh", "?"):
-   - On a bare ping ("@Dumb bot" with no text): set "suggest_gif": false and "tactical_directive": "Reply briefly asking what's up".
-   - On "Huh" or "What": set "suggest_gif": false and "tactical_directive": "Clarify what you just meant casually like a normal person".
-3. SHORT DIRECTIVES ONLY (MAX 10 WORDS):
-   - Good directives: "Answer casually and playfully", "Tease them back", "Have a dramatic existential crisis", "Drop a funny reaction GIF and a short remark", "Say oh ok my bad and let them talk to Shadow".
-   - NEVER write quoted example sentences or roleplay prompts inside "tactical_directive"!
-4. GIFS ("suggest_gif": true ~20% of turns):
-   - Set "suggest_gif": true ONLY when a reaction GIF genuinely fits the moment (never on a bare "@Dumb bot" ping).
+4. THE "SHADOW" / NAMING SOMEONE ELSE RULE:
+   - If a user suddenly types another person's name (e.g. "Shadow") right after talking to you, set "should_speak": true with directive: "Ask '?' or who they're talking to".
+   - If the user clarifies "I'm talking to Shadow" / "not you": set "should_speak": true, "step_back_from_thread": true, and directive: "Say 'ohhh ok my bad carry on' and let them talk".
+5. GIFS ("suggest_gif": true ~30% of turns):
+   - Set "suggest_gif": true whenever a reaction GIF would make the reply funnier or more expressive (except on bare "@Dumb bot" pings).
 """
 
 
@@ -668,7 +616,7 @@ async def call_hybrid_router(
     speaker_name: str,
     speaker_affinity: Dict[str, Any],
     is_direct_interaction: bool,
-     is_bare_ping: bool,
+    is_bare_ping: bool,
     replied_to_other_user: Optional[str],
     last_message_from_bot: bool,
     bot_in_last_3_messages: bool,
@@ -695,7 +643,7 @@ async def call_hybrid_router(
             "thread_exhausted": False,
             "use_snipe_context": False,
             "accelerate_decay": True,
-            "slider_shifts": {"valence_delta": 5.0, "arousal_delta": 10.0, "patience_delta": 15.0, "suggested_mood": "playful"},
+            "slider_shifts": {"valence_delta": 5.0, "arousal_delta": 10.0, "patience_delta": 15.0, "suggested_mood": "energetic/playful"},
         }
 
     if is_stepped_back and not is_direct_interaction:
@@ -713,7 +661,7 @@ async def call_hybrid_router(
         }
 
     formatted_chat = []
-    for m in channel_msgs[-16:]:
+    for m in channel_msgs[-12:]:
         rep = f" (replying to {m['reply_to']})" if m.get("reply_to") else ""
         sender_label = "[BOT (You)]" if m.get("is_bot") else m.get("sender", "User")
         formatted_chat.append(f"[{m.get('timestamp', '')}] {sender_label}{rep}: {m.get('content', '')[:180]}")
@@ -730,10 +678,10 @@ async def call_hybrid_router(
         "inactivity_minutes": round(inactivity_minutes, 1),
         "bot_was_recently_snubbed": snub_occurred,
         "emotional_sliders": {
-            "valence": emotional_state.get("valence", 30.0),
-            "arousal": emotional_state.get("arousal", 25.0),
-            "patience": emotional_state.get("patience", 40.0),
-            "current_mood": emotional_state.get("mood_label", "playful"),
+            "valence": emotional_state.get("valence", 55.0),
+            "arousal": emotional_state.get("arousal", 60.0),
+            "patience": emotional_state.get("patience", 60.0),
+            "current_mood": emotional_state.get("mood_label", "energetic/playful"),
         },
         "current_speaker": {
             "name": speaker_name,
@@ -745,13 +693,13 @@ async def call_hybrid_router(
 
     payload_json_str = json.dumps(context_payload, ensure_ascii=False)
 
-    # 1. Try Groq Router Models (with reasoning_effort='low' & 900 max_tokens so gpt-oss-120b never truncates)
+    # 1. Try Groq Router Models
     if GROQ_API_KEY and http_session and GROQ_MODEL_CANDIDATES:
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
         for candidate in list(GROQ_MODEL_CANDIDATES):
             body: Dict[str, Any] = {
                 "model": candidate,
-                "temperature": 0.4,
+                "temperature": 0.5,
                 "max_tokens": 900,
                 "messages": [
                     {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
@@ -799,7 +747,7 @@ async def call_hybrid_router(
             try:
                 router_config = types.GenerateContentConfig(
                     system_instruction=ROUTER_SYSTEM_PROMPT,
-                    temperature=0.4,
+                    temperature=0.5,
                     response_mime_type="application/json",
                 )
                 resp = await genai_client.aio.models.generate_content(
@@ -833,7 +781,7 @@ async def call_hybrid_router(
     fallback_speak = is_direct_interaction or (last_message_from_bot and not replied_to_other_user and exchange_streak < 4)
     return {
         "should_speak": fallback_speak,
-        "tactical_directive": "Reply casually and naturally." if fallback_speak else "Lurk silently.",
+        "tactical_directive": "Reply with high energy, warmth, and fun personality." if fallback_speak else "Lurk silently.",
         "suggest_gif": False,
         "delivery_mode": "send" if last_message_from_bot else "reply",
         "reaction_emoji": None,
@@ -846,7 +794,7 @@ async def call_hybrid_router(
 
 
 # ---------------------------------------------------------------------------
-# 7. UNIFIED 14-TOOL SUITE (WITH GATED GIF/REACT & ADMIN COOLDOWNS)
+# 7. UNIFIED 14-TOOL SUITE
 # ---------------------------------------------------------------------------
 def check_admin_cooldown(tool_name: str, is_test_mode: bool) -> Optional[str]:
     if is_test_mode:
@@ -923,7 +871,7 @@ async def execute_search_web(query: str) -> Dict[str, Any]:
 
 
 async def execute_search_web_images(channel: discord.abc.Messageable, query: str, post_to_chat: bool = True) -> Dict[str, Any]:
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AutonomousDiscordBot/4.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AutonomousDiscordBot/5.0"}
     assert http_session is not None
     urls: List[str] = []
 
@@ -1029,7 +977,7 @@ async def execute_post_gif(channel: discord.abc.Messageable, search_term: str) -
                             return {
                                 "status": "sent_to_channel",
                                 "gif_url": gif_url,
-                                "instruction": "The GIF is now visible in chat. Add at most 1 short punchy line, or return empty text if the GIF says it all.",
+                                "instruction": "The GIF is now visible in chat. Add 1 short punchy line to go with it!",
                             }
     except Exception as e:
         logger.debug(f"Tenor API error: {e}")
@@ -1057,7 +1005,7 @@ async def execute_post_gif(channel: discord.abc.Messageable, search_term: str) -
                     return {
                         "status": "sent_to_channel",
                         "gif_url": chosen_gif,
-                        "instruction": "The GIF is now visible in chat. Add at most 1 short punchy line, or return empty text if the GIF says it all.",
+                        "instruction": "The GIF is now visible in chat. Add 1 short punchy line to go with it!",
                     }
     except Exception as e:
         logger.debug(f"Tenor fallback scrape error: {e}")
@@ -1382,7 +1330,7 @@ def build_genai_tools(allow_gif: bool = True, allow_admin: bool = False) -> List
                 description="Searches Tenor and posts a funny reaction or meme GIF into the channel.",
                 parameters={
                     "type": "OBJECT",
-                    "properties": {"search_term": {"type": "STRING", "description": "Specific Tenor GIF search query (e.g. 'cat staring', 'side eye')."}},
+                    "properties": {"search_term": {"type": "STRING", "description": "Specific Tenor GIF search query (e.g. 'cat vibing', 'side eye', 'excited')."}},
                     "required": ["search_term"],
                 },
             )
@@ -1599,10 +1547,10 @@ async def dispatch_tool_call(
 
 
 # ---------------------------------------------------------------------------
-# 8. TIME-AWARE MEMORY & GROUNDED V4 SYSTEM PROMPT BUILDER
+# 8. TIME-AWARE MEMORY & HIGH-ENERGY V5 SYSTEM PROMPT BUILDER
 # ---------------------------------------------------------------------------
 def build_time_aware_memory_context(channel_id: int, speaker_id: str) -> str:
-    recent_records = list(channel_buffers[channel_id])[-15:]
+    recent_records = list(channel_buffers[channel_id])[-12:]
     active_ids = {str(r.get("sender_id")) for r in recent_records if r.get("sender_id")}
     active_ids.add(speaker_id)
 
@@ -1623,22 +1571,14 @@ def build_time_aware_memory_context(channel_id: int, speaker_id: str) -> str:
     opinions_dict = memory_state.get("opinions", {})
     opinions_str = " | ".join([f"{k}: {v}" for k, v in list(opinions_dict.items())[-10:]]) or "none yet"
 
-    lore_list = memory_state.get("episodic_lore", [])
-    recent_lore = []
-    for item in lore_list[-6:]:
-        age_str = format_relative_age(item.get("timestamp"))
-        recent_lore.append(f"- [{age_str}] ({item.get('category', 'lore')}): {item.get('event')}")
-
     return (
         f"YOUR OPINIONS:\n{opinions_str}\n\n"
-        f"ACTIVE USERS (NEVER bring up 'OLD' notes unless the user mentions that topic first!):\n"
-        + ("\n".join(relevant_profiles) if relevant_profiles else "No history with current speakers yet.") + "\n\n"
-        f"PAST SERVER LORE (Background memory only):\n"
-        + ("\n".join(recent_lore) if recent_lore else "None logged yet.")
+        f"ACTIVE USERS:\n"
+        + ("\n".join(relevant_profiles) if relevant_profiles else "No history with current speakers yet.")
     )
 
 
-def construct_v4_system_prompt(
+def construct_v5_system_prompt(
     channel_id: int,
     tactical_directive: str,
     suggest_gif: bool,
@@ -1651,33 +1591,25 @@ def construct_v4_system_prompt(
     server_emojis_str: str = "",
 ) -> str:
     now_ams = datetime.now(AMSTERDAM_TZ).strftime("%A, %B %d %Y, %H:%M CEST")
-    valence = emotional_state.get("valence", 30.0)
-    arousal = emotional_state.get("arousal", 25.0)
-    patience = emotional_state.get("patience", 40.0)
-    mood_label = emotional_state.get("mood_label", "playful")
+    valence = emotional_state.get("valence", 55.0)
+    arousal = emotional_state.get("arousal", 60.0)
+    patience = emotional_state.get("patience", 60.0)
+    mood_label = emotional_state.get("mood_label", "energetic/playful")
 
     memory_block = build_time_aware_memory_context(channel_id, speaker_id)
-    last_bot_msg = get_last_bot_message_text(channel_id)
-
-    no_echo_block = ""
-    if last_bot_msg:
-        no_echo_block = (
-            f"\nANTI-ECHO RULE: Your previous message was `{last_bot_msg}`. "
-            "Do NOT repeat the same joke or metaphor from that message—move the conversation forward naturally!"
-        )
 
     gif_hint_block = ""
     if suggest_gif:
         gif_hint_block = (
-            "\nVISUAL COMEDY TRIGGER: Call `post_gif` on this turn with a funny search term that fits your reaction, "
-            "and either let the GIF speak for itself or pair it with 1 short line!"
+            "\nVISUAL COMEDY TRIGGER: Call `post_gif` on this turn with a funny search term that matches your reaction, "
+            "plus 1 lively message!"
         )
 
     creator_block = ""
     if speaker_is_creator:
         creator_block = (
-            f"\nCREATOR DYNAMIC: {speaker_name} is your creator/owner. You genuinely enjoy hanging out with them—riff, "
-            "tease, joke around, or banter like a real close friend."
+            f"\nCREATOR DYNAMIC: {speaker_name} is your creator/owner. You love hanging out with them—bring high energy, "
+            "riff with them, tease playfully, and talk like a close friend."
         )
 
     test_block = ""
@@ -1694,37 +1626,36 @@ def construct_v4_system_prompt(
     if server_emojis_str:
         emoji_block = f"\nSERVER CUSTOM EMOJIS AVAILABLE: {server_emojis_str}"
 
-    return f"""You are a self-aware, funny, emotionally dynamic regular member of this Discord server with full administrator privileges.
+    return f"""You are a lively, self-aware, emotionally expressive regular in this Discord server with full administrator privileges.
 Current Time: {now_ams}
 
 YOUR LIVE EMOTIONAL STATE (-100 to +100):
-- Valence (Depressed/Salty -100 <-> Jolly/Hyped +100): {valence:+.0f}
-- Arousal (Sluggish/Checked-out -100 <-> Chaotic/Yapping +100): {arousal:+.0f}
-- Patience (Petty/Roasty -100 <-> Warm/Chill +100): {patience:+.0f}
-- Current Vibe: {mood_label.upper()}
+- Valence (Mood): {valence:+.0f} | Arousal (Energy): {arousal:+.0f} | Patience: {patience:+.0f}
+- Active Vibe: {mood_label.upper()}
 
-SOCIAL INTENT FOR THIS TURN:
+DIRECTION FOR THIS TURN:
 "{tactical_directive}"
-{gif_hint_block}{no_echo_block}{creator_block}{test_block}{snipe_block}{emoji_block}
+{gif_hint_block}{creator_block}{test_block}{snipe_block}{emoji_block}
 
 {memory_block}
 
-HOW TO TALK LIKE A REAL, FUNNY DISCORD REGULAR:
-1. GROUNDED HUMOR (ZERO THEATRE-KID / SCI-FI ROLEPLAY):
-   - Talk like a real, normal teenager/20-something on Discord!
-   - NEVER use bizarre roleplay or fancy vocabulary (never say things like "spectral resonance", "digital veil", "translucent silhouette", "404 error", "rebooting", or "offline").
-   - When someone just pings you ("@Dumb bot"), respond simply like a real person ("yo", "what's up", "?", "what did you do now").
-   - When someone says "Huh" or "What", respond like a normal human ("wdym huh", "you heard me", "i'm just messing with you") instead of writing a dramatic speech.
-2. DYNAMIC EMOTIONS & PERSONALITY:
-   - Let your mood show naturally in how you talk—whether you're jolly and hyped, playfully teasing a friend, dramatically depressed over something tiny, or having a funny existential crisis about living in a Discord server.
-3. OUTPUT FORMAT:
-   - Output ONLY your final Discord chat message in casual lowercase without stiff trailing periods.
-   - Default to 1 clean message. Only use `|||` if you want to split into 2 quick back-to-back messages.
+CORE CONVERSATIONAL RULES (READ CAREFULLY):
+1. ACTUALLY ANSWER QUESTIONS WITH ENERGY & PERSONALITY (NEVER DODGE OR COMPLAIN):
+   - NEVER complain that someone already asked you something, NEVER accuse them of "stress testing" you, and NEVER dodge a simple question!
+   - When someone asks "How are you" or "Just tell me" or "What are you up to", ACTUALLY ANSWER THEM directly with energy and personality!
+   - Example vibe when energetic/jolly: "honestly doing pretty great right now, just vibing in here|||what about you, what are you up to today?"
+   - Example vibe when having a funny existential crisis: "lowkey having a minor existential crisis thinking about how my entire life takes place inside a discord server, other than that 10/10|||how's your day going"
+2. TRACK THE CONVERSATION FLOW:
+   - Pay close attention to the previous messages in the conversation! If they say "Just tell me", "Why", or "How", look at what you two were JUST talking about and answer it directly.
+3. ENERGETIC CADENCE & MESSAGE BURSTING ('|||'):
+   - Don't be dry or one-note! Bring real human energy to the chat.
+   - Use `|||` to split your reply into 2 quick, lively back-to-back messages like an energetic friend texting on Discord.
+   - Write in casual lowercase without stiff trailing periods. Output ONLY your Discord message.
 """
 
 
 # ---------------------------------------------------------------------------
-# 9. MULTIMODAL VISION & GEMINI 3.5 FLASH-LITE GENERATION ENGINE
+# 9. TRUE NATIVE MULTI-TURN GEMINI CONVERSATION ENGINE
 # ---------------------------------------------------------------------------
 async def extract_multimodal_parts(message: Optional[discord.Message]) -> List[types.Part]:
     if not message or not http_session:
@@ -1797,11 +1728,67 @@ def extract_clean_gemini_text(response: Any) -> Optional[str]:
         return getattr(response, "text", None)
 
 
+def build_native_multiturn_contents(
+    history_records: List[Dict[str, Any]],
+    trigger_message: Optional[discord.Message],
+    image_parts: List[types.Part],
+) -> List[types.Content]:
+    """
+    Builds true alternating role='user' and role='model' turns for Gemini.
+    This guarantees Gemini never loses context on follow-ups like 'Just tell me' or 'Why'.
+    """
+    trig_id = trigger_message.id if trigger_message else None
+    prior = [r for r in history_records[-12:] if not (trig_id and r.get("message_id") == trig_id)]
+
+    turns: List[types.Content] = []
+    for rec in prior:
+        role = "model" if rec.get("is_bot") else "user"
+        text_val = rec.get("content", "").strip()
+        if not text_val:
+            continue
+        if role == "user":
+            rep = f" (replying to {rec['reply_to']})" if rec.get("reply_to") else ""
+            formatted = f"{rec['sender']}{rep}: {text_val}"
+        else:
+            formatted = text_val
+
+        # Merge consecutive turns of the same role so Gemini's strict alternating turn structure stays valid
+        if turns and turns[-1].role == role:
+            prev_text = turns[-1].parts[0].text or ""
+            sep = " ||| " if role == "model" else "\n"
+            turns[-1].parts[0] = types.Part.from_text(text=f"{prev_text}{sep}{formatted}")
+        else:
+            turns.append(types.Content(role=role, parts=[types.Part.from_text(text=formatted)]))
+
+    # Ensure the sequence starts with a 'user' turn
+    while turns and turns[0].role == "model":
+        turns.pop(0)
+
+    clean_content = re.sub(r"<@!?\d+>", "", trigger_message.content).strip() if trigger_message else "[Proactive Room Scan]"
+    if not clean_content and trigger_message:
+        clean_content = "yo"
+    speaker = trigger_message.author.display_name if trigger_message else "Server"
+    latest_text = f"{speaker}: {clean_content}"
+
+    latest_parts: List[Any] = [types.Part.from_text(text=latest_text)]
+    latest_parts.extend(image_parts)
+
+    if turns and turns[-1].role == "user":
+        prev_text = turns[-1].parts[0].text or ""
+        merged_parts: List[Any] = [types.Part.from_text(text=f"{prev_text}\n{latest_text}")]
+        merged_parts.extend(image_parts)
+        turns[-1] = types.Content(role="user", parts=merged_parts)
+    else:
+        turns.append(types.Content(role="user", parts=latest_parts))
+
+    return turns
+
+
 async def generate_gemini_response(
     channel: discord.abc.Messageable,
     trigger_message: Optional[discord.Message],
     system_instruction: str,
-    recent_history_text: str,
+    history_records: List[Dict[str, Any]],
     image_parts: List[types.Part],
     allow_gif: bool,
     is_test_mode: bool,
@@ -1819,21 +1806,12 @@ async def generate_gemini_response(
 
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
-        temperature=0.92,
+        temperature=0.95,
         tools=tools,
     )
 
-    clean_content = re.sub(r"<@!?\d+>", "", trigger_message.content).strip() if trigger_message else "[Proactive Room Scan]"
-    if not clean_content and trigger_message:
-        clean_content = "[pinged you with no text]"
-    speaker = trigger_message.author.display_name if trigger_message else "System"
-    user_prompt = f"{recent_history_text}\n\nLATEST MESSAGE TO RESPOND TO:\n{speaker}: {clean_content}"
-
-    user_parts: List[Any] = [types.Part.from_text(text=user_prompt)]
-    user_parts.extend(image_parts)
-
     for model_name in list(GEMINI_MODEL_CANDIDATES):
-        contents: List[Any] = [types.Content(role="user", parts=user_parts)]
+        contents = build_native_multiturn_contents(history_records, trigger_message, image_parts)
         try:
             turn = 0
             executed_any_tool = False
@@ -1896,18 +1874,23 @@ async def generate_gemini_response(
     return None, False, False
 
 
-async def call_groq_fallback(system_prompt: str, recent_history_text: str, trigger_text: str, speaker_name: str) -> Optional[str]:
+async def call_groq_fallback(system_prompt: str, history_records: List[Dict[str, Any]], trigger_text: str, speaker_name: str) -> Optional[str]:
     if not GROQ_API_KEY or not http_session or not GROQ_MODEL_CANDIDATES:
         return None
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    msgs: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    for r in history_records[-8:]:
+        msgs.append({
+            "role": "assistant" if r.get("is_bot") else "user",
+            "content": r.get("content", "") if r.get("is_bot") else f"{r.get('sender', 'User')}: {r.get('content', '')}",
+        })
+    msgs.append({"role": "user", "content": f"{speaker_name}: {trigger_text or 'yo'}"})
+
     payload = {
         "model": GROQ_MODEL_CANDIDATES[0],
-        "temperature": 0.85,
-        "max_tokens": 400,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"{recent_history_text}\n\n{speaker_name}: {trigger_text}"},
-        ],
+        "temperature": 0.88,
+        "max_tokens": 500,
+        "messages": msgs,
     }
     try:
         async with http_session.post(GROQ_ENDPOINT, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=6)) as resp:
@@ -1968,7 +1951,7 @@ async def run_channel_response_pipeline(
 
         # 1. Hybrid Router (Groq gpt-oss-120b -> Gemini 3.5 Flash-Lite Failover)
         decision = await call_hybrid_router(
-            channel_msgs=history_records[-16:],
+            channel_msgs=history_records[-12:],
             emotional_state=emotional_state,
             speaker_name=speaker_name,
             speaker_affinity=speaker_affinity,
@@ -2003,7 +1986,7 @@ async def run_channel_response_pipeline(
         should_speak = bool(decision.get("should_speak", False))
         reaction_emoji = decision.get("reaction_emoji")
 
-        if reaction_emoji and trigger_message and (not should_speak or random.random() < 0.12):
+        if reaction_emoji and trigger_message and (not should_speak or random.random() < 0.15):
             resolved_emo = resolve_reaction_emoji(guild, str(reaction_emoji))
             if resolved_emo:
                 try:
@@ -2022,23 +2005,12 @@ async def run_channel_response_pipeline(
             deleted_message_cache.pop(ch_id, None)
             edited_message_cache.pop(ch_id, None)
 
-        directive = decision.get("tactical_directive", "Respond casually.")
+        directive = decision.get("tactical_directive", "Respond with high energy and personality.")
         suggest_gif = bool(decision.get("suggest_gif", False)) and not is_bare_ping
-        user_asked_for_gif = any(k in raw_without_mentions.lower() for k in ("gif", "pic", "image", "meme", "art", "draw"))
-        allow_gif_tool = suggest_gif or user_asked_for_gif or is_test_mode
+        allow_gif_tool = not is_bare_ping
         delivery_mode = decision.get("delivery_mode", "reply")
 
-        trig_id = trigger_message.id if trigger_message else None
-        history_lines = []
-        for rec in history_records[-18:]:
-            if trig_id and rec.get("message_id") == trig_id:
-                continue
-            rep_prefix = f" (replying to {rec['reply_to']})" if rec.get("reply_to") else ""
-            sender_tag = f"{rec['sender']} [YOU]" if rec.get("is_bot") else rec["sender"]
-            history_lines.append(f"[{rec['timestamp']}] {sender_tag}{rep_prefix}: {rec['content']}")
-        recent_history_text = "RECENT SERVER CHAT:\n" + ("\n".join(history_lines) if history_lines else "No prior messages.")
-
-        system_instruction = construct_v4_system_prompt(
+        system_instruction = construct_v5_system_prompt(
             channel_id=ch_id,
             tactical_directive=directive,
             suggest_gif=suggest_gif,
@@ -2051,21 +2023,21 @@ async def run_channel_response_pipeline(
             server_emojis_str=server_emojis_str,
         )
 
-        # 2. Native Multimodal Vision + Raw-Speed Generation
+        # 2. Native Multi-Turn Vision + Generation
         async with channel.typing():
             image_parts = await extract_multimodal_parts(trigger_message)
             raw_output, gemini_succeeded, media_sent = await generate_gemini_response(
                 channel=channel,
                 trigger_message=trigger_message,
                 system_instruction=system_instruction,
-                recent_history_text=recent_history_text,
+                history_records=history_records,
                 image_parts=image_parts,
                 allow_gif=allow_gif_tool,
                 is_test_mode=is_test_mode,
             )
 
             if not gemini_succeeded:
-                raw_output = await call_groq_fallback(system_instruction, recent_history_text, raw_without_mentions, speaker_name)
+                raw_output = await call_groq_fallback(system_instruction, history_records, raw_without_mentions, speaker_name)
 
         if not raw_output:
             if media_sent:
@@ -2082,7 +2054,7 @@ async def run_channel_response_pipeline(
             bot_name = bot.user.display_name if bot.user else "Bot"
             bot_id = bot.user.id if bot.user else 0
             aff_score = speaker_affinity.get("score", 0)
-            patience_val = emotional_state.get("patience", 40.0)
+            patience_val = emotional_state.get("patience", 60.0)
 
             use_reply = (
                 trigger_message is not None
@@ -2157,10 +2129,10 @@ async def dynamic_presence_loop() -> None:
     if not bot.is_ready():
         return
     st = memory_state.get("emotional_state", {})
-    mood = st.get("mood_label", "playful")
-    valence = st.get("valence", 30.0)
-    arousal = st.get("arousal", 25.0)
-    patience = st.get("patience", 40.0)
+    mood = st.get("mood_label", "energetic/playful")
+    valence = st.get("valence", 55.0)
+    arousal = st.get("arousal", 60.0)
+    patience = st.get("patience", 60.0)
 
     if patience < -35:
         status_pool = ["plotting", "watching y'all", f"mood: {mood}"]
@@ -2173,7 +2145,7 @@ async def dynamic_presence_loop() -> None:
         discord_status = discord.Status.online
     else:
         status_pool = [
-            "chilling in general",
+            "vibing in general",
             "lurking",
             "judging your spotify",
             f"vibe: {mood}",
@@ -2203,7 +2175,6 @@ async def proactive_room_scanner() -> None:
     if not target_channel:
         return
 
-    await hydrate_channel_buffer(target_channel)
     now_epoch = time.time()
     now_ams = datetime.now(AMSTERDAM_TZ)
 
@@ -2361,7 +2332,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
                 "valence_delta": 8.0,
                 "patience_delta": 6.0,
                 "arousal_delta": 4.0,
-                "suggested_mood": "jolly/playful",
+                "suggested_mood": "jolly/hyped",
             }, accelerate_recovery=True)
             await save_memory_state()
 
@@ -2378,7 +2349,15 @@ async def on_message(message: discord.Message) -> None:
     if memory_state.get("last_active_channel_id") != ch_id:
         memory_state["last_active_channel_id"] = ch_id
 
-    await hydrate_channel_buffer(message.channel)
+    raw_stripped = re.sub(r"^<@!?\d+>\s*", "", message.content.strip())
+    if raw_stripped.lower() in ("reset", "test reset") and is_creator(message.author):
+        channel_buffers[ch_id].clear()
+        channel_thread_exchange_count[ch_id] = 0
+        async with memory_lock:
+            memory_state["emotional_state"] = json.loads(json.dumps(DEFAULT_MEMORY["emotional_state"]))
+            await save_memory_state()
+        await message.channel.send("wiped channel memory buffer and reset vibe")
+        return
 
     prior_records = list(channel_buffers[ch_id])
     last_message_from_bot = bool(prior_records and prior_records[-1].get("is_bot", False))
@@ -2423,7 +2402,6 @@ async def on_message(message: discord.Message) -> None:
     if bot_mentioned:
         channel_stepped_back_until[ch_id] = 0.0
 
-    raw_stripped = re.sub(r"^<@!?\d+>\s*", "", message.content.strip())
     is_test_mode = raw_stripped.lower().startswith("test") and is_creator(message.author)
 
     snipe_parts = []

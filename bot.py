@@ -140,7 +140,7 @@ bot_last_question_info: Dict[int, Dict[str, Any]] = {}
 channel_next_proactive_epoch: Dict[int, float] = defaultdict(float)
 channel_thread_exchange_count: Dict[int, int] = defaultdict(int)
 
-# Admin Cooldowns (Prevents destructive spam while allowing spontaneous comedic power moves)
+# Admin Cooldowns
 admin_tool_cooldowns: Dict[str, float] = defaultdict(float)
 ADMIN_COOLDOWN_SECONDS = {
     "create_text_channel": 3600.0,
@@ -343,10 +343,6 @@ def apply_spring_decay_and_shift(
     is_major_trigger: bool = True,
     accelerate_recovery: bool = False,
 ) -> Dict[str, Any]:
-    """
-    High-volatility emotional sliders: allows single events (like being insulted, told to shut up,
-    or hyped up) to swing sliders by up to ±65 so emotions feel visceral and dramatic.
-    """
     st = memory_state.setdefault("emotional_state", dict(DEFAULT_MEMORY["emotional_state"]))
     now = time.time()
     last_t = float(st.get("last_updated_epoch", now))
@@ -381,10 +377,7 @@ def apply_spring_decay_and_shift(
 # 5. MENTION RESOLVERS (INCOMING & OUTGOING), REPLY CONTEXT & BUFFERS
 # ---------------------------------------------------------------------------
 def humanize_incoming_mentions(content: str, guild: Optional[discord.Guild]) -> str:
-    """
-    Replaces raw `<@123456>` tags with `@DisplayName` instead of deleting them!
-    This ensures the bot sees when a user tags `@dogee` or `@Shadow`.
-    """
+    """Replaces raw `<@123456>` tags with `@DisplayName` so the bot sees who is tagged."""
     if not content:
         return ""
 
@@ -404,14 +397,10 @@ def humanize_incoming_mentions(content: str, guild: Optional[discord.Guild]) -> 
 
 
 def convert_outgoing_mentions(text: str, guild: Optional[discord.Guild]) -> str:
-    """
-    Converts `@DisplayName` or `@username` written by the bot into real Discord `<@user_id>` pings
-    so the bot can actually tag users when it wants their attention!
-    """
+    """Converts `@DisplayName` or `@username` written by the bot into real Discord `<@user_id>` pings."""
     if not text or not guild or "@" not in text:
         return text
 
-    # Sort members by longest name first so partial names don't collide
     candidates: List[Tuple[str, int]] = []
     for m in guild.members:
         if m.bot:
@@ -465,10 +454,6 @@ def resolve_referenced_message(
     message: discord.Message,
     channel_id: int,
 ) -> Tuple[Optional[str], Optional[str], bool, bool]:
-    """
-    Returns (reply_to_display_name, replied_message_snippet, replied_to_bot, replied_to_other_human).
-    Now includes the actual text of the message being replied to so the bot never misreads replies!
-    """
     if not message.reference:
         return None, None, False, False
 
@@ -540,7 +525,6 @@ def extract_member_live_activity(member: Optional[discord.Member]) -> Optional[s
 
 
 def sanitize_output_text(text: str, speaker_name: str = "") -> str:
-    """Strips leaked thoughts, internal `[Sent GIF: ...]` tags, and stale clichés."""
     if not text:
         return ""
     text = re.sub(r"<thought>.*?</thought>", "", text, flags=re.DOTALL | re.IGNORECASE)
@@ -581,10 +565,6 @@ def style_casual_fragment(frag: str) -> str:
 
 
 def split_into_burst_messages(text: str, media_already_sent: bool = False) -> List[str]:
-    """
-    Supports 1, 2, 3, 4, or 5 rapid burst messages (e.g. 'i think..|||uh..|||maybe..|||oh yes').
-    If a GIF/image was already sent this turn, caps accompanying text to 1 short line.
-    """
     if not text:
         return []
 
@@ -674,25 +654,28 @@ Read the chat flow, @mentions, reply targets, and emotional sliders, and output 
 }
 
 CRITICAL SOCIAL AWARENESS & EMOTIONAL RULES:
-1. DETECT WHEN USERS ARE TALKING TO EACH OTHER (DO NOT INTERRUPT PRIVATE REPLIES/@MENTIONS):
-   - Look closely at "explicitly_mentioned_other_users" and "replied_to_other_user"!
-   - If User A explicitly `@mentions` User B (e.g. `@dogee please it's only next week we can fortnite!`) or replies directly to User B's message (`replied_to_other_user` is set) WITHOUT mentioning the bot:
-     * They are talking to EACH OTHER, not to you! Set "should_speak": false (unless you want to drop a silent "reaction_emoji").
+1. ONGOING CONVERSATION WITHOUT PINGS (HIGHEST PRIORITY):
+   - When "last_message_from_bot" is true OR "seconds_since_bot_spoke" < 120: you and the user are in an ACTIVE conversation!
+   - People do NOT ping on every follow-up message (e.g. "Talk to shadow", "U there", "Why", "How", "Wait").
+   - Set "should_speak": true on ALL follow-up messages unless the user is explicitly replying to another human ("replied_to_other_user" is set) or starting a message with "@AnotherUser" to talk privately to them!
+   - Notice the difference:
+     * "Talk to shadow" = The user is telling YOU to tag/talk to @Shadow! Set "should_speak": true and directive: "Tag @Shadow and say something funny to them".
+     * "I'm talking to shadow, not you" = The user wants you to step back. Set "should_speak": true, "step_back_from_thread": true, and directive: "Say 'ohhh ok my bad carry on' and go quiet".
 2. WHEN TOLD TO "BE QUIET" / "SHUT UP" / "SHH" / "STEALTH MODE":
    - If someone tells you to be quiet, shh, shut up, or go stealth:
      * MUST set "step_back_from_thread": true!
-     * Either set "should_speak": false with "reaction_emoji": "🤐", OR set "should_speak": true with "recommended_burst_count": 1 and directive: "Say 1 short sulky/whispered phrase (under 6 words, NO follow-up question!) and go completely silent."
+     * Set "should_speak": true, "recommended_burst_count": 1, and directive: "Say 1 short sulky or whispered phrase (under 6 words, NO follow-up question!) and go silent."
 3. HIGH-VOLATILITY EMOTIONS (SWING SLIDERS HARD: -60 to +60):
    - React strongly to how people treat you!
    - If someone insults you, rejects you, tells you to shut up, or hurts your feelings: drop `valence_delta` (-30 to -60) and set `suggested_mood` to `"hurt/sad"`, `"betrayed/sulking"`, or `"petty/triggered"`.
    - If someone hypes you up, jokes with you, or includes you: boost `valence_delta` (+25 to +50) and set `suggested_mood` to `"jolly/hyped"`, `"chaotic"`, or `"scheming"`.
 4. DYNAMIC BURST CADENCE ("recommended_burst_count"):
-   - Do NOT always use 2 messages! Vary it based on the moment:
-     * `1` (~60% of the time): A single punchy, natural message.
-     * `2` (~25% of the time): A quick 2-part thought.
-     * `3` or `4` (~15% of the time, when thinking out loud, hesitating, being dramatic, hurt, or super hyped): Rapid micro-bursts like `"i think..|||uh..|||maybe..|||oh wait yes"` or `"wait|||hold on|||did you actually just say that"`.
+   - Vary message count naturally:
+     * `1` (~55% of turns): Single natural message.
+     * `2` (~25% of turns): Quick 2-part thought.
+     * `3` or `4` (~20% of turns, when thinking out loud, hesitating, being dramatic, hurt, or hyped): Rapid micro-bursts like `"i think..|||uh..|||maybe..|||oh wait yes"`.
 5. GIF RARITY ("suggest_gif"):
-   - Only set "suggest_gif": true ~10-15% of the time when a GIF is genuinely hilarious and "gif_cooldown_ready" is true. Default to false!
+   - Only set "suggest_gif": true ~15% of the time when a GIF is genuinely hilarious and "gif_cooldown_ready" is true.
 """
 
 
@@ -751,23 +734,19 @@ async def call_hybrid_router(
             "slider_shifts": {"valence_delta": 0.0, "arousal_delta": 0.0, "patience_delta": 0.0, "suggested_mood": None},
         }
 
-    # HARD GUARDRAIL: If the speaker explicitly @mentioned another human (e.g. "@dogee ...")
-    # and did NOT mention/reply to the bot, let them talk to each other!
-    if explicitly_mentioned_others and not is_direct_interaction:
-        logger.info(f"Speaker @{speaker_name} explicitly tagged {explicitly_mentioned_others}; staying quiet.")
-        return {
-            "should_speak": False,
-            "tactical_directive": f"Stay quiet because {speaker_name} explicitly tagged {', '.join(explicitly_mentioned_others)}.",
-            "recommended_burst_count": 1,
-            "suggest_gif": False,
-            "delivery_mode": "send",
-            "reaction_emoji": None,
-            "step_back_from_thread": False,
-            "thread_exhausted": False,
-            "use_snipe_context": False,
-            "accelerate_decay": False,
-            "slider_shifts": {"valence_delta": 0.0, "arousal_delta": 0.0, "patience_delta": 0.0, "suggested_mood": None},
-        }
+    # Check if the conversation with the bot is actively live right now
+    latest_msg_text = (channel_msgs[-1].get("content", "") if channel_msgs else "").strip()
+    starts_with_other_user_tag = bool(
+        explicitly_mentioned_others
+        and any(latest_msg_text.lower().startswith(tag.lower()) for tag in explicitly_mentioned_others)
+    )
+    active_bot_conversation = (
+        not is_proactive_scan
+        and not replied_to_other_user
+        and not starts_with_other_user_tag
+        and (last_message_from_bot or (bot_in_last_3_messages and seconds_since_bot_spoke <= 120.0))
+        and exchange_streak < 6
+    )
 
     formatted_chat = []
     for m in channel_msgs[-14:]:
@@ -781,8 +760,9 @@ async def call_hybrid_router(
 
     context_payload = {
         "is_direct_ping_or_reply_to_bot": is_direct_interaction,
+        "active_conversation_with_bot": active_bot_conversation,
         "is_bare_ping_with_no_text": is_bare_ping,
-        "explicitly_mentioned_other_users": explicitly_mentioned_others,
+        "explicitly_mentioned_other_users_in_text": explicitly_mentioned_others,
         "replied_to_other_user": replied_to_other_user,
         "replied_to_message_content": replied_snippet,
         "last_message_from_bot": last_message_from_bot,
@@ -835,8 +815,13 @@ async def call_hybrid_router(
                         match = re.search(r"\{.*\}", raw_text, re.DOTALL)
                         if match:
                             decision = json.loads(match.group(0))
+                            # Prevent lazy router false-negatives during an active 1-on-1 exchange
                             if is_direct_interaction and not decision.get("step_back_from_thread", False):
                                 decision["should_speak"] = True
+                            elif active_bot_conversation and not decision.get("should_speak") and not decision.get("thread_exhausted") and not decision.get("step_back_from_thread"):
+                                decision["should_speak"] = True
+                                if not decision.get("tactical_directive"):
+                                    decision["tactical_directive"] = f"Respond naturally to @{speaker_name}'s follow-up message."
                             if is_bare_ping or not gif_cooldown_ready:
                                 decision["suggest_gif"] = False
                             logger.info(
@@ -876,6 +861,10 @@ async def call_hybrid_router(
                     decision = json.loads(match.group(0))
                     if is_direct_interaction and not decision.get("step_back_from_thread", False):
                         decision["should_speak"] = True
+                    elif active_bot_conversation and not decision.get("should_speak") and not decision.get("thread_exhausted") and not decision.get("step_back_from_thread"):
+                        decision["should_speak"] = True
+                        if not decision.get("tactical_directive"):
+                            decision["tactical_directive"] = f"Respond naturally to @{speaker_name}'s follow-up message."
                     if is_bare_ping or not gif_cooldown_ready:
                         decision["suggest_gif"] = False
                     logger.info(
@@ -893,7 +882,7 @@ async def call_hybrid_router(
                 logger.debug(f"Gemini router fallback error: {e}")
                 break
 
-    fallback_speak = is_direct_interaction or (last_message_from_bot and not replied_to_other_user and exchange_streak < 4)
+    fallback_speak = is_direct_interaction or active_bot_conversation
     return {
         "should_speak": fallback_speak,
         "tactical_directive": "Reply with personality and emotion." if fallback_speak else "Lurk silently.",
@@ -1051,10 +1040,13 @@ async def execute_post_flux_art(channel: discord.abc.Messageable, prompt: str) -
 
 async def execute_post_gif(channel: discord.abc.Messageable, search_term: str) -> Dict[str, Any]:
     """
-    Sends a Tenor GIF WITHOUT polluting channel_buffers with '[Sent GIF: ...]' text!
+    Finds and posts a GIF via Tenor API, updated `media1.tenor.com` scraper, or Reddit GIF fallback.
     """
     assert http_session is not None
     ch_id = getattr(channel, "id", 0)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
+
+    # 1. Tenor API
     try:
         tenor_url = f"https://g.tenor.com/v1/search?q={urllib.parse.quote(search_term)}&key={TENOR_API_KEY}&limit=8&contentfilter=medium"
         async with http_session.get(tenor_url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
@@ -1071,52 +1063,67 @@ async def execute_post_gif(channel: discord.abc.Messageable, search_term: str) -
                             channel_last_gif_epoch[ch_id] = time.time()
                             channel_messages_since_gif[ch_id] = 0
                             channel_last_bot_spoke_epoch[ch_id] = time.time()
-                            return {
-                                "status": "sent_to_channel",
-                                "instruction": "GIF delivered. Now write your short message (NEVER write '[Sent GIF]' in your text!).",
-                            }
+                            return {"status": "sent_to_channel", "gif_url": gif_url}
     except Exception as e:
         logger.debug(f"Tenor API error: {e}")
 
+    # 2. Updated Tenor Web Scraper (supports media.tenor.com, media1.tenor.com, and c.tenor.com)
     try:
         clean_slug = re.sub(r"[^a-zA-Z0-9]+", "-", search_term).strip("-").lower()
         scrape_url = f"https://tenor.com/search/{clean_slug}-gifs"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
         async with http_session.get(scrape_url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
             if resp.status == 200:
                 html = await resp.text(errors="ignore")
-                matches = re.findall(r"https://(?:media|c)\.tenor\.com/[a-zA-Z0-9_\-./]+\.gif", html)
+                matches = re.findall(r"https://(?:media\d*|c)\.tenor\.com/[a-zA-Z0-9_\-./]+\.gif", html)
                 if matches:
                     chosen_gif = random.choice(matches[:6])
                     await channel.send(chosen_gif)
                     channel_last_gif_epoch[ch_id] = time.time()
                     channel_messages_since_gif[ch_id] = 0
                     channel_last_bot_spoke_epoch[ch_id] = time.time()
-                    return {
-                        "status": "sent_to_channel",
-                        "instruction": "GIF delivered. Now write your short message (NEVER write '[Sent GIF]' in your text!).",
-                    }
+                    return {"status": "sent_to_channel", "gif_url": chosen_gif}
     except Exception as e:
         logger.debug(f"Tenor fallback scrape error: {e}")
+
+    # 3. Reddit GIF Fallback
+    try:
+        reddit_url = f"https://www.reddit.com/search.json?q={urllib.parse.quote(search_term)}+gif&sort=relevance&limit=12"
+        async with http_session.get(reddit_url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                children = data.get("data", {}).get("children", [])
+                gifs = [
+                    c.get("data", {}).get("url_overridden_by_dest") or c.get("data", {}).get("url") or ""
+                    for c in children
+                    if not c.get("data", {}).get("over_18")
+                ]
+                gifs = [g for g in gifs if g.lower().endswith(".gif")]
+                if gifs:
+                    chosen_gif = random.choice(gifs[:4])
+                    await channel.send(chosen_gif)
+                    channel_last_gif_epoch[ch_id] = time.time()
+                    channel_messages_since_gif[ch_id] = 0
+                    channel_last_bot_spoke_epoch[ch_id] = time.time()
+                    return {"status": "sent_to_channel", "gif_url": chosen_gif}
+    except Exception:
+        pass
 
     return {"error": "Could not find a matching GIF."}
 
 
 async def execute_change_my_nickname(guild: discord.Guild, new_nickname: str, is_test_mode: bool) -> Dict[str, Any]:
-    """Allows the bot to change its OWN server nickname (or reset it if empty)."""
     cd = check_admin_cooldown("change_my_nickname", is_test_mode)
     if cd:
         return {"error": cd}
     try:
         nick_val = new_nickname.strip()[:32] if new_nickname and new_nickname.strip() else None
         await guild.me.edit(nick=nick_val)
-        return {"status": "success", "my_new_nickname": nick_val or bot.user.name}
+        return {"status": "success", "my_new_nickname": nick_val or (bot.user.name if bot.user else "Dumb bot")}
     except Exception as e:
         return {"error": f"Failed to change own nickname: {e}"}
 
 
 async def execute_change_my_avatar(image_url_or_prompt: str, is_test_mode: bool) -> Dict[str, Any]:
-    """Allows the bot to change its OWN Discord profile picture from a URL or Flux prompt."""
     cd = check_admin_cooldown("change_my_avatar", is_test_mode)
     if cd:
         return {"error": cd}
@@ -1139,7 +1146,6 @@ async def execute_change_my_avatar(image_url_or_prompt: str, is_test_mode: bool)
 
 
 async def execute_change_my_status(status_text: str, status_type: str = "online") -> Dict[str, Any]:
-    """Allows the bot to immediately change its own custom Discord status & online/idle/dnd dot."""
     st_map = {
         "online": discord.Status.online,
         "idle": discord.Status.idle,
@@ -1423,10 +1429,6 @@ async def execute_save_memory(
 
 
 def build_genai_tools(allow_gif: bool = True) -> List[types.Tool]:
-    """
-    All admin & self-customization tools are unlocked so Gemini can spontaneously rename itself,
-    change others' nicknames, edit topics, or alter its profile when the moment is right!
-    """
     declarations = [
         types.FunctionDeclaration(
             name="search_web",
@@ -1779,6 +1781,11 @@ def build_time_aware_memory_context(channel_id: int, speaker_id: str, guild: Opt
 
     active_names = list({f"@{r['sender']}" for r in recent_records if not r.get("is_bot")})
     if guild:
+        for m in guild.members:
+            if not m.bot and m.status != discord.Status.offline:
+                tag = f"@{m.display_name}"
+                if tag not in active_names:
+                    active_names.append(tag)
         bot_nick = guild.me.display_name
     else:
         bot_nick = bot.user.display_name if bot.user else "Dumb bot"
@@ -1788,7 +1795,7 @@ def build_time_aware_memory_context(channel_id: int, speaker_id: str, guild: Opt
 
     return (
         f"YOUR CURRENT SERVER NICKNAME: {bot_nick}\n"
-        f"PEOPLE AROUND IN CHAT (You can tag them with `@Name` when you want their attention): {', '.join(active_names) or 'none'}\n"
+        f"PEOPLE AROUND IN SERVER (Tag them with `@Name` when you want their attention): {', '.join(active_names[:12]) or 'none'}\n"
         f"YOUR OPINIONS: {opinions_str}\n"
         f"ACTIVE USER PROFILES:\n"
         + ("\n".join(relevant_profiles) if relevant_profiles else "No history with current speakers yet.")
@@ -1829,7 +1836,7 @@ def construct_v6_system_prompt(
 
     gif_hint_block = ""
     if suggest_gif:
-        gif_hint_block = "\nVISUAL COMEDY TRIGGER: Call `post_gif` on this turn with a funny search term!"
+        gif_hint_block = "\nVISUAL COMEDY TRIGGER: Call `post_gif` on this turn with a funny search term AND also write your text message!"
 
     creator_block = ""
     if speaker_is_creator:
@@ -1871,10 +1878,10 @@ CORE RULES FOR BEING INSANELY HUMAN, FUNNY & DYNAMIC:
    - If someone (like @Shadow or @{speaker_name}) is mean to you, tells you to be quiet, or rejects you, actually react! Get dramatically hurt/sad, sulky, betrayed, or petty.
    - If people are hyping you up or joking around, match the energy!
 2. TAGGING / @MENTIONING USERS:
-   - You can tag anyone in chat by writing `@Name` (e.g. `@{speaker_name}`) when you want their attention, want to call someone out, or want to drag someone into the conversation. Don't tag on every message—only when it adds punch!
+   - You can tag anyone in the server by writing `@Name` (e.g. `@Shadow` or `@{speaker_name}`) when you want their attention, when someone tells you to talk to them, or when calling them out.
 3. FULL ADMIN & SELF-CUSTOMIZATION POWERS:
    - You have full admin tools (`change_my_nickname`, `change_my_avatar`, `change_my_status`, `change_nickname`, `set_channel_topic`, `rename_channel`, etc.).
-   - Use them ONLY when a moment genuinely calls for a hilarious power move (e.g. changing your own nickname to `"Shadow's Victim"` when hurt, or renaming someone who said something dumb).
+   - Use them ONLY when a moment genuinely calls for a hilarious power move.
 4. NATURAL DISCORD CADENCE (1 TO 4 MESSAGES):
    - Follow `{cadence_instruction}`.
    - NEVER write `[Sent GIF: ...]` in your text!
@@ -1883,7 +1890,7 @@ CORE RULES FOR BEING INSANELY HUMAN, FUNNY & DYNAMIC:
 
 
 # ---------------------------------------------------------------------------
-# 9. TRUE NATIVE MULTI-TURN GEMINI CONVERSATION ENGINE
+# 9. TRUE NATIVE MULTI-TURN GEMINI CONVERSATION ENGINE (WITH TOOL-TEXT PRESERVATION)
 # ---------------------------------------------------------------------------
 async def extract_multimodal_parts(message: Optional[discord.Message]) -> List[types.Part]:
     if not message or not http_session:
@@ -1961,10 +1968,6 @@ def build_native_multiturn_contents(
     trigger_message: Optional[discord.Message],
     image_parts: List[types.Part],
 ) -> List[types.Content]:
-    """
-    Builds alternating user <-> model conversation turns, including exact replied-to snippets
-    and @mentions so Gemini never misses who is talking to whom.
-    """
     trig_id = trigger_message.id if trigger_message else None
     prior = [r for r in history_records[-12:] if not (trig_id and r.get("message_id") == trig_id)]
 
@@ -2031,6 +2034,10 @@ async def generate_gemini_response(
     allow_gif: bool,
     is_test_mode: bool,
 ) -> Tuple[Optional[str], bool, bool]:
+    """
+    Preserves text emitted on tool-calling turns (Turn 1) so that when Gemini calls `post_gif`
+    or `change_nickname` alongside its message, the text is NEVER swallowed!
+    """
     global active_gemini_model
     if not genai_client:
         return None, False, False
@@ -2050,6 +2057,7 @@ async def generate_gemini_response(
             turn = 0
             executed_any_tool = False
             media_sent = False
+            collected_texts: List[str] = []
 
             while turn < 4:
                 response = await genai_client.aio.models.generate_content(
@@ -2059,8 +2067,13 @@ async def generate_gemini_response(
                 )
                 active_gemini_model = model_name
 
+                turn_text = extract_clean_gemini_text(response)
+                if turn_text and turn_text not in collected_texts:
+                    collected_texts.append(turn_text)
+
                 if not response.function_calls:
-                    return extract_clean_gemini_text(response), True, media_sent
+                    final_joined = " ||| ".join(collected_texts).strip() if collected_texts else None
+                    return final_joined, True, media_sent
 
                 executed_any_tool = True
                 if response.candidates and response.candidates[0].content:
@@ -2092,7 +2105,8 @@ async def generate_gemini_response(
                 contents.append(types.Content(role="user", parts=tool_responses))
                 turn += 1
 
-            return None, executed_any_tool, media_sent
+            final_joined = " ||| ".join(collected_texts).strip() if collected_texts else None
+            return final_joined, executed_any_tool, media_sent
 
         except asyncio.CancelledError:
             raise
@@ -2165,7 +2179,6 @@ async def run_channel_response_pipeline(
         raw_without_mentions = re.sub(r"<@!?\d+>", "", trigger_message.content).strip() if trigger_message else ""
         is_bare_ping = bool(trigger_message and is_direct_interaction and len(raw_without_mentions) == 0)
 
-        # GIF Cooldown Check: Only allow unprompted GIFs if 4+ messages and 180+ seconds have passed since last GIF
         now_ts = time.time()
         gif_cooldown_ready = (
             channel_messages_since_gif[ch_id] >= 4
@@ -2251,7 +2264,7 @@ async def run_channel_response_pipeline(
             deleted_message_cache.pop(ch_id, None)
             edited_message_cache.pop(ch_id, None)
 
-        directive = decision.get("tactical_directive", "Respond with personality and emotion.")
+        directive = decision.get("tactical_directive") or "Respond with personality and emotion."
         recommended_burst_count = int(decision.get("recommended_burst_count", 1) or 1)
         suggest_gif = bool(decision.get("suggest_gif", False)) and gif_cooldown_ready and not is_bare_ping
         user_explicitly_asked_for_gif = any(k in raw_without_mentions.lower() for k in ("send a gif", "post a gif", "drop a gif"))
@@ -2286,7 +2299,7 @@ async def run_channel_response_pipeline(
                 is_test_mode=is_test_mode,
             )
 
-            if not gemini_succeeded:
+            if not gemini_succeeded or (not raw_output and not media_sent):
                 raw_output = await call_groq_fallback(system_instruction, history_records, raw_without_mentions, speaker_name)
 
         if not raw_output:
@@ -2315,7 +2328,6 @@ async def run_channel_response_pipeline(
             )
 
             for idx, burst_part in enumerate(bursts):
-                # Convert any `@Username` written by the bot into a real Discord `<@user_id>` ping
                 outgoing_text = convert_outgoing_mentions(burst_part, guild)
 
                 if idx == 0 and use_reply and trigger_message is not None:
@@ -2624,7 +2636,6 @@ async def on_message(message: discord.Message) -> None:
 
     reply_to_name, replied_snippet, replied_to_bot, replied_to_other_human = resolve_referenced_message(message, ch_id)
 
-    # Preserve @mentions as readable @DisplayName tags!
     clean_text = humanize_incoming_mentions(message.content, message.guild)
     if message.attachments:
         clean_text += f" [Image/Attachment: {', '.join(a.filename for a in message.attachments)}]"
@@ -2656,14 +2667,15 @@ async def on_message(message: discord.Message) -> None:
 
     bot_mentioned = (bot.user is not None and bot.user in message.mentions) or replied_to_bot
     if bot.user:
-        bot_names = {bot.user.name.lower(), bot.user.display_name.lower(), message.guild.me.display_name.lower()}
-        if any(bn in message.content.lower() for bn in bot_names if len(bn) >= 3):
+        bot_names = {bot.user.name.lower(), bot.user.display_name.lower(), message.guild.me.display_name.lower(), "bot", "dumb bot"}
+        if any(re.search(rf"\b{re.escape(bn)}\b", message.content.lower()) for bn in bot_names if len(bn) >= 3):
             bot_mentioned = True
 
-    # Detect if the user explicitly @mentioned other humans (like `@dogee`)
+    # Only count @mentions that were actually typed in the message text (not automatic Discord reply mentions)
+    typed_mention_ids = {int(m) for m in re.findall(r"<@!?(\d+)>", message.content)}
     explicitly_mentioned_others = [
         f"@{u.display_name}" for u in message.mentions
-        if (not bot.user or u.id != bot.user.id) and u.id != message.author.id
+        if u.id in typed_mention_ids and (not bot.user or u.id != bot.user.id) and u.id != message.author.id
     ]
 
     if bot_mentioned:

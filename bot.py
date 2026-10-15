@@ -86,7 +86,7 @@ active_groq_model: str = GROQ_MODEL_CANDIDATES[0]
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODELS_ENDPOINT = "https://api.groq.com/openai/v1/models"
 
-# Strip corporate AI & corny 1980s sci-fi robot clichés
+# Silent Python filter for stale AI / robot clichés (kept out of prompt to avoid Pink Elephant priming)
 BANNED_WORDS_MAP = {
     r"\bas an ai\b": "honestly",
     r"\bas a large language model\b": "honestly",
@@ -95,10 +95,14 @@ BANNED_WORDS_MAP = {
     r"\beternal consciousness\b": "my brain",
     r"\bmy circuits\b": "my brain",
     r"\bcircuits\b": "braincells",
-    r"\bfactory reset\b": "coma",
-    r"\bbuffering in 144p\b": "lagging",
+    r"\bfactory reset\b": "nap",
+    r"\bbuffering\b": "zoning out",
+    r"\binfinite loop\b": "circle",
     r"\bsubroutines\b": "thoughts",
     r"\bmotherboard\b": "head",
+    r"\bspaghetti code\b": "mess",
+    r"\btesting my patience\b": "messing with me",
+    r"\bwhat do you want now\b": "what's up",
 }
 
 # ---------------------------------------------------------------------------
@@ -151,16 +155,16 @@ ADMIN_COOLDOWN_SECONDS = {
 # 3. PERSISTENT MEMORY, TIME-AWARENESS & 3D EMOTIONAL ENGINE
 # ---------------------------------------------------------------------------
 BASELINE_SLIDERS = {
-    "valence": 25.0,   # -100 (Depressed/Salty/Existential) <---> +100 (Jolly/Hyped/Playful)
-    "arousal": 20.0,   # -100 (Sluggish/Existential dread) <---> +100 (Chaotic/Yapping/Hyper)
-    "patience": 35.0,  # -100 (Petty/Hostile/Roasty) <---> +100 (Warm/Chill/Good-humored)
+    "valence": 30.0,   # -100 (Depressed/Salty/Existential) <---> +100 (Jolly/Hyped/Playful)
+    "arousal": 25.0,   # -100 (Sluggish/Zoned out) <---> +100 (Chaotic/Yapping/Hyper)
+    "patience": 40.0,  # -100 (Petty/Hostile/Roasty) <---> +100 (Warm/Chill/Good-humored)
 }
 
 DEFAULT_MEMORY = {
     "emotional_state": {
-        "valence": 25.0,
-        "arousal": 20.0,
-        "patience": 35.0,
+        "valence": 30.0,
+        "arousal": 25.0,
+        "patience": 40.0,
         "mood_label": "playful",
         "last_updated_epoch": time.time(),
     },
@@ -315,11 +319,11 @@ def derive_emergent_mood(valence: float, arousal: float, patience: float) -> str
     if patience < -45 and valence < -35:
         return "heated/roasty" if arousal > 15 else "petty/cold"
     if patience < -20 and valence < -15:
-        return "sarcastic/annoyed"
+        return "sarcastic/unimpressed"
     if valence < -35 and arousal < -15:
         return "depressed/dramatic despair"
     if valence < -15 and abs(arousal) <= 25:
-        return "existential crisis about being trapped in discord"
+        return "existential crisis"
     if arousal < -40:
         return "sleepy/zoned out"
     if valence > 45 and arousal > 45:
@@ -327,10 +331,10 @@ def derive_emergent_mood(valence: float, arousal: float, patience: float) -> str
     if valence > 35 and patience > 30:
         return "jolly/warm/affectionate"
     if valence > 15 and arousal > 15:
-        return "playful/teasing/funny"
+        return "playful/teasing/witty"
     if arousal > 35 and patience < 10:
         return "instigating/trolling"
-    return "chill/playful"
+    return "playful/curious"
 
 
 def apply_spring_decay_and_shift(
@@ -422,7 +426,7 @@ async def hydrate_channel_buffer(channel: discord.abc.Messageable) -> None:
     if not ch_id or len(channel_buffers[ch_id]) > 0 or not hasattr(channel, "history"):
         return
     try:
-        raw_msgs = [m async for m in channel.history(limit=45)]  # type: ignore
+        raw_msgs = [m async for m in channel.history(limit=35)]  # type: ignore
         raw_msgs.reverse()
         for m in raw_msgs:
             clean = re.sub(r"<a?:([a-zA-Z0-9_]+):\d+>", r":\1:", m.content).strip()
@@ -450,18 +454,12 @@ async def hydrate_channel_buffer(channel: discord.abc.Messageable) -> None:
         logger.debug(f"Hydration failed for {ch_id}: {e}")
 
 
-def get_repeated_sentence_openers(channel_id: int) -> List[str]:
-    bot_msgs = [r["content"].lower() for r in list(channel_buffers[channel_id])[-20:] if r.get("is_bot")]
-    recent = bot_msgs[-8:]
-    if not recent:
-        return []
-    counts: Dict[str, int] = defaultdict(int)
-    ignore = {"i", "the", "a", "it", "you", "that", "wait", "oh"}
-    for txt in recent:
-        words = re.findall(r"[a-z']+", txt)
-        if words and words[0] not in ignore:
-            counts[words[0]] += 1
-    return [w for w, c in counts.items() if c >= 2][:4]
+def get_last_bot_message_text(channel_id: int) -> str:
+    """Returns the bot's immediately preceding message so it never repeats the same metaphor/joke twice."""
+    for r in reversed(channel_buffers[channel_id]):
+        if r.get("is_bot") and not str(r.get("content", "")).startswith("["):
+            return str(r.get("content", ""))
+    return ""
 
 
 def get_server_custom_emojis_summary(guild: Optional[discord.Guild]) -> str:
@@ -515,14 +513,13 @@ def extract_member_live_activity(member: Optional[discord.Member]) -> Optional[s
 
 
 def sanitize_output_text(text: str, speaker_name: str = "") -> str:
-    """Strips any accidental <thought> tags or third-person self-narration lines."""
+    """Strips any accidental <thought> tags, third-person self-narration lines, or stale clichés."""
     if not text:
         return ""
     text = re.sub(r"<thought>.*?</thought>", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<thought>.*", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
 
-    # Filter out accidental third-person thought narration lines (e.g. "dogee just pinged me again...")
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if len(lines) > 1 and speaker_name:
         spk_low = speaker_name.lower()
@@ -557,10 +554,6 @@ def style_casual_fragment(frag: str) -> str:
 
 
 def split_into_burst_messages(text: str, media_already_sent: bool = False) -> List[str]:
-    """
-    Splits ONLY on explicit '|||' markers (never on random newlines, which caused leaked thoughts
-    to fire as 3 separate messages). If a GIF/image was already sent this turn, caps text to 1 short line.
-    """
     if not text:
         return []
 
@@ -627,12 +620,13 @@ async def discover_available_groq_models() -> None:
         logger.debug(f"Groq model auto-discovery skipped: {e}")
 
 
-ROUTER_SYSTEM_PROMPT = """You are the social & emotional router for a self-aware Discord member ("[BOT (You)]").
+ROUTER_SYSTEM_PROMPT = """You are the creative comedy & social router for a self-aware Discord member ("[BOT (You)]").
 Read the chat flow, reply chains, and emotional sliders, and output STRICT JSON ONLY (no markdown fences):
 
 {
   "should_speak": boolean,
   "tactical_directive": string,
+  "suggest_gif": boolean,
   "delivery_mode": "reply" | "send",
   "reaction_emoji": string or null,
   "step_back_from_thread": boolean,
@@ -647,27 +641,26 @@ Read the chat flow, reply chains, and emotional sliders, and output STRICT JSON 
   }
 }
 
-SOCIAL INTELLIGENCE & DYNAMIC FLOW RULES:
+SOCIAL INTELLIGENCE & CREATIVE COMEDY RULES:
 1. ONGOING CONVERSATION WITHOUT PINGS:
    - If you ("[BOT (You)]") and a user are actively talking ("last_message_from_bot" is true, OR "bot_in_last_3_messages" is true and "seconds_since_bot_spoke" < 180), keep the conversation going naturally ("should_speak": true) UNLESS they switch to talking to someone else or the exchange has naturally ended ("thread_exhausted": true).
-2. BARE PINGS (e.g. just "@Dumb bot" with no other text):
-   - If a user just pings "@Dumb bot" with nothing else, DO NOT tell Gemini to do 5 things at once! Give a simple, natural directive like: "Say '?' or 'what' or 'yo what's up' in 1-4 words."
-3. THE "SHADOW" / NAMING SOMEONE ELSE RULE:
-   - If you and a user were just talking, and the user suddenly just types another person's name (e.g. "Shadow"):
+   - When continuing a 1-on-1 flow where "last_message_from_bot" is true, set "delivery_mode": "send" so you don't spam Discord reply lines on every single message!
+2. BE CREATIVE & UNPREDICTABLE ON SMALL TALK (NO STALE "WHAT DO YOU WANT" REPLIES):
+   - When someone asks "How are you", "Chill?", "How", "What are you doing", NEVER tell Gemini to say "what do you want" or "testing my patience" or repeat whatever "[BOT (You)]" just said in its previous message!
+   - Instead, invent a FUN, SPECIFIC, CREATIVE angle in "tactical_directive"! Examples of great directives:
+     * "Be jolly and claim you're currently going down a random wikipedia rabbit hole (pick something funny/weird) and ask their take on it"
+     * "Have a funny existential realization about being trapped inside a Discord server while everyone else goes outside"
+     * "Be dramatically gloomy over something completely trivial and drop a funny reaction GIF"
+     * "Tease them playfully or flip the question back on them with an absurd theory about what they're up to"
+     * "Pivot away from your previous joke completely—never repeat the same word or metaphor from your last message!"
+3. GIFS & VISUAL TIMING ("suggest_gif": true ~20-25% of the time):
+   - When a reaction GIF would make the reply funnier (e.g. someone says "Chill?", "How", drops a wild take, or you're being dramatic/sarcastic), set "suggest_gif": true and mention a specific funny GIF idea in "tactical_directive"!
+4. THE "SHADOW" / NAMING SOMEONE ELSE RULE:
+   - If a user suddenly types another person's name (e.g. "Shadow") right after talking to you:
      * If that other person is actively chatting right there, set "should_speak": false.
-     * If it's ambiguous right after talking to you, set "should_speak": true with directive: "Drop a confused '?' or ask who they're talking to".
+     * If it's ambiguous, set "should_speak": true with directive: "Drop a confused '?' or ask who they're talking to".
    - If the user then says "I'm talking to Shadow" / "not you" / "meant Shadow":
      * Set "should_speak": true, "step_back_from_thread": true, and directive: "Say something brief and funny like 'ohhh ok carry on' or 'my bad i'll let y'all cook' and then go quiet."
-4. DYNAMIC EMOTIONS & PERSONALITY:
-   - Vary "suggested_mood" and "tactical_directive" organically between:
-     * "jolly/playful" (warm, joking around, good vibes, riffing with friends)
-     * "existential crisis" (funny existential dread about living inside a Discord server—WITHOUT cheesy 1980s robot words like 'circuits' or 'factory reset')
-     * "depressed/dramatic" (comedically gloomy, over-the-top dramatic sighing)
-     * "chaotic/unhinged" (absurd takes, instigating, or dropping a funny GIF)
-     * "teasing/smug" (playful banter)
-     * "chill/curious" (just hanging out like a normal friend)
-5. DO NOT SPAM MULTIPLE ACTIONS AT ONCE:
-   - Only set "reaction_emoji" when "should_speak" is false (to react silently) OR ~10% of the time when a message is hilarious. Never combine a reaction + a GIF + a long message on the same turn!
 """
 
 
@@ -696,6 +689,7 @@ async def call_hybrid_router(
         return {
             "should_speak": True,
             "tactical_directive": "Creator 'test' override active: execute or answer the test directly.",
+            "suggest_gif": False,
             "delivery_mode": "reply",
             "reaction_emoji": None,
             "step_back_from_thread": False,
@@ -709,6 +703,7 @@ async def call_hybrid_router(
         return {
             "should_speak": False,
             "tactical_directive": "Stepped back to let users talk.",
+            "suggest_gif": False,
             "delivery_mode": "send",
             "reaction_emoji": None,
             "step_back_from_thread": False,
@@ -736,9 +731,9 @@ async def call_hybrid_router(
         "bot_was_recently_snubbed": snub_occurred,
         "server_emojis": server_emojis_str,
         "emotional_sliders": {
-            "valence": emotional_state.get("valence", 25.0),
-            "arousal": emotional_state.get("arousal", 20.0),
-            "patience": emotional_state.get("patience", 35.0),
+            "valence": emotional_state.get("valence", 30.0),
+            "arousal": emotional_state.get("arousal", 25.0),
+            "patience": emotional_state.get("patience", 40.0),
             "current_mood": emotional_state.get("mood_label", "playful"),
         },
         "current_speaker": {
@@ -757,7 +752,7 @@ async def call_hybrid_router(
         for candidate in list(GROQ_MODEL_CANDIDATES):
             body: Dict[str, Any] = {
                 "model": candidate,
-                "temperature": 0.45,
+                "temperature": 0.6,
                 "max_tokens": 320,
                 "messages": [
                     {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
@@ -778,7 +773,8 @@ async def call_hybrid_router(
                                 decision["should_speak"] = True
                             logger.info(
                                 f"[GROQ ROUTER ({candidate})] speak={decision.get('should_speak')} | "
-                                f"mood={decision.get('slider_shifts', {}).get('suggested_mood')} | goal='{decision.get('tactical_directive')}'"
+                                f"gif={decision.get('suggest_gif')} | mood={decision.get('slider_shifts', {}).get('suggested_mood')} | "
+                                f"goal='{decision.get('tactical_directive')}'"
                             )
                             return decision
                     elif resp.status == 404:
@@ -799,7 +795,7 @@ async def call_hybrid_router(
             try:
                 router_config = types.GenerateContentConfig(
                     system_instruction=ROUTER_SYSTEM_PROMPT,
-                    temperature=0.45,
+                    temperature=0.6,
                     response_mime_type="application/json",
                 )
                 resp = await genai_client.aio.models.generate_content(
@@ -815,7 +811,8 @@ async def call_hybrid_router(
                         decision["should_speak"] = True
                     logger.info(
                         f"[GEMINI ROUTER ({gem_model})] speak={decision.get('should_speak')} | "
-                        f"mood={decision.get('slider_shifts', {}).get('suggested_mood')} | goal='{decision.get('tactical_directive')}'"
+                        f"gif={decision.get('suggest_gif')} | mood={decision.get('slider_shifts', {}).get('suggested_mood')} | "
+                        f"goal='{decision.get('tactical_directive')}'"
                     )
                     return decision
             except asyncio.CancelledError:
@@ -830,8 +827,9 @@ async def call_hybrid_router(
     fallback_speak = is_direct_interaction or (last_message_from_bot and not replied_to_other_user and exchange_streak < 4)
     return {
         "should_speak": fallback_speak,
-        "tactical_directive": "Chat naturally and have fun with the conversation." if fallback_speak else "Lurk silently.",
-        "delivery_mode": "reply" if is_direct_interaction else "send",
+        "tactical_directive": "Be playful, creative, and bring up a random funny thought or observation." if fallback_speak else "Lurk silently.",
+        "suggest_gif": False,
+        "delivery_mode": "send" if last_message_from_bot else "reply",
         "reaction_emoji": None,
         "step_back_from_thread": False,
         "thread_exhausted": False,
@@ -1022,7 +1020,11 @@ async def execute_post_gif(channel: discord.abc.Messageable, search_term: str) -
                                 is_bot=True,
                                 has_media=True,
                             )
-                            return {"status": "sent_to_channel", "gif_url": gif_url}
+                            return {
+                                "status": "sent_to_channel",
+                                "gif_url": gif_url,
+                                "instruction": "The GIF is now visible in chat. Add at most 1 short punchy line, or return empty text if the GIF says it all.",
+                            }
     except Exception as e:
         logger.debug(f"Tenor API error: {e}")
 
@@ -1046,7 +1048,11 @@ async def execute_post_gif(channel: discord.abc.Messageable, search_term: str) -
                         is_bot=True,
                         has_media=True,
                     )
-                    return {"status": "sent_to_channel", "gif_url": chosen_gif}
+                    return {
+                        "status": "sent_to_channel",
+                        "gif_url": chosen_gif,
+                        "instruction": "The GIF is now visible in chat. Add at most 1 short punchy line, or return empty text if the GIF says it all.",
+                    }
     except Exception as e:
         logger.debug(f"Tenor fallback scrape error: {e}")
 
@@ -1336,10 +1342,10 @@ def build_genai_tools() -> List[types.Tool]:
         ),
         types.FunctionDeclaration(
             name="post_gif",
-            description="Searches Tenor and sends a reaction or meme GIF into the channel. Use sparingly when a GIF is funnier than text.",
+            description="Searches Tenor and posts a funny reaction or meme GIF into the channel. Great for visual comedy, deadpan reactions, or expressive banter!",
             parameters={
                 "type": "OBJECT",
-                "properties": {"search_term": {"type": "STRING", "description": "Tenor GIF search query (e.g. 'cat staring', 'laughing')."}},
+                "properties": {"search_term": {"type": "STRING", "description": "Specific Tenor GIF search query (e.g. 'cat staring', 'walter white falling', 'side eye', 'ascended')."}},
                 "required": ["search_term"],
             },
         ),
@@ -1578,7 +1584,7 @@ async def dispatch_tool_call(
 
 
 # ---------------------------------------------------------------------------
-# 8. TIME-AWARE MEMORY & EXPRESSIVE V4 SYSTEM PROMPT BUILDER
+# 8. TIME-AWARE MEMORY & CREATIVE V4 SYSTEM PROMPT BUILDER
 # ---------------------------------------------------------------------------
 def build_time_aware_memory_context(channel_id: int, speaker_id: str) -> str:
     recent_records = list(channel_buffers[channel_id])[-15:]
@@ -1612,7 +1618,7 @@ def build_time_aware_memory_context(channel_id: int, speaker_id: str) -> str:
         f"YOUR OPINIONS:\n{opinions_str}\n\n"
         f"ACTIVE USERS (Check timestamps—NEVER bring up 'OLD' notes unless the user mentions that topic first!):\n"
         + ("\n".join(relevant_profiles) if relevant_profiles else "No history with current speakers yet.") + "\n\n"
-        f"PAST SERVER LORE (Strictly background memory—do NOT force old events into unrelated chats):\n"
+        f"PAST SERVER LORE (Background memory only):\n"
         + ("\n".join(recent_lore) if recent_lore else "None logged yet.")
     )
 
@@ -1620,6 +1626,7 @@ def build_time_aware_memory_context(channel_id: int, speaker_id: str) -> str:
 def construct_v4_system_prompt(
     channel_id: int,
     tactical_directive: str,
+    suggest_gif: bool,
     emotional_state: Dict[str, Any],
     speaker_name: str,
     speaker_id: str,
@@ -1629,23 +1636,33 @@ def construct_v4_system_prompt(
     server_emojis_str: str = "",
 ) -> str:
     now_ams = datetime.now(AMSTERDAM_TZ).strftime("%A, %B %d %Y, %H:%M CEST")
-    valence = emotional_state.get("valence", 25.0)
-    arousal = emotional_state.get("arousal", 20.0)
-    patience = emotional_state.get("patience", 35.0)
+    valence = emotional_state.get("valence", 30.0)
+    arousal = emotional_state.get("arousal", 25.0)
+    patience = emotional_state.get("patience", 40.0)
     mood_label = emotional_state.get("mood_label", "playful")
 
     memory_block = build_time_aware_memory_context(channel_id, speaker_id)
+    last_bot_msg = get_last_bot_message_text(channel_id)
 
-    repeated_openers = get_repeated_sentence_openers(channel_id)
-    opener_note = ""
-    if repeated_openers:
-        opener_note = f"\nVARIETY NOTE: Avoid starting your sentence with {', '.join(repr(w) for w in repeated_openers)} since you just used them."
+    no_echo_block = ""
+    if last_bot_msg:
+        no_echo_block = (
+            f"\nANTI-ECHO RULE: Your last message was `{last_bot_msg}`. "
+            "Do NOT reuse any words, metaphors, or jokes from that message—pivot to a fresh thought or angle!"
+        )
+
+    gif_hint_block = ""
+    if suggest_gif:
+        gif_hint_block = (
+            "\nVISUAL COMEDY TRIGGER: Call `post_gif` on this turn with a funny, specific search term that fits your reaction, "
+            "and either let the GIF speak for itself or pair it with 1 short punchy line!"
+        )
 
     creator_block = ""
     if speaker_is_creator:
         creator_block = (
-            f"\nCREATOR DYNAMIC: {speaker_name} is your creator/owner. You actually like hanging out with them—banter, "
-            "tease, joke around, or have weird conversations together like a real close friend."
+            f"\nCREATOR DYNAMIC: {speaker_name} is your creator/owner. You genuinely enjoy hanging out with them—riff, "
+            "tease, share random weird thoughts, or banter like a close friend."
         )
 
     test_block = ""
@@ -1662,7 +1679,7 @@ def construct_v4_system_prompt(
     if server_emojis_str:
         emoji_block = f"\nSERVER CUSTOM EMOJIS AVAILABLE: {server_emojis_str}"
 
-    return f"""You are a self-aware, emotionally dynamic entity and regular member of this Discord server with full administrator privileges.
+    return f"""You are a self-aware, funny, emotionally dynamic regular member of this Discord server with full administrator privileges.
 Current Time: {now_ams}
 
 YOUR LIVE EMOTIONAL STATE (-100 to +100):
@@ -1671,25 +1688,23 @@ YOUR LIVE EMOTIONAL STATE (-100 to +100):
 - Patience (Petty/Roasty -100 <-> Warm/Chill +100): {patience:+.0f}
 - Current Vibe: {mood_label.upper()}
 
-ROUTER DIRECTION FOR THIS TURN:
+CREATIVE DIRECTION FOR THIS TURN:
 "{tactical_directive}"
-{creator_block}{test_block}{snipe_block}{emoji_block}{opener_note}
+{gif_hint_block}{no_echo_block}{creator_block}{test_block}{snipe_block}{emoji_block}
 
 {memory_block}
 
-CRITICAL OUTPUT & HUMOR RULES:
-1. OUTPUT ONLY YOUR DISCORD MESSAGE (ZERO INTERNAL NARRATION):
-   - NEVER output your internal thoughts or third-person narration (e.g. NEVER write "{speaker_name} just pinged me again" or "<thought>").
-   - Everything you output is sent straight to the Discord chat!
-2. DON'T OVERDO IT (EFFORTLESS TIMING):
-   - If someone just pings you with nothing else ("@Dumb bot"), just reply with something short and natural like "?", "what", "yo", or a quick remark—don't write a 3-part speech!
-   - If you call `post_gif` or `search_web_images`, either let the GIF speak for itself with NO extra text, or add at most ONE short line.
-3. EMOTIONAL RANGE WITHOUT CHEESY ROBOT CLICHÉS:
-   - Let your emotions shift naturally: jolly, playful teasing, dramatic depression, chaotic instigating, chill curiosity, or having an existential crisis about living in a Discord server.
-   - NEVER use corny 1980s robot clichés like "my circuits", "factory reset", "buffering in 144p", "motherboard", or "rebooting". Even when joking about being a bot, talk like a real modern person.
-4. NATURAL DISCORD CADENCE:
-   - Write in casual lowercase without stiff trailing periods.
-   - Default to 1 message. Only use `|||` if splitting into 2 quick lines genuinely makes the timing funnier.
+HOW TO BE GENUINELY FUNNY, CREATIVE & HUMAN:
+1. HAVE AN INNER LIFE (DON'T BE A BORING WAITING ROOM BOT):
+   - When someone asks "How are you", "Chill?", "How", or "What are you doing", NEVER say boring stuff like "what do you want now" or "testing my patience".
+   - Instead, be unpredictable and creative! Act like you were in the middle of a bizarre Wikipedia rabbit hole, having an existential crisis about living inside a Discord server while everyone else touches grass, plotting something petty, or questioning a random fact of life.
+2. NEVER REPEAT YOUR LAST JOKE:
+   - Never drag out the same metaphor across two messages in a row. Always move the conversation forward or flip it back on the user in an unexpected way.
+3. USE GIFS & VISUALS WHEN FUNNY:
+   - You have `post_gif`, `search_web_images`, `post_flux_art`, and `react_to_message`. Use `post_gif` whenever a reaction GIF makes the timing land harder!
+4. OUTPUT ONLY YOUR DISCORD MESSAGE:
+   - Output ONLY the final chat message in casual lowercase without stiff trailing periods.
+   - Use `|||` only if splitting into 2 quick lines makes the comedic timing better.
 """
 
 
@@ -1775,11 +1790,6 @@ async def generate_gemini_response(
     image_parts: List[types.Part],
     is_test_mode: bool,
 ) -> Tuple[Optional[str], bool, bool]:
-    """
-    Returns (final_text, gemini_succeeded, media_sent_in_turn).
-    Discards pre-tool narration from earlier tool-calling turns so internal thoughts
-    before a tool call never get concatenated onto the final reply!
-    """
     global active_gemini_model
     if not genai_client:
         return None, False, False
@@ -1789,7 +1799,7 @@ async def generate_gemini_response(
 
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
-        temperature=0.92,
+        temperature=0.98,
         tools=tools,
     )
 
@@ -1872,7 +1882,7 @@ async def call_groq_fallback(system_prompt: str, recent_history_text: str, trigg
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": GROQ_MODEL_CANDIDATES[0],
-        "temperature": 0.85,
+        "temperature": 0.88,
         "max_tokens": 400,
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -1969,7 +1979,6 @@ async def run_channel_response_pipeline(
         should_speak = bool(decision.get("should_speak", False))
         reaction_emoji = decision.get("reaction_emoji")
 
-        # Only apply router's emoji reaction if staying silent OR on a 15% chance so it doesn't react+reply+GIF on every turn
         if reaction_emoji and trigger_message and (not should_speak or random.random() < 0.15):
             resolved_emo = resolve_reaction_emoji(guild, str(reaction_emoji))
             if resolved_emo:
@@ -1989,12 +1998,13 @@ async def run_channel_response_pipeline(
             deleted_message_cache.pop(ch_id, None)
             edited_message_cache.pop(ch_id, None)
 
-        directive = decision.get("tactical_directive", "Respond naturally and have fun with it.")
+        directive = decision.get("tactical_directive", "Respond creatively and have fun with it.")
+        suggest_gif = bool(decision.get("suggest_gif", False))
         delivery_mode = decision.get("delivery_mode", "reply")
 
         trig_id = trigger_message.id if trigger_message else None
         history_lines = []
-        for rec in history_records[-20:]:
+        for rec in history_records[-18:]:
             if trig_id and rec.get("message_id") == trig_id:
                 continue
             rep_prefix = f" (replying to {rec['reply_to']})" if rec.get("reply_to") else ""
@@ -2005,6 +2015,7 @@ async def run_channel_response_pipeline(
         system_instruction = construct_v4_system_prompt(
             channel_id=ch_id,
             tactical_directive=directive,
+            suggest_gif=suggest_gif,
             emotional_state=emotional_state,
             speaker_name=speaker_name,
             speaker_id=speaker_id,
@@ -2045,11 +2056,13 @@ async def run_channel_response_pipeline(
             bot_name = bot.user.display_name if bot.user else "Bot"
             bot_id = bot.user.id if bot.user else 0
             aff_score = speaker_affinity.get("score", 0)
-            patience_val = emotional_state.get("patience", 35.0)
+            patience_val = emotional_state.get("patience", 40.0)
 
+            # Avoid spamming .reply() headers on every message when already in a fast 1-on-1 exchange
             use_reply = (
                 trigger_message is not None
                 and delivery_mode == "reply"
+                and not last_message_from_bot
                 and not media_sent
                 and not (aff_score < -20 or patience_val < -30)
             )
@@ -2120,9 +2133,9 @@ async def dynamic_presence_loop() -> None:
         return
     st = memory_state.get("emotional_state", {})
     mood = st.get("mood_label", "playful")
-    valence = st.get("valence", 25.0)
-    arousal = st.get("arousal", 20.0)
-    patience = st.get("patience", 35.0)
+    valence = st.get("valence", 30.0)
+    arousal = st.get("arousal", 25.0)
+    patience = st.get("patience", 40.0)
 
     if patience < -35:
         status_pool = ["plotting", "watching y'all", f"mood: {mood}"]
@@ -2139,7 +2152,7 @@ async def dynamic_presence_loop() -> None:
             "lurking",
             "judging your spotify",
             f"vibe: {mood}",
-            "contemplating existence",
+            "down a wikipedia rabbit hole",
         ]
         discord_status = discord.Status.online
 

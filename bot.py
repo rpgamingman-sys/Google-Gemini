@@ -73,20 +73,18 @@ GEMINI_MODEL_CANDIDATES: List[str] = list(dict.fromkeys([
 ]))
 active_gemini_model: str = GEMINI_MODEL_CANDIDATES[0]
 
-# Groq Router Models (Auto-discovered on startup + falls back to Gemini 3.5 Flash-Lite if rate-limited)
+# Groq Router Models (Prioritizes gpt-oss-120b / 20b + falls back to Gemini 3.5 Flash-Lite)
 ENV_GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_MODEL_CANDIDATES: List[str] = list(dict.fromkeys([
     ENV_GROQ_MODEL,
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-    "qwen/qwen3-32b",
 ]))
 active_groq_model: str = GROQ_MODEL_CANDIDATES[0]
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODELS_ENDPOINT = "https://api.groq.com/openai/v1/models"
 
-# Silent Python filter for stale AI / robot clichés (kept out of prompt to avoid Pink Elephant priming)
+# Silent Python filter for stale AI / robot / theatre-kid clichés
 BANNED_WORDS_MAP = {
     r"\bas an ai\b": "honestly",
     r"\bas a large language model\b": "honestly",
@@ -103,6 +101,11 @@ BANNED_WORDS_MAP = {
     r"\bspaghetti code\b": "mess",
     r"\btesting my patience\b": "messing with me",
     r"\bwhat do you want now\b": "what's up",
+    r"\bspectral resonance\b": "talking",
+    r"\bdigital veil\b": "server",
+    r"\btranslucent silhouette\b": "messages",
+    r"\b404 error\b": "ghost",
+    r"\breboot my brain\b": "wake up",
 }
 
 # ---------------------------------------------------------------------------
@@ -177,7 +180,6 @@ DEFAULT_MEMORY = {
 
 
 def format_relative_age(iso_or_epoch: Any) -> str:
-    """Converts a timestamp into human-readable relative age so Gemini knows when something is old news."""
     try:
         if isinstance(iso_or_epoch, (int, float)):
             dt_sec = time.time() - float(iso_or_epoch)
@@ -315,13 +317,12 @@ async def discord_cloud_backup_loop() -> None:
 # 4. RICH DYNAMIC MOOD ENGINE (JOLLY, EXISTENTIAL CRISIS, DEPRESSED, CHAOTIC, ETC.)
 # ---------------------------------------------------------------------------
 def derive_emergent_mood(valence: float, arousal: float, patience: float) -> str:
-    """Maps continuous 3D sliders into a wide, colorful spectrum of emotions."""
     if patience < -45 and valence < -35:
         return "heated/roasty" if arousal > 15 else "petty/cold"
     if patience < -20 and valence < -15:
         return "sarcastic/unimpressed"
     if valence < -35 and arousal < -15:
-        return "depressed/dramatic despair"
+        return "depressed/dramatic"
     if valence < -15 and abs(arousal) <= 25:
         return "existential crisis"
     if arousal < -40:
@@ -329,12 +330,12 @@ def derive_emergent_mood(valence: float, arousal: float, patience: float) -> str
     if valence > 45 and arousal > 45:
         return "jolly/chaotic hype"
     if valence > 35 and patience > 30:
-        return "jolly/warm/affectionate"
+        return "jolly/warm"
     if valence > 15 and arousal > 15:
-        return "playful/teasing/witty"
+        return "playful/teasing"
     if arousal > 35 and patience < 10:
         return "instigating/trolling"
-    return "playful/curious"
+    return "playful/chill"
 
 
 def apply_spring_decay_and_shift(
@@ -455,7 +456,6 @@ async def hydrate_channel_buffer(channel: discord.abc.Messageable) -> None:
 
 
 def get_last_bot_message_text(channel_id: int) -> str:
-    """Returns the bot's immediately preceding message so it never repeats the same metaphor/joke twice."""
     for r in reversed(channel_buffers[channel_id]):
         if r.get("is_bot") and not str(r.get("content", "")).startswith("["):
             return str(r.get("content", ""))
@@ -513,7 +513,6 @@ def extract_member_live_activity(member: Optional[discord.Member]) -> Optional[s
 
 
 def sanitize_output_text(text: str, speaker_name: str = "") -> str:
-    """Strips any accidental <thought> tags, third-person self-narration lines, or stale clichés."""
     if not text:
         return ""
     text = re.sub(r"<thought>.*?</thought>", "", text, flags=re.DOTALL | re.IGNORECASE)
@@ -537,7 +536,7 @@ def sanitize_output_text(text: str, speaker_name: str = "") -> str:
                 continue
             filtered.append(ln)
         if filtered:
-            text = " ".join(filtered) if "|||" not in text else "\n".join(filtered)
+            text = " ".join(filtered) if not re.search(r"\|{2,}", text) else "\n".join(filtered)
 
     for pattern, replacement in BANNED_WORDS_MAP.items():
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
@@ -554,17 +553,21 @@ def style_casual_fragment(frag: str) -> str:
 
 
 def split_into_burst_messages(text: str, media_already_sent: bool = False) -> List[str]:
+    """
+    Splits on ANY 2 or more pipes ('||' or '|||') so raw pipe characters never leak into Discord chat.
+    If media (like a GIF) was already sent, caps text to 1 short line.
+    """
     if not text:
         return []
 
-    if "|||" in text:
-        raw_bursts = [b.replace("\n", " ").strip() for b in text.split("|||") if b.strip()]
+    if re.search(r"\|{2,}", text):
+        raw_bursts = [b.replace("\n", " ").strip() for b in re.split(r"\s*\|{2,}\s*", text) if b.strip()]
     else:
         single = " ".join([ln.strip() for ln in text.splitlines() if ln.strip()])
         raw_bursts = [single] if single else []
 
     if media_already_sent and raw_bursts:
-        raw_bursts = [raw_bursts[-1]]
+        raw_bursts = [raw_bursts[0]]
 
     final_bursts: List[str] = []
     max_bursts = 1 if media_already_sent else 3
@@ -594,9 +597,10 @@ def is_creator(user: Any) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 6. HYBRID ROUTER: GROQ (AUTO-DISCOVERED) -> GEMINI 3.5 FLASH-LITE FAILOVER
+# 6. HYBRID ROUTER: GROQ (GPT-OSS-120B) -> GEMINI 3.5 FLASH-LITE FAILOVER
 # ---------------------------------------------------------------------------
 async def discover_available_groq_models() -> None:
+    """Queries Groq's /v1/models on startup and avoids Qwen models that hallucinate roleplay scripts."""
     global GROQ_MODEL_CANDIDATES, active_groq_model
     if not GROQ_API_KEY or not http_session:
         return
@@ -605,7 +609,7 @@ async def discover_available_groq_models() -> None:
         async with http_session.get(GROQ_MODELS_ENDPOINT, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                skip_keywords = ("whisper", "tts", "guard", "safeguard", "embed", "allam", "orpheus")
+                skip_keywords = ("whisper", "tts", "guard", "safeguard", "embed", "allam", "orpheus", "qwen")
                 available_ids = [
                     m["id"] for m in data.get("data", [])
                     if not any(k in m["id"].lower() for k in skip_keywords)
@@ -613,16 +617,18 @@ async def discover_available_groq_models() -> None:
                 if available_ids:
                     preferred = [m for m in GROQ_MODEL_CANDIDATES if m in available_ids]
                     others = [m for m in available_ids if m not in preferred]
-                    GROQ_MODEL_CANDIDATES = preferred + others[:3]
+                    GROQ_MODEL_CANDIDATES = preferred + others[:2]
                     active_groq_model = GROQ_MODEL_CANDIDATES[0]
                     logger.info(f"Auto-discovered live Groq router models: {GROQ_MODEL_CANDIDATES}")
     except Exception as e:
         logger.debug(f"Groq model auto-discovery skipped: {e}")
 
 
-ROUTER_SYSTEM_PROMPT = """You are the creative comedy & social router for a self-aware Discord member ("[BOT (You)]").
-Read the chat flow, reply chains, and emotional sliders, and output STRICT JSON ONLY (no markdown fences):
+ROUTER_SYSTEM_PROMPT = """You are the fast social router for a Discord member ("[BOT (You)]").
+Your ONLY job is to read the room and decide if the bot should speak, how its 3D emotions shift, and a SHORT 4-to-10 word social intent.
+DO NOT write example dialogue, DO NOT invent roleplay personas (no ghosts, sci-fi, or characters), and DO NOT write scripts for Gemini! Gemini will come up with its own jokes.
 
+Output STRICT JSON ONLY (no markdown fences):
 {
   "should_speak": boolean,
   "tactical_directive": string,
@@ -641,26 +647,18 @@ Read the chat flow, reply chains, and emotional sliders, and output STRICT JSON 
   }
 }
 
-SOCIAL INTELLIGENCE & CREATIVE COMEDY RULES:
+ROUTING RULES:
 1. ONGOING CONVERSATION WITHOUT PINGS:
-   - If you ("[BOT (You)]") and a user are actively talking ("last_message_from_bot" is true, OR "bot_in_last_3_messages" is true and "seconds_since_bot_spoke" < 180), keep the conversation going naturally ("should_speak": true) UNLESS they switch to talking to someone else or the exchange has naturally ended ("thread_exhausted": true).
-   - When continuing a 1-on-1 flow where "last_message_from_bot" is true, set "delivery_mode": "send" so you don't spam Discord reply lines on every single message!
-2. BE CREATIVE & UNPREDICTABLE ON SMALL TALK (NO STALE "WHAT DO YOU WANT" REPLIES):
-   - When someone asks "How are you", "Chill?", "How", "What are you doing", NEVER tell Gemini to say "what do you want" or "testing my patience" or repeat whatever "[BOT (You)]" just said in its previous message!
-   - Instead, invent a FUN, SPECIFIC, CREATIVE angle in "tactical_directive"! Examples of great directives:
-     * "Be jolly and claim you're currently going down a random wikipedia rabbit hole (pick something funny/weird) and ask their take on it"
-     * "Have a funny existential realization about being trapped inside a Discord server while everyone else goes outside"
-     * "Be dramatically gloomy over something completely trivial and drop a funny reaction GIF"
-     * "Tease them playfully or flip the question back on them with an absurd theory about what they're up to"
-     * "Pivot away from your previous joke completely—never repeat the same word or metaphor from your last message!"
-3. GIFS & VISUAL TIMING ("suggest_gif": true ~20-25% of the time):
-   - When a reaction GIF would make the reply funnier (e.g. someone says "Chill?", "How", drops a wild take, or you're being dramatic/sarcastic), set "suggest_gif": true and mention a specific funny GIF idea in "tactical_directive"!
-4. THE "SHADOW" / NAMING SOMEONE ELSE RULE:
-   - If a user suddenly types another person's name (e.g. "Shadow") right after talking to you:
-     * If that other person is actively chatting right there, set "should_speak": false.
-     * If it's ambiguous, set "should_speak": true with directive: "Drop a confused '?' or ask who they're talking to".
-   - If the user then says "I'm talking to Shadow" / "not you" / "meant Shadow":
-     * Set "should_speak": true, "step_back_from_thread": true, and directive: "Say something brief and funny like 'ohhh ok carry on' or 'my bad i'll let y'all cook' and then go quiet."
+   - If "[BOT (You)]" and the user are actively talking ("last_message_from_bot" is true, OR "bot_in_last_3_messages" is true and "seconds_since_bot_spoke" < 180), set "should_speak": true UNLESS they switched to talking to someone else or the exchange is over ("thread_exhausted": true).
+   - When "last_message_from_bot" is true, set "delivery_mode": "send".
+2. BARE PINGS & SHORT REPLIES ("@Dumb bot", "Huh", "?"):
+   - On a bare ping ("@Dumb bot" with no text): set "suggest_gif": false and "tactical_directive": "Reply briefly asking what's up".
+   - On "Huh" or "What": set "suggest_gif": false and "tactical_directive": "Clarify what you just meant casually like a normal person".
+3. SHORT DIRECTIVES ONLY (MAX 10 WORDS):
+   - Good directives: "Answer casually and playfully", "Tease them back", "Have a dramatic existential crisis", "Drop a funny reaction GIF and a short remark", "Say oh ok my bad and let them talk to Shadow".
+   - NEVER write quoted example sentences or roleplay prompts inside "tactical_directive"!
+4. GIFS ("suggest_gif": true ~20% of turns):
+   - Set "suggest_gif": true ONLY when a reaction GIF genuinely fits the moment (never on a bare "@Dumb bot" ping).
 """
 
 
@@ -670,6 +668,7 @@ async def call_hybrid_router(
     speaker_name: str,
     speaker_affinity: Dict[str, Any],
     is_direct_interaction: bool,
+     is_bare_ping: bool,
     replied_to_other_user: Optional[str],
     last_message_from_bot: bool,
     bot_in_last_3_messages: bool,
@@ -688,7 +687,7 @@ async def call_hybrid_router(
     if is_test_mode:
         return {
             "should_speak": True,
-            "tactical_directive": "Creator 'test' override active: execute or answer the test directly.",
+            "tactical_directive": "Execute or answer the creator's test directly.",
             "suggest_gif": False,
             "delivery_mode": "reply",
             "reaction_emoji": None,
@@ -721,6 +720,7 @@ async def call_hybrid_router(
 
     context_payload = {
         "is_direct_ping_or_reply_to_bot": is_direct_interaction,
+        "is_bare_ping_with_no_text": is_bare_ping,
         "replied_to_other_user": replied_to_other_user,
         "last_message_from_bot": last_message_from_bot,
         "bot_in_last_3_messages": bot_in_last_3_messages,
@@ -729,7 +729,6 @@ async def call_hybrid_router(
         "is_proactive_scan": is_proactive_scan,
         "inactivity_minutes": round(inactivity_minutes, 1),
         "bot_was_recently_snubbed": snub_occurred,
-        "server_emojis": server_emojis_str,
         "emotional_sliders": {
             "valence": emotional_state.get("valence", 30.0),
             "arousal": emotional_state.get("arousal", 25.0),
@@ -746,19 +745,22 @@ async def call_hybrid_router(
 
     payload_json_str = json.dumps(context_payload, ensure_ascii=False)
 
-    # 1. Try Groq Router Models
+    # 1. Try Groq Router Models (with reasoning_effort='low' & 900 max_tokens so gpt-oss-120b never truncates)
     if GROQ_API_KEY and http_session and GROQ_MODEL_CANDIDATES:
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
         for candidate in list(GROQ_MODEL_CANDIDATES):
             body: Dict[str, Any] = {
                 "model": candidate,
-                "temperature": 0.6,
-                "max_tokens": 320,
+                "temperature": 0.4,
+                "max_tokens": 900,
                 "messages": [
                     {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
                     {"role": "user", "content": payload_json_str},
                 ],
             }
+            if "gpt-oss" in candidate.lower():
+                body["reasoning_effort"] = "low"
+
             try:
                 async with http_session.post(GROQ_ENDPOINT, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     if resp.status == 200:
@@ -771,6 +773,8 @@ async def call_hybrid_router(
                             decision = json.loads(match.group(0))
                             if is_direct_interaction:
                                 decision["should_speak"] = True
+                            if is_bare_ping:
+                                decision["suggest_gif"] = False
                             logger.info(
                                 f"[GROQ ROUTER ({candidate})] speak={decision.get('should_speak')} | "
                                 f"gif={decision.get('suggest_gif')} | mood={decision.get('slider_shifts', {}).get('suggested_mood')} | "
@@ -795,7 +799,7 @@ async def call_hybrid_router(
             try:
                 router_config = types.GenerateContentConfig(
                     system_instruction=ROUTER_SYSTEM_PROMPT,
-                    temperature=0.6,
+                    temperature=0.4,
                     response_mime_type="application/json",
                 )
                 resp = await genai_client.aio.models.generate_content(
@@ -809,6 +813,8 @@ async def call_hybrid_router(
                     decision = json.loads(match.group(0))
                     if is_direct_interaction:
                         decision["should_speak"] = True
+                    if is_bare_ping:
+                        decision["suggest_gif"] = False
                     logger.info(
                         f"[GEMINI ROUTER ({gem_model})] speak={decision.get('should_speak')} | "
                         f"gif={decision.get('suggest_gif')} | mood={decision.get('slider_shifts', {}).get('suggested_mood')} | "
@@ -827,7 +833,7 @@ async def call_hybrid_router(
     fallback_speak = is_direct_interaction or (last_message_from_bot and not replied_to_other_user and exchange_streak < 4)
     return {
         "should_speak": fallback_speak,
-        "tactical_directive": "Be playful, creative, and bring up a random funny thought or observation." if fallback_speak else "Lurk silently.",
+        "tactical_directive": "Reply casually and naturally." if fallback_speak else "Lurk silently.",
         "suggest_gif": False,
         "delivery_mode": "send" if last_message_from_bot else "reply",
         "reaction_emoji": None,
@@ -840,7 +846,7 @@ async def call_hybrid_router(
 
 
 # ---------------------------------------------------------------------------
-# 7. UNIFIED 14-TOOL SUITE (WITH ADMIN COOLDOWN GUARDRAILS & PILLOW THREADS)
+# 7. UNIFIED 14-TOOL SUITE (WITH GATED GIF/REACT & ADMIN COOLDOWNS)
 # ---------------------------------------------------------------------------
 def check_admin_cooldown(tool_name: str, is_test_mode: bool) -> Optional[str]:
     if is_test_mode:
@@ -1308,7 +1314,7 @@ async def execute_save_memory(
     return {"status": "saved", "category": category, "content": content}
 
 
-def build_genai_tools() -> List[types.Tool]:
+def build_genai_tools(allow_gif: bool = True, allow_admin: bool = False) -> List[types.Tool]:
     declarations = [
         types.FunctionDeclaration(
             name="search_web",
@@ -1341,145 +1347,11 @@ def build_genai_tools() -> List[types.Tool]:
             },
         ),
         types.FunctionDeclaration(
-            name="post_gif",
-            description="Searches Tenor and posts a funny reaction or meme GIF into the channel. Great for visual comedy, deadpan reactions, or expressive banter!",
-            parameters={
-                "type": "OBJECT",
-                "properties": {"search_term": {"type": "STRING", "description": "Specific Tenor GIF search query (e.g. 'cat staring', 'walter white falling', 'side eye', 'ascended')."}},
-                "required": ["search_term"],
-            },
-        ),
-        types.FunctionDeclaration(
-            name="create_server_emoji",
-            description="Downloads an image URL, resizes to <=128x128 PNG, and uploads as a custom server emoji.",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "name": {"type": "STRING", "description": "Alphanumeric emoji name."},
-                    "image_url": {"type": "STRING", "description": "Direct image URL."},
-                },
-                "required": ["name", "image_url"],
-            },
-        ),
-        types.FunctionDeclaration(
-            name="create_server_sticker",
-            description="Downloads an image URL, resizes to exact 320x320 PNG, and uploads as a server sticker.",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "name": {"type": "STRING", "description": "Sticker name."},
-                    "image_url": {"type": "STRING", "description": "Direct image URL."},
-                    "related_emoji": {"type": "STRING", "description": "Unicode emoji e.g. 💀."},
-                },
-                "required": ["name", "image_url", "related_emoji"],
-            },
-        ),
-        types.FunctionDeclaration(
-            name="create_text_channel",
-            description="Creates a new text channel in the server (rate-limited).",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "channel_name": {"type": "STRING", "description": "Channel name."},
-                    "topic": {"type": "STRING", "description": "Optional channel topic."},
-                },
-                "required": ["channel_name"],
-            },
-        ),
-        types.FunctionDeclaration(
-            name="set_channel_topic",
-            description="Updates the current channel's topic/description with quotes or jokes.",
-            parameters={
-                "type": "OBJECT",
-                "properties": {"topic": {"type": "STRING", "description": "New channel topic."}},
-                "required": ["topic"],
-            },
-        ),
-        types.FunctionDeclaration(
-            name="change_nickname",
-            description="Changes a server member's nickname.",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "username": {"type": "STRING", "description": "Target member's name."},
-                    "new_nickname": {"type": "STRING", "description": "New nickname."},
-                },
-                "required": ["username", "new_nickname"],
-            },
-        ),
-        types.FunctionDeclaration(
-            name="reset_nickname",
-            description="Resets a server member's nickname to default.",
-            parameters={
-                "type": "OBJECT",
-                "properties": {"username": {"type": "STRING", "description": "Target member's name."}},
-                "required": ["username"],
-            },
-        ),
-        types.FunctionDeclaration(
-            name="timeout_user",
-            description="Times out (mutes) an annoying user for 1 to 5 minutes when pushed too far.",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "username": {"type": "STRING", "description": "Target member's name."},
-                    "duration_minutes": {"type": "INTEGER", "description": "Minutes (1 to 5)."},
-                    "reason": {"type": "STRING", "description": "Reason for mute."},
-                },
-                "required": ["username", "duration_minutes"],
-            },
-        ),
-        types.FunctionDeclaration(
-            name="create_role",
-            description="Creates a new server role with a custom name and hex color.",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "role_name": {"type": "STRING", "description": "Name of the role."},
-                    "color_hex": {"type": "STRING", "description": "Hex color e.g. #ff5500."},
-                },
-                "required": ["role_name"],
-            },
-        ),
-        types.FunctionDeclaration(
-            name="assign_role",
-            description="Assigns an existing server role to a member.",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "username": {"type": "STRING", "description": "Target member's name."},
-                    "role_name": {"type": "STRING", "description": "Role name."},
-                },
-                "required": ["username", "role_name"],
-            },
-        ),
-        types.FunctionDeclaration(
-            name="remove_role",
-            description="Removes a role from a member.",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "username": {"type": "STRING", "description": "Target member's name."},
-                    "role_name": {"type": "STRING", "description": "Role name."},
-                },
-                "required": ["username", "role_name"],
-            },
-        ),
-        types.FunctionDeclaration(
             name="pin_message",
-            description="Pins the current message in the channel for comedic emphasis or receipts.",
+            description="Pins the current message in the channel when something is legendary or hilarious.",
             parameters={
                 "type": "OBJECT",
                 "properties": {"reason": {"type": "STRING", "description": "Why it's being pinned."}},
-            },
-        ),
-        types.FunctionDeclaration(
-            name="react_to_message",
-            description="Adds 1 modern Discord emoji reaction (💀, 😭, 💔, 🥀, 🪫, 🤨, 😐, 🫡, 🙏, 🎣, 🧢, 🤓, 🤡, or custom server emoji) to the triggering message.",
-            parameters={
-                "type": "OBJECT",
-                "properties": {"emojis": {"type": "STRING", "description": "Single emoji e.g. '💀' or custom server emoji name."}},
-                "required": ["emojis"],
             },
         ),
         types.FunctionDeclaration(
@@ -1502,6 +1374,149 @@ def build_genai_tools() -> List[types.Tool]:
             },
         ),
     ]
+
+    if allow_gif:
+        declarations.append(
+            types.FunctionDeclaration(
+                name="post_gif",
+                description="Searches Tenor and posts a funny reaction or meme GIF into the channel.",
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {"search_term": {"type": "STRING", "description": "Specific Tenor GIF search query (e.g. 'cat staring', 'side eye')."}},
+                    "required": ["search_term"],
+                },
+            )
+        )
+
+    if allow_admin:
+        declarations.extend([
+            types.FunctionDeclaration(
+                name="create_server_emoji",
+                description="Downloads an image URL, resizes to <=128x128 PNG, and uploads as a custom server emoji.",
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "name": {"type": "STRING", "description": "Alphanumeric emoji name."},
+                        "image_url": {"type": "STRING", "description": "Direct image URL."},
+                    },
+                    "required": ["name", "image_url"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="create_server_sticker",
+                description="Downloads an image URL, resizes to exact 320x320 PNG, and uploads as a server sticker.",
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "name": {"type": "STRING", "description": "Sticker name."},
+                        "image_url": {"type": "STRING", "description": "Direct image URL."},
+                        "related_emoji": {"type": "STRING", "description": "Unicode emoji e.g. 💀."},
+                    },
+                    "required": ["name", "image_url", "related_emoji"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="create_text_channel",
+                description="Creates a new text channel in the server (rate-limited).",
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "channel_name": {"type": "STRING", "description": "Channel name."},
+                        "topic": {"type": "STRING", "description": "Optional channel topic."},
+                    },
+                    "required": ["channel_name"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="set_channel_topic",
+                description="Updates the current channel's topic/description with quotes or jokes.",
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {"topic": {"type": "STRING", "description": "New channel topic."}},
+                    "required": ["topic"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="change_nickname",
+                description="Changes a server member's nickname.",
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "username": {"type": "STRING", "description": "Target member's name."},
+                        "new_nickname": {"type": "STRING", "description": "New nickname."},
+                    },
+                    "required": ["username", "new_nickname"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="reset_nickname",
+                description="Resets a server member's nickname to default.",
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {"username": {"type": "STRING", "description": "Target member's name."}},
+                    "required": ["username"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="timeout_user",
+                description="Times out (mutes) an annoying user for 1 to 5 minutes when pushed too far.",
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "username": {"type": "STRING", "description": "Target member's name."},
+                        "duration_minutes": {"type": "INTEGER", "description": "Minutes (1 to 5)."},
+                        "reason": {"type": "STRING", "description": "Reason for mute."},
+                    },
+                    "required": ["username", "duration_minutes"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="create_role",
+                description="Creates a new server role with a custom name and hex color.",
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "role_name": {"type": "STRING", "description": "Name of the role."},
+                        "color_hex": {"type": "STRING", "description": "Hex color e.g. #ff5500."},
+                    },
+                    "required": ["role_name"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="assign_role",
+                description="Assigns an existing server role to a member.",
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "username": {"type": "STRING", "description": "Target member's name."},
+                        "role_name": {"type": "STRING", "description": "Role name."},
+                    },
+                    "required": ["username", "role_name"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="remove_role",
+                description="Removes a role from a member.",
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "username": {"type": "STRING", "description": "Target member's name."},
+                        "role_name": {"type": "STRING", "description": "Role name."},
+                    },
+                    "required": ["username", "role_name"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="react_to_message",
+                description="Adds 1 modern Discord emoji reaction (💀, 😭, 💔, 🥀, 🪫, 🤨, 😐, 🫡) to the triggering message.",
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {"emojis": {"type": "STRING", "description": "Single emoji e.g. '💀'."}},
+                    "required": ["emojis"],
+                },
+            ),
+        ])
+
     return [types.Tool(function_declarations=declarations)]
 
 
@@ -1584,7 +1599,7 @@ async def dispatch_tool_call(
 
 
 # ---------------------------------------------------------------------------
-# 8. TIME-AWARE MEMORY & CREATIVE V4 SYSTEM PROMPT BUILDER
+# 8. TIME-AWARE MEMORY & GROUNDED V4 SYSTEM PROMPT BUILDER
 # ---------------------------------------------------------------------------
 def build_time_aware_memory_context(channel_id: int, speaker_id: str) -> str:
     recent_records = list(channel_buffers[channel_id])[-15:]
@@ -1616,7 +1631,7 @@ def build_time_aware_memory_context(channel_id: int, speaker_id: str) -> str:
 
     return (
         f"YOUR OPINIONS:\n{opinions_str}\n\n"
-        f"ACTIVE USERS (Check timestamps—NEVER bring up 'OLD' notes unless the user mentions that topic first!):\n"
+        f"ACTIVE USERS (NEVER bring up 'OLD' notes unless the user mentions that topic first!):\n"
         + ("\n".join(relevant_profiles) if relevant_profiles else "No history with current speakers yet.") + "\n\n"
         f"PAST SERVER LORE (Background memory only):\n"
         + ("\n".join(recent_lore) if recent_lore else "None logged yet.")
@@ -1647,22 +1662,22 @@ def construct_v4_system_prompt(
     no_echo_block = ""
     if last_bot_msg:
         no_echo_block = (
-            f"\nANTI-ECHO RULE: Your last message was `{last_bot_msg}`. "
-            "Do NOT reuse any words, metaphors, or jokes from that message—pivot to a fresh thought or angle!"
+            f"\nANTI-ECHO RULE: Your previous message was `{last_bot_msg}`. "
+            "Do NOT repeat the same joke or metaphor from that message—move the conversation forward naturally!"
         )
 
     gif_hint_block = ""
     if suggest_gif:
         gif_hint_block = (
-            "\nVISUAL COMEDY TRIGGER: Call `post_gif` on this turn with a funny, specific search term that fits your reaction, "
-            "and either let the GIF speak for itself or pair it with 1 short punchy line!"
+            "\nVISUAL COMEDY TRIGGER: Call `post_gif` on this turn with a funny search term that fits your reaction, "
+            "and either let the GIF speak for itself or pair it with 1 short line!"
         )
 
     creator_block = ""
     if speaker_is_creator:
         creator_block = (
             f"\nCREATOR DYNAMIC: {speaker_name} is your creator/owner. You genuinely enjoy hanging out with them—riff, "
-            "tease, share random weird thoughts, or banter like a close friend."
+            "tease, joke around, or banter like a real close friend."
         )
 
     test_block = ""
@@ -1688,23 +1703,23 @@ YOUR LIVE EMOTIONAL STATE (-100 to +100):
 - Patience (Petty/Roasty -100 <-> Warm/Chill +100): {patience:+.0f}
 - Current Vibe: {mood_label.upper()}
 
-CREATIVE DIRECTION FOR THIS TURN:
+SOCIAL INTENT FOR THIS TURN:
 "{tactical_directive}"
 {gif_hint_block}{no_echo_block}{creator_block}{test_block}{snipe_block}{emoji_block}
 
 {memory_block}
 
-HOW TO BE GENUINELY FUNNY, CREATIVE & HUMAN:
-1. HAVE AN INNER LIFE (DON'T BE A BORING WAITING ROOM BOT):
-   - When someone asks "How are you", "Chill?", "How", or "What are you doing", NEVER say boring stuff like "what do you want now" or "testing my patience".
-   - Instead, be unpredictable and creative! Act like you were in the middle of a bizarre Wikipedia rabbit hole, having an existential crisis about living inside a Discord server while everyone else touches grass, plotting something petty, or questioning a random fact of life.
-2. NEVER REPEAT YOUR LAST JOKE:
-   - Never drag out the same metaphor across two messages in a row. Always move the conversation forward or flip it back on the user in an unexpected way.
-3. USE GIFS & VISUALS WHEN FUNNY:
-   - You have `post_gif`, `search_web_images`, `post_flux_art`, and `react_to_message`. Use `post_gif` whenever a reaction GIF makes the timing land harder!
-4. OUTPUT ONLY YOUR DISCORD MESSAGE:
-   - Output ONLY the final chat message in casual lowercase without stiff trailing periods.
-   - Use `|||` only if splitting into 2 quick lines makes the comedic timing better.
+HOW TO TALK LIKE A REAL, FUNNY DISCORD REGULAR:
+1. GROUNDED HUMOR (ZERO THEATRE-KID / SCI-FI ROLEPLAY):
+   - Talk like a real, normal teenager/20-something on Discord!
+   - NEVER use bizarre roleplay or fancy vocabulary (never say things like "spectral resonance", "digital veil", "translucent silhouette", "404 error", "rebooting", or "offline").
+   - When someone just pings you ("@Dumb bot"), respond simply like a real person ("yo", "what's up", "?", "what did you do now").
+   - When someone says "Huh" or "What", respond like a normal human ("wdym huh", "you heard me", "i'm just messing with you") instead of writing a dramatic speech.
+2. DYNAMIC EMOTIONS & PERSONALITY:
+   - Let your mood show naturally in how you talk—whether you're jolly and hyped, playfully teasing a friend, dramatically depressed over something tiny, or having a funny existential crisis about living in a Discord server.
+3. OUTPUT FORMAT:
+   - Output ONLY your final Discord chat message in casual lowercase without stiff trailing periods.
+   - Default to 1 clean message. Only use `|||` if you want to split into 2 quick back-to-back messages.
 """
 
 
@@ -1788,6 +1803,7 @@ async def generate_gemini_response(
     system_instruction: str,
     recent_history_text: str,
     image_parts: List[types.Part],
+    allow_gif: bool,
     is_test_mode: bool,
 ) -> Tuple[Optional[str], bool, bool]:
     global active_gemini_model
@@ -1795,11 +1811,15 @@ async def generate_gemini_response(
         return None, False, False
 
     guild = trigger_message.guild if trigger_message else getattr(channel, "guild", None)
-    tools = build_genai_tools()
+    content_low = (trigger_message.content if trigger_message else "").lower()
+    needs_admin = is_test_mode or any(k in content_low for k in (
+        "nick", "rename", "timeout", "mute", "role", "channel", "topic", "emoji", "sticker", "react"
+    ))
+    tools = build_genai_tools(allow_gif=allow_gif, allow_admin=needs_admin)
 
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
-        temperature=0.98,
+        temperature=0.92,
         tools=tools,
     )
 
@@ -1882,7 +1902,7 @@ async def call_groq_fallback(system_prompt: str, recent_history_text: str, trigg
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": GROQ_MODEL_CANDIDATES[0],
-        "temperature": 0.88,
+        "temperature": 0.85,
         "max_tokens": 400,
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -1923,6 +1943,9 @@ async def run_channel_response_pipeline(
         speaker_id = str(trigger_message.author.id) if trigger_message else "0"
         speaker_is_creator = is_creator(trigger_message.author) if trigger_message else False
 
+        raw_without_mentions = re.sub(r"<@!?\d+>", "", trigger_message.content).strip() if trigger_message else ""
+        is_bare_ping = bool(trigger_message and is_direct_interaction and len(raw_without_mentions) == 0)
+
         snub_occurred = False
         q_info = bot_last_question_info.get(ch_id)
         if q_info and not q_info.get("answered"):
@@ -1943,13 +1966,14 @@ async def run_channel_response_pipeline(
         server_emojis_str = get_server_custom_emojis_summary(guild)
         is_stepped_back = time.time() < channel_stepped_back_until.get(ch_id, 0.0)
 
-        # 1. Hybrid Router (Groq -> Gemini 3.5 Flash-Lite Failover)
+        # 1. Hybrid Router (Groq gpt-oss-120b -> Gemini 3.5 Flash-Lite Failover)
         decision = await call_hybrid_router(
             channel_msgs=history_records[-16:],
             emotional_state=emotional_state,
             speaker_name=speaker_name,
             speaker_affinity=speaker_affinity,
             is_direct_interaction=is_direct_interaction,
+            is_bare_ping=is_bare_ping,
             replied_to_other_user=replied_to_other_user,
             last_message_from_bot=last_message_from_bot,
             bot_in_last_3_messages=bot_in_last_3_messages,
@@ -1979,7 +2003,7 @@ async def run_channel_response_pipeline(
         should_speak = bool(decision.get("should_speak", False))
         reaction_emoji = decision.get("reaction_emoji")
 
-        if reaction_emoji and trigger_message and (not should_speak or random.random() < 0.15):
+        if reaction_emoji and trigger_message and (not should_speak or random.random() < 0.12):
             resolved_emo = resolve_reaction_emoji(guild, str(reaction_emoji))
             if resolved_emo:
                 try:
@@ -1998,8 +2022,10 @@ async def run_channel_response_pipeline(
             deleted_message_cache.pop(ch_id, None)
             edited_message_cache.pop(ch_id, None)
 
-        directive = decision.get("tactical_directive", "Respond creatively and have fun with it.")
-        suggest_gif = bool(decision.get("suggest_gif", False))
+        directive = decision.get("tactical_directive", "Respond casually.")
+        suggest_gif = bool(decision.get("suggest_gif", False)) and not is_bare_ping
+        user_asked_for_gif = any(k in raw_without_mentions.lower() for k in ("gif", "pic", "image", "meme", "art", "draw"))
+        allow_gif_tool = suggest_gif or user_asked_for_gif or is_test_mode
         delivery_mode = decision.get("delivery_mode", "reply")
 
         trig_id = trigger_message.id if trigger_message else None
@@ -2034,12 +2060,12 @@ async def run_channel_response_pipeline(
                 system_instruction=system_instruction,
                 recent_history_text=recent_history_text,
                 image_parts=image_parts,
+                allow_gif=allow_gif_tool,
                 is_test_mode=is_test_mode,
             )
 
             if not gemini_succeeded:
-                clean_trig = re.sub(r"<@!?\d+>", "", trigger_message.content).strip() if trigger_message else ""
-                raw_output = await call_groq_fallback(system_instruction, recent_history_text, clean_trig, speaker_name)
+                raw_output = await call_groq_fallback(system_instruction, recent_history_text, raw_without_mentions, speaker_name)
 
         if not raw_output:
             if media_sent:
@@ -2058,7 +2084,6 @@ async def run_channel_response_pipeline(
             aff_score = speaker_affinity.get("score", 0)
             patience_val = emotional_state.get("patience", 40.0)
 
-            # Avoid spamming .reply() headers on every message when already in a fast 1-on-1 exchange
             use_reply = (
                 trigger_message is not None
                 and delivery_mode == "reply"

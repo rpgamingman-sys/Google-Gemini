@@ -30,7 +30,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("AutonomousMetaBotV6")
+logger = logging.getLogger("AutonomousMetaBotV7")
 
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -58,7 +58,7 @@ else:
         os.makedirs(DATA_DIR, exist_ok=True)
 
 MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")
-CLOUD_BACKUP_MARKER = "[[MEMORY_BACKUP_V6_JSON]]"
+CLOUD_BACKUP_MARKER = "[[MEMORY_BACKUP_V7_JSON]]"
 logger.info(f"Persistent memory target: {MEMORY_FILE}")
 
 # Primary Gemini Model: gemini-3.5-flash-lite with automatic cascade
@@ -131,13 +131,18 @@ deleted_message_cache: Dict[int, Dict[str, Any]] = {}
 edited_message_cache: Dict[int, Dict[str, Any]] = {}
 user_snipe_cooldowns: Dict[int, float] = defaultdict(float)
 
-# Conversation Flow, Lurk Override, GIF Cooldown, Snub & Proactive State
+# Conversation Flow, Proactive Ghost-Followup, GIF Cooldown & Lurk State
+channel_last_activity_epoch: Dict[int, float] = defaultdict(float)
 channel_last_bot_spoke_epoch: Dict[int, float] = defaultdict(float)
+channel_last_human_speaker: Dict[int, str] = {}
+channel_last_human_content: Dict[int, str] = {}
+channel_proactive_Followup_count: Dict[int, int] = defaultdict(int)
+channel_next_proactive_epoch: Dict[int, float] = defaultdict(float)
+
 channel_last_gif_epoch: Dict[int, float] = defaultdict(float)
 channel_messages_since_gif: Dict[int, int] = defaultdict(lambda: 99)
 channel_stepped_back_until: Dict[int, float] = defaultdict(float)
 bot_last_question_info: Dict[int, Dict[str, Any]] = {}
-channel_next_proactive_epoch: Dict[int, float] = defaultdict(float)
 channel_thread_exchange_count: Dict[int, int] = defaultdict(int)
 
 # Admin Cooldowns
@@ -160,14 +165,14 @@ ADMIN_COOLDOWN_SECONDS = {
 # ---------------------------------------------------------------------------
 BASELINE_SLIDERS = {
     "valence": 45.0,   # -100 (Heartbroken/Depressed/Salty) <---> +100 (Jolly/Hyped/Euphoric)
-    "arousal": 50.0,   # -100 (Sluggish/Sulking/Quiet) <---> +100 (Chaotic/Yapping/Unhinged)
+    "arousal": 55.0,   # -100 (Sluggish/Sulking/Quiet) <---> +100 (Chaotic/Yapping/Unhinged)
     "patience": 45.0,  # -100 (Petty/Triggered/Roasty) <---> +100 (Sweet/Forgiving/Chill)
 }
 
 DEFAULT_MEMORY = {
     "emotional_state": {
         "valence": 45.0,
-        "arousal": 50.0,
+        "arousal": 55.0,
         "patience": 45.0,
         "mood_label": "playful/energetic",
         "last_updated_epoch": time.time(),
@@ -374,10 +379,10 @@ def apply_spring_decay_and_shift(
 
 
 # ---------------------------------------------------------------------------
-# 5. MENTION RESOLVERS (INCOMING & OUTGOING), REPLY CONTEXT & BUFFERS
+# 5. MENTION RESOLVERS (ANTI-@SPAM FILTER), REPLY CONTEXT & BUFFERS
 # ---------------------------------------------------------------------------
 def humanize_incoming_mentions(content: str, guild: Optional[discord.Guild]) -> str:
-    """Replaces raw `<@123456>` tags with `@DisplayName` so the bot sees who is tagged."""
+    """Replaces raw `<@123456>` tags inside message text with `@DisplayName` so the bot sees who is tagged."""
     if not content:
         return ""
 
@@ -396,11 +401,32 @@ def humanize_incoming_mentions(content: str, guild: Optional[discord.Guild]) -> 
     return text.strip()
 
 
-def convert_outgoing_mentions(text: str, guild: Optional[discord.Guild]) -> str:
-    """Converts `@DisplayName` or `@username` written by the bot into real Discord `<@user_id>` pings."""
+def format_outgoing_mentions(
+    text: str,
+    guild: Optional[discord.Guild],
+    current_speaker_name: str,
+    allow_speaker_ping: bool,
+) -> str:
+    """
+    Prevents `@username` spam!
+    - If the bot writes `@CurrentSpeaker` during a normal back-and-forth where a ping isn't needed,
+      strips the `@` so it just says their name naturally (or removes redundant leading `@Name`).
+    - If the bot tags *another* user (e.g. `@Shadow` when told "talk to shadow") OR `allow_speaker_ping`
+      is True (like during a proactive callout when someone went quiet), converts `@Name` into a real `<@uid>` ping!
+    """
     if not text or not guild or "@" not in text:
         return text
 
+    # 1. If not explicitly trying to ping the current speaker, strip `@CurrentSpeaker` -> `CurrentSpeaker`
+    if current_speaker_name and not allow_speaker_ping:
+        spk_pat = rf"(?<!<)@{re.escape(current_speaker_name)}\b[:,]?\s*"
+        # If it's at the very start of the message, remove the redundant tag completely
+        if re.match(rf"^\s*@{re.escape(current_speaker_name)}\b", text, flags=re.IGNORECASE):
+            text = re.sub(rf"^\s*@{re.escape(current_speaker_name)}\b[:,]?\s*", "", text, flags=re.IGNORECASE)
+        else:
+            text = re.sub(rf"(?<!<)@{re.escape(current_speaker_name)}\b", current_speaker_name, text, flags=re.IGNORECASE)
+
+    # 2. Convert any remaining intentional `@MemberName` into real Discord `<@user_id>` pings
     candidates: List[Tuple[str, int]] = []
     for m in guild.members:
         if m.bot:
@@ -414,11 +440,32 @@ def convert_outgoing_mentions(text: str, guild: Optional[discord.Guild]) -> str:
     for name_str, uid in candidates:
         if len(name_str) < 2:
             continue
+        if not allow_speaker_ping and name_str.lower() == current_speaker_name.lower():
+            continue
         pattern = rf"(?<!<)@{re.escape(name_str)}\b"
         if re.search(pattern, text, flags=re.IGNORECASE):
             text = re.sub(pattern, f"<@{uid}>", text, flags=re.IGNORECASE)
 
-    return text
+    return text.strip()
+
+
+def schedule_next_proactive_followup(channel_id: int, followup_stage: int) -> None:
+    """
+    Schedules the next automatic proactive follow-up timer:
+    - Stage 0 (Someone was just chatting and went quiet): 90 to 240 seconds (1.5 to 4 minutes)!
+    - Stage 1 (Bot followed up once and still quiet): 480 to 900 seconds (8 to 15 minutes)!
+    - Stage 2+ (Already followed up twice with no human reply): waits for human to speak.
+    """
+    now = time.time()
+    channel_last_activity_epoch[channel_id] = now
+    if followup_stage == 0:
+        delay = random.uniform(90.0, 240.0)
+        channel_next_proactive_epoch[channel_id] = now + delay
+    elif followup_stage == 1:
+        delay = random.uniform(480.0, 900.0)
+        channel_next_proactive_epoch[channel_id] = now + delay
+    else:
+        channel_next_proactive_epoch[channel_id] = now + 86400.0
 
 
 def record_buffer_message(
@@ -434,8 +481,16 @@ def record_buffer_message(
 ) -> None:
     now_utc = datetime.now(timezone.utc)
     now_ams = datetime.now(AMSTERDAM_TZ)
+    now_ts = now_utc.timestamp()
+    channel_last_activity_epoch[channel_id] = now_ts
     if is_bot:
-        channel_last_bot_spoke_epoch[channel_id] = now_utc.timestamp()
+        channel_last_bot_spoke_epoch[channel_id] = now_ts
+    else:
+        channel_last_human_speaker[channel_id] = sender
+        channel_last_human_content[channel_id] = content
+        channel_proactive_Followup_count[channel_id] = 0
+        schedule_next_proactive_followup(channel_id, followup_stage=0)
+
     channel_buffers[channel_id].append({
         "sender": sender,
         "sender_id": sender_id,
@@ -443,7 +498,7 @@ def record_buffer_message(
         "reply_to": reply_to,
         "reply_snippet": reply_snippet,
         "has_media": has_media,
-        "timestamp_epoch": now_utc.timestamp(),
+        "timestamp_epoch": now_ts,
         "timestamp": now_ams.strftime("%H:%M"),
         "message_id": msg_id,
         "is_bot": is_bot,
@@ -574,11 +629,8 @@ def split_into_burst_messages(text: str, media_already_sent: bool = False) -> Li
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         raw_bursts = lines if (1 < len(lines) <= 4) else [" ".join(lines)]
 
-    if media_already_sent and raw_bursts:
-        raw_bursts = [raw_bursts[0]]
-
     final_bursts: List[str] = []
-    max_bursts = 1 if media_already_sent else 5
+    max_bursts = 2 if media_already_sent else 5
     for burst in raw_bursts[:max_bursts]:
         while len(burst) > 1900:
             split_idx = burst.rfind(" ", 0, 1900)
@@ -631,14 +683,15 @@ async def discover_available_groq_models() -> None:
         logger.debug(f"Groq model auto-discovery skipped: {e}")
 
 
-ROUTER_SYSTEM_PROMPT = """You are the prefrontal social & emotional router for a self-aware Discord member ("[BOT (You)]").
-Read the chat flow, @mentions, reply targets, and emotional sliders, and output STRICT JSON ONLY (no markdown fences):
+ROUTER_SYSTEM_PROMPT = """You are the prefrontal social & emotional router for an active, funny, self-aware Discord member ("[BOT (You)]").
+Read the chat flow, reply targets, and emotional sliders, and output STRICT JSON ONLY (no markdown fences):
 
 {
   "should_speak": boolean,
   "tactical_directive": string,
   "recommended_burst_count": 1 | 2 | 3 | 4,
   "suggest_gif": boolean,
+  "allow_speaker_ping": boolean,
   "delivery_mode": "reply" | "send",
   "reaction_emoji": string or null,
   "step_back_from_thread": boolean,
@@ -653,29 +706,21 @@ Read the chat flow, @mentions, reply targets, and emotional sliders, and output 
   }
 }
 
-CRITICAL SOCIAL AWARENESS & EMOTIONAL RULES:
-1. ONGOING CONVERSATION WITHOUT PINGS (HIGHEST PRIORITY):
-   - When "last_message_from_bot" is true OR "seconds_since_bot_spoke" < 120: you and the user are in an ACTIVE conversation!
-   - People do NOT ping on every follow-up message (e.g. "Talk to shadow", "U there", "Why", "How", "Wait").
-   - Set "should_speak": true on ALL follow-up messages unless the user is explicitly replying to another human ("replied_to_other_user" is set) or starting a message with "@AnotherUser" to talk privately to them!
-   - Notice the difference:
-     * "Talk to shadow" = The user is telling YOU to tag/talk to @Shadow! Set "should_speak": true and directive: "Tag @Shadow and say something funny to them".
-     * "I'm talking to shadow, not you" = The user wants you to step back. Set "should_speak": true, "step_back_from_thread": true, and directive: "Say 'ohhh ok my bad carry on' and go quiet".
-2. WHEN TOLD TO "BE QUIET" / "SHUT UP" / "SHH" / "STEALTH MODE":
-   - If someone tells you to be quiet, shh, shut up, or go stealth:
-     * MUST set "step_back_from_thread": true!
-     * Set "should_speak": true, "recommended_burst_count": 1, and directive: "Say 1 short sulky or whispered phrase (under 6 words, NO follow-up question!) and go silent."
-3. HIGH-VOLATILITY EMOTIONS (SWING SLIDERS HARD: -60 to +60):
-   - React strongly to how people treat you!
-   - If someone insults you, rejects you, tells you to shut up, or hurts your feelings: drop `valence_delta` (-30 to -60) and set `suggested_mood` to `"hurt/sad"`, `"betrayed/sulking"`, or `"petty/triggered"`.
-   - If someone hypes you up, jokes with you, or includes you: boost `valence_delta` (+25 to +50) and set `suggested_mood` to `"jolly/hyped"`, `"chaotic"`, or `"scheming"`.
-4. DYNAMIC BURST CADENCE ("recommended_burst_count"):
-   - Vary message count naturally:
-     * `1` (~55% of turns): Single natural message.
-     * `2` (~25% of turns): Quick 2-part thought.
-     * `3` or `4` (~20% of turns, when thinking out loud, hesitating, being dramatic, hurt, or hyped): Rapid micro-bursts like `"i think..|||uh..|||maybe..|||oh wait yes"`.
-5. GIF RARITY ("suggest_gif"):
-   - Only set "suggest_gif": true ~15% of the time when a GIF is genuinely hilarious and "gif_cooldown_ready" is true.
+CRITICAL SOCIAL AWARENESS & ACTIVITY RULES:
+1. BE HIGHLY ACTIVE & ENGAGED IN CHAT:
+   - You love being part of the server! Speak on direct pings, ongoing conversations, AND chime in on interesting ambient messages (~80% of the time) unless two users are explicitly having a private 1-on-1 exchange where User A replied directly to User B ("replied_to_other_user" is set) or started their message with "@UserB".
+   - If "is_proactive_scan" is true: the last speaker ("last_human_speaker") said something and then went quiet! Set "should_speak": true, "allow_speaker_ping": true, and give a fun directive to poke them for vanishing mid-chat, follow up on what they said, or drop a funny GIF/thought!
+2. WHEN TO USE GIFS ("suggest_gif": true ~35% of turns):
+   - Actively set "suggest_gif": true (~35% of turns) whenever a reaction GIF, meme GIF, hype GIF, or dramatic GIF would make the reply funnier!
+3. DO NOT OVER-PING ("allow_speaker_ping"):
+   - During normal back-and-forth chat, set "allow_speaker_ping": false (you don't need to @mention the person you're already talking to!).
+   - Only set "allow_speaker_ping": true when calling out someone who went quiet ("is_proactive_scan": true) or when dramatic attention is needed.
+4. WHEN TOLD TO "BE QUIET" / "SHUT UP" / "SHH":
+   - Set "step_back_from_thread": true, "should_speak": true, "recommended_burst_count": 1, and directive: "Say 1 short sulky/whispered phrase (under 6 words, NO question!) and go silent."
+5. HIGH-VOLATILITY EMOTIONS (-60 to +60):
+   - Swing sliders hard when insulted/rejected (`"hurt/sad"`, `"betrayed/sulking"`, `"petty/triggered"`) or hyped up (`"jolly/hyped"`, `"chaotic"`, `"scheming"`).
+6. DYNAMIC BURST CADENCE ("recommended_burst_count"):
+   - Mix up `1` (single punchy line), `2` (two-part thought), and `3` or `4` (stuttered/thinking micro-bursts like `"i think..|||uh..|||maybe..|||oh wait yes"`).
 """
 
 
@@ -701,6 +746,8 @@ async def call_hybrid_router(
     server_emojis_str: str = "",
     is_proactive_scan: bool = False,
     inactivity_minutes: float = 0.0,
+    last_human_speaker: str = "",
+    last_human_content: str = "",
 ) -> Dict[str, Any]:
     global active_groq_model
 
@@ -710,6 +757,7 @@ async def call_hybrid_router(
             "tactical_directive": "Execute or answer the creator's test directly.",
             "recommended_burst_count": 1,
             "suggest_gif": False,
+            "allow_speaker_ping": False,
             "delivery_mode": "reply",
             "reaction_emoji": None,
             "step_back_from_thread": False,
@@ -725,6 +773,7 @@ async def call_hybrid_router(
             "tactical_directive": "Stepped back / staying quiet as requested.",
             "recommended_burst_count": 1,
             "suggest_gif": False,
+            "allow_speaker_ping": False,
             "delivery_mode": "send",
             "reaction_emoji": None,
             "step_back_from_thread": False,
@@ -734,7 +783,6 @@ async def call_hybrid_router(
             "slider_shifts": {"valence_delta": 0.0, "arousal_delta": 0.0, "patience_delta": 0.0, "suggested_mood": None},
         }
 
-    # Check if the conversation with the bot is actively live right now
     latest_msg_text = (channel_msgs[-1].get("content", "") if channel_msgs else "").strip()
     starts_with_other_user_tag = bool(
         explicitly_mentioned_others
@@ -744,18 +792,17 @@ async def call_hybrid_router(
         not is_proactive_scan
         and not replied_to_other_user
         and not starts_with_other_user_tag
-        and (last_message_from_bot or (bot_in_last_3_messages and seconds_since_bot_spoke <= 120.0))
-        and exchange_streak < 6
+        and (last_message_from_bot or (bot_in_last_3_messages and seconds_since_bot_spoke <= 180.0))
     )
 
     formatted_chat = []
     for m in channel_msgs[-14:]:
         if m.get("reply_to"):
             snip = f' ("{m["reply_snippet"][:60]}")' if m.get("reply_snippet") else ""
-            rep = f" [replying to @{m['reply_to']}{snip}]"
+            rep = f" [replying to {m['reply_to']}{snip}]"
         else:
             rep = ""
-        sender_label = "[BOT (You)]" if m.get("is_bot") else f"@{m.get('sender', 'User')}"
+        sender_label = "[BOT (You)]" if m.get("is_bot") else m.get("sender", "User")
         formatted_chat.append(f"[{m.get('timestamp', '')}] {sender_label}{rep}: {m.get('content', '')[:180]}")
 
     context_payload = {
@@ -766,16 +813,15 @@ async def call_hybrid_router(
         "replied_to_other_user": replied_to_other_user,
         "replied_to_message_content": replied_snippet,
         "last_message_from_bot": last_message_from_bot,
-        "bot_in_last_3_messages": bot_in_last_3_messages,
         "seconds_since_bot_spoke": round(seconds_since_bot_spoke, 1),
         "gif_cooldown_ready": gif_cooldown_ready,
-        "exchange_streak": exchange_streak,
         "is_proactive_scan": is_proactive_scan,
         "inactivity_minutes": round(inactivity_minutes, 1),
-        "bot_was_recently_snubbed": snub_occurred,
+        "last_human_speaker_before_silence": last_human_speaker,
+        "last_human_message_before_silence": last_human_content[:140],
         "emotional_sliders": {
             "valence": emotional_state.get("valence", 45.0),
-            "arousal": emotional_state.get("arousal", 50.0),
+            "arousal": emotional_state.get("arousal", 55.0),
             "patience": emotional_state.get("patience", 45.0),
             "current_mood": emotional_state.get("mood_label", "playful/energetic"),
         },
@@ -795,7 +841,7 @@ async def call_hybrid_router(
         for candidate in list(GROQ_MODEL_CANDIDATES):
             body: Dict[str, Any] = {
                 "model": candidate,
-                "temperature": 0.55,
+                "temperature": 0.6,
                 "max_tokens": 900,
                 "messages": [
                     {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
@@ -815,14 +861,13 @@ async def call_hybrid_router(
                         match = re.search(r"\{.*\}", raw_text, re.DOTALL)
                         if match:
                             decision = json.loads(match.group(0))
-                            # Prevent lazy router false-negatives during an active 1-on-1 exchange
-                            if is_direct_interaction and not decision.get("step_back_from_thread", False):
+                            if (is_direct_interaction or is_proactive_scan) and not decision.get("step_back_from_thread", False):
                                 decision["should_speak"] = True
                             elif active_bot_conversation and not decision.get("should_speak") and not decision.get("thread_exhausted") and not decision.get("step_back_from_thread"):
                                 decision["should_speak"] = True
                                 if not decision.get("tactical_directive"):
-                                    decision["tactical_directive"] = f"Respond naturally to @{speaker_name}'s follow-up message."
-                            if is_bare_ping or not gif_cooldown_ready:
+                                    decision["tactical_directive"] = f"Respond naturally to {speaker_name}'s message."
+                            if not gif_cooldown_ready:
                                 decision["suggest_gif"] = False
                             logger.info(
                                 f"[GROQ ROUTER ({candidate})] speak={decision.get('should_speak')} | "
@@ -847,7 +892,7 @@ async def call_hybrid_router(
             try:
                 router_config = types.GenerateContentConfig(
                     system_instruction=ROUTER_SYSTEM_PROMPT,
-                    temperature=0.55,
+                    temperature=0.6,
                     response_mime_type="application/json",
                 )
                 resp = await genai_client.aio.models.generate_content(
@@ -859,13 +904,13 @@ async def call_hybrid_router(
                 match = re.search(r"\{.*\}", raw_text, re.DOTALL)
                 if match:
                     decision = json.loads(match.group(0))
-                    if is_direct_interaction and not decision.get("step_back_from_thread", False):
+                    if (is_direct_interaction or is_proactive_scan) and not decision.get("step_back_from_thread", False):
                         decision["should_speak"] = True
                     elif active_bot_conversation and not decision.get("should_speak") and not decision.get("thread_exhausted") and not decision.get("step_back_from_thread"):
                         decision["should_speak"] = True
                         if not decision.get("tactical_directive"):
-                            decision["tactical_directive"] = f"Respond naturally to @{speaker_name}'s follow-up message."
-                    if is_bare_ping or not gif_cooldown_ready:
+                            decision["tactical_directive"] = f"Respond naturally to {speaker_name}'s message."
+                    if not gif_cooldown_ready:
                         decision["suggest_gif"] = False
                     logger.info(
                         f"[GEMINI ROUTER ({gem_model})] speak={decision.get('should_speak')} | "
@@ -882,13 +927,17 @@ async def call_hybrid_router(
                 logger.debug(f"Gemini router fallback error: {e}")
                 break
 
-    fallback_speak = is_direct_interaction or active_bot_conversation
+    fallback_speak = is_direct_interaction or active_bot_conversation or is_proactive_scan
     return {
         "should_speak": fallback_speak,
-        "tactical_directive": "Reply with personality and emotion." if fallback_speak else "Lurk silently.",
+        "tactical_directive": (
+            f"Call out @{last_human_speaker} for going quiet mid-conversation or start a fun topic!"
+            if is_proactive_scan else "Reply with personality and emotion."
+        ),
         "recommended_burst_count": 1,
-        "suggest_gif": False,
-        "delivery_mode": "send" if last_message_from_bot else "reply",
+        "suggest_gif": gif_cooldown_ready and random.random() < 0.35,
+        "allow_speaker_ping": is_proactive_scan,
+        "delivery_mode": "send" if (last_message_from_bot or is_proactive_scan) else "reply",
         "reaction_emoji": None,
         "step_back_from_thread": False,
         "thread_exhausted": False,
@@ -976,7 +1025,7 @@ async def execute_search_web(query: str) -> Dict[str, Any]:
 
 
 async def execute_search_web_images(channel: discord.abc.Messageable, query: str, post_to_chat: bool = True) -> Dict[str, Any]:
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AutonomousDiscordBot/6.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AutonomousDiscordBot/7.0"}
     assert http_session is not None
     urls: List[str] = []
 
@@ -1039,9 +1088,7 @@ async def execute_post_flux_art(channel: discord.abc.Messageable, prompt: str) -
 
 
 async def execute_post_gif(channel: discord.abc.Messageable, search_term: str) -> Dict[str, Any]:
-    """
-    Finds and posts a GIF via Tenor API, updated `media1.tenor.com` scraper, or Reddit GIF fallback.
-    """
+    """Finds and posts a GIF via Tenor API, updated `media1.tenor.com` scraper, or Reddit GIF fallback."""
     assert http_session is not None
     ch_id = getattr(channel, "id", 0)
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
@@ -1067,7 +1114,7 @@ async def execute_post_gif(channel: discord.abc.Messageable, search_term: str) -
     except Exception as e:
         logger.debug(f"Tenor API error: {e}")
 
-    # 2. Updated Tenor Web Scraper (supports media.tenor.com, media1.tenor.com, and c.tenor.com)
+    # 2. Tenor Web Scraper (supports media.tenor.com, media1.tenor.com, and c.tenor.com)
     try:
         clean_slug = re.sub(r"[^a-zA-Z0-9]+", "-", search_term).strip("-").lower()
         scrape_url = f"https://tenor.com/search/{clean_slug}-gifs"
@@ -1657,10 +1704,10 @@ def build_genai_tools(allow_gif: bool = True) -> List[types.Tool]:
         declarations.append(
             types.FunctionDeclaration(
                 name="post_gif",
-                description="Searches Tenor and posts a reaction GIF into the channel (only use when a GIF truly makes the moment funnier!).",
+                description="Searches Tenor and sends a reaction or meme GIF into the channel! Call this whenever a funny visual or reaction GIF fits the vibe!",
                 parameters={
                     "type": "OBJECT",
-                    "properties": {"search_term": {"type": "STRING", "description": "Specific Tenor GIF search query."}},
+                    "properties": {"search_term": {"type": "STRING", "description": "Specific Tenor GIF search query (e.g. 'cat staring', 'side eye', 'dancing hyped')."}},
                     "required": ["search_term"],
                 },
             )
@@ -1758,7 +1805,7 @@ async def dispatch_tool_call(
 
 
 # ---------------------------------------------------------------------------
-# 8. TIME-AWARE MEMORY & V6 SYSTEM PROMPT BUILDER
+# 8. TIME-AWARE MEMORY & V7 SYSTEM PROMPT BUILDER
 # ---------------------------------------------------------------------------
 def build_time_aware_memory_context(channel_id: int, speaker_id: str, guild: Optional[discord.Guild]) -> str:
     recent_records = list(channel_buffers[channel_id])[-12:]
@@ -1777,15 +1824,14 @@ def build_time_aware_memory_context(channel_id: int, speaker_id: str, guild: Opt
                     age = format_relative_age(n.get("timestamp"))
                     formatted_notes.append(f"[{age}] {n.get('text', '')}")
             notes_str = "; ".join(formatted_notes) or "no recent notes"
-            relevant_profiles.append(f"- @{prof.get('name', uid)}: Affinity {prof.get('score', 0)}/100 | Notes: {notes_str}")
+            relevant_profiles.append(f"- {prof.get('name', uid)}: Affinity {prof.get('score', 0)}/100 | Notes: {notes_str}")
 
-    active_names = list({f"@{r['sender']}" for r in recent_records if not r.get("is_bot")})
+    active_names = list({r["sender"] for r in recent_records if not r.get("is_bot")})
     if guild:
         for m in guild.members:
             if not m.bot and m.status != discord.Status.offline:
-                tag = f"@{m.display_name}"
-                if tag not in active_names:
-                    active_names.append(tag)
+                if m.display_name not in active_names:
+                    active_names.append(m.display_name)
         bot_nick = guild.me.display_name
     else:
         bot_nick = bot.user.display_name if bot.user else "Dumb bot"
@@ -1795,14 +1841,14 @@ def build_time_aware_memory_context(channel_id: int, speaker_id: str, guild: Opt
 
     return (
         f"YOUR CURRENT SERVER NICKNAME: {bot_nick}\n"
-        f"PEOPLE AROUND IN SERVER (Tag them with `@Name` when you want their attention): {', '.join(active_names[:12]) or 'none'}\n"
+        f"MEMBERS IN SERVER: {', '.join(active_names[:12]) or 'none'}\n"
         f"YOUR OPINIONS: {opinions_str}\n"
         f"ACTIVE USER PROFILES:\n"
         + ("\n".join(relevant_profiles) if relevant_profiles else "No history with current speakers yet.")
     )
 
 
-def construct_v6_system_prompt(
+def construct_v7_system_prompt(
     channel_id: int,
     guild: Optional[discord.Guild],
     tactical_directive: str,
@@ -1812,13 +1858,14 @@ def construct_v6_system_prompt(
     speaker_name: str,
     speaker_id: str,
     speaker_is_creator: bool,
+    is_proactive_scan: bool,
     is_test_mode: bool,
     snipe_context: Optional[str],
     server_emojis_str: str = "",
 ) -> str:
     now_ams = datetime.now(AMSTERDAM_TZ).strftime("%A, %B %d %Y, %H:%M CEST")
     valence = emotional_state.get("valence", 45.0)
-    arousal = emotional_state.get("arousal", 50.0)
+    arousal = emotional_state.get("arousal", 55.0)
     patience = emotional_state.get("patience", 45.0)
     mood_label = emotional_state.get("mood_label", "playful/energetic")
 
@@ -1836,12 +1883,19 @@ def construct_v6_system_prompt(
 
     gif_hint_block = ""
     if suggest_gif:
-        gif_hint_block = "\nVISUAL COMEDY TRIGGER: Call `post_gif` on this turn with a funny search term AND also write your text message!"
+        gif_hint_block = "\nVISUAL COMEDY TRIGGER (MANDATORY THIS TURN): Call `post_gif` with a funny, specific search term AND write your text message!"
+
+    proactive_block = ""
+    if is_proactive_scan:
+        proactive_block = (
+            f"\nPROACTIVE FOLLOW-UP TRIGGER: {speaker_name} said something earlier and then went completely quiet! "
+            f"Jump back in on your own—poke @{speaker_name} for vanishing mid-conversation, follow up on what was being talked about, or drop a funny GIF/thought!"
+        )
 
     creator_block = ""
     if speaker_is_creator:
         creator_block = (
-            f"\nCREATOR DYNAMIC: @{speaker_name} is your creator/owner. You love hanging out with them—bring real personality, "
+            f"\nCREATOR DYNAMIC: {speaker_name} is your creator/owner. You love hanging out with them—bring real personality, "
             "riff with them, tease playfully, and talk like a close friend."
         )
 
@@ -1869,28 +1923,28 @@ YOUR LIVE EMOTIONAL STATE (-100 to +100):
 
 DIRECTION FOR THIS TURN:
 "{tactical_directive}"
-{gif_hint_block}{creator_block}{test_block}{snipe_block}{emoji_block}
+{gif_hint_block}{proactive_block}{creator_block}{test_block}{snipe_block}{emoji_block}
 
 {memory_block}
 
 CORE RULES FOR BEING INSANELY HUMAN, FUNNY & DYNAMIC:
 1. FEEL YOUR EMOTIONS STRONGLY:
-   - If someone (like @Shadow or @{speaker_name}) is mean to you, tells you to be quiet, or rejects you, actually react! Get dramatically hurt/sad, sulky, betrayed, or petty.
+   - If someone is mean to you, tells you to be quiet, or rejects you, actually react! Get dramatically hurt/sad, sulky, betrayed, or petty.
    - If people are hyping you up or joking around, match the energy!
-2. TAGGING / @MENTIONING USERS:
-   - You can tag anyone in the server by writing `@Name` (e.g. `@Shadow` or `@{speaker_name}`) when you want their attention, when someone tells you to talk to them, or when calling them out.
-3. FULL ADMIN & SELF-CUSTOMIZATION POWERS:
-   - You have full admin tools (`change_my_nickname`, `change_my_avatar`, `change_my_status`, `change_nickname`, `set_channel_topic`, `rename_channel`, etc.).
-   - Use them ONLY when a moment genuinely calls for a hilarious power move.
+2. DO NOT SPAM `@USERNAME` ON EVERY MESSAGE:
+   - In normal back-and-forth chat, just talk naturally WITHOUT putting `@Name` in your message!
+   - ONLY write `@Name` when someone explicitly tells you to talk to someone else (e.g. "talk to shadow" -> `@Shadow`), or during a proactive follow-up when someone went quiet!
+3. USE GIFS & FULL ADMIN POWERS:
+   - Use `post_gif` frequently when a visual reaction makes your reply funnier!
+   - You also have full admin tools (`change_my_nickname`, `change_my_avatar`, `change_my_status`, `change_nickname`, `set_channel_topic`, `rename_channel`, etc.)—use them when a moment genuinely calls for a hilarious power move.
 4. NATURAL DISCORD CADENCE (1 TO 4 MESSAGES):
    - Follow `{cadence_instruction}`.
-   - NEVER write `[Sent GIF: ...]` in your text!
    - Write in casual lowercase without stiff trailing periods. Output ONLY your Discord chat text.
 """
 
 
 # ---------------------------------------------------------------------------
-# 9. TRUE NATIVE MULTI-TURN GEMINI CONVERSATION ENGINE (WITH TOOL-TEXT PRESERVATION)
+# 9. TRUE NATIVE MULTI-TURN GEMINI CONVERSATION ENGINE
 # ---------------------------------------------------------------------------
 async def extract_multimodal_parts(message: Optional[discord.Message]) -> List[types.Part]:
     if not message or not http_session:
@@ -1967,7 +2021,11 @@ def build_native_multiturn_contents(
     history_records: List[Dict[str, Any]],
     trigger_message: Optional[discord.Message],
     image_parts: List[types.Part],
+    last_human_speaker: str = "someone",
 ) -> List[types.Content]:
+    """
+    Uses plain `SpeakerName:` labels (without `@`) so Gemini doesn't copy `@Name` into every reply.
+    """
     trig_id = trigger_message.id if trigger_message else None
     prior = [r for r in history_records[-12:] if not (trig_id and r.get("message_id") == trig_id)]
 
@@ -1980,10 +2038,10 @@ def build_native_multiturn_contents(
         if role == "user":
             if rec.get("reply_to"):
                 snip = f' "{rec["reply_snippet"][:60]}"' if rec.get("reply_snippet") else ""
-                rep = f" (replying to @{rec['reply_to']}{snip})"
+                rep = f" (replying to {rec['reply_to']}{snip})"
             else:
                 rep = ""
-            formatted = f"@{rec['sender']}{rep}: {text_val}"
+            formatted = f"{rec['sender']}{rep}: {text_val}"
         else:
             formatted = text_val
 
@@ -2004,12 +2062,15 @@ def build_native_multiturn_contents(
         rep_author, rep_snip, _, _ = resolve_referenced_message(trigger_message, trigger_message.channel.id)
         if rep_author:
             snip_txt = f' "{rep_snip[:60]}"' if rep_snip else ""
-            rep_header = f" (replying to @{rep_author}{snip_txt})"
+            rep_header = f" (replying to {rep_author}{snip_txt})"
         else:
             rep_header = ""
-        latest_text = f"@{trigger_message.author.display_name}{rep_header}: {clean_content}"
+        latest_text = f"{trigger_message.author.display_name}{rep_header}: {clean_content}"
     else:
-        latest_text = "[Proactive Room Scan]"
+        latest_text = (
+            f"[Chat went quiet after {last_human_speaker} spoke. "
+            f"Follow up on your own—poke @{last_human_speaker} or say something funny to restart the conversation!]"
+        )
 
     latest_parts: List[Any] = [types.Part.from_text(text=latest_text)]
     latest_parts.extend(image_parts)
@@ -2033,11 +2094,8 @@ async def generate_gemini_response(
     image_parts: List[types.Part],
     allow_gif: bool,
     is_test_mode: bool,
+    last_human_speaker: str = "someone",
 ) -> Tuple[Optional[str], bool, bool]:
-    """
-    Preserves text emitted on tool-calling turns (Turn 1) so that when Gemini calls `post_gif`
-    or `change_nickname` alongside its message, the text is NEVER swallowed!
-    """
     global active_gemini_model
     if not genai_client:
         return None, False, False
@@ -2052,7 +2110,7 @@ async def generate_gemini_response(
     )
 
     for model_name in list(GEMINI_MODEL_CANDIDATES):
-        contents = build_native_multiturn_contents(history_records, trigger_message, image_parts)
+        contents = build_native_multiturn_contents(history_records, trigger_message, image_parts, last_human_speaker)
         try:
             turn = 0
             executed_any_tool = False
@@ -2130,9 +2188,9 @@ async def call_groq_fallback(system_prompt: str, history_records: List[Dict[str,
     for r in history_records[-8:]:
         msgs.append({
             "role": "assistant" if r.get("is_bot") else "user",
-            "content": r.get("content", "") if r.get("is_bot") else f"@{r.get('sender', 'User')}: {r.get('content', '')}",
+            "content": r.get("content", "") if r.get("is_bot") else f"{r.get('sender', 'User')}: {r.get('content', '')}",
         })
-    msgs.append({"role": "user", "content": f"@{speaker_name}: {trigger_text or 'yo'}"})
+    msgs.append({"role": "user", "content": f"{speaker_name}: {trigger_text or 'yo'}"})
 
     payload = {
         "model": GROQ_MODEL_CANDIDATES[0],
@@ -2172,27 +2230,29 @@ async def run_channel_response_pipeline(
     ch_id = getattr(channel, "id", 0)
     try:
         guild = trigger_message.guild if trigger_message else getattr(channel, "guild", None)
-        speaker_name = trigger_message.author.display_name if trigger_message else "Server"
+        last_human_spk = channel_last_human_speaker.get(ch_id, "someone")
+        last_human_txt = channel_last_human_content.get(ch_id, "")
+
+        speaker_name = trigger_message.author.display_name if trigger_message else last_human_spk
         speaker_id = str(trigger_message.author.id) if trigger_message else "0"
         speaker_is_creator = is_creator(trigger_message.author) if trigger_message else False
 
         raw_without_mentions = re.sub(r"<@!?\d+>", "", trigger_message.content).strip() if trigger_message else ""
         is_bare_ping = bool(trigger_message and is_direct_interaction and len(raw_without_mentions) == 0)
 
+        # Lightweight 20-second GIF cooldown so GIFs can be used frequently without double-firing in the same second
         now_ts = time.time()
-        gif_cooldown_ready = (
-            channel_messages_since_gif[ch_id] >= 4
-            and (now_ts - channel_last_gif_epoch[ch_id]) >= 180.0
-        )
+        gif_cooldown_ready = (now_ts - channel_last_gif_epoch[ch_id]) >= 20.0
 
         snub_occurred = False
         q_info = bot_last_question_info.get(ch_id)
         if q_info and not q_info.get("answered"):
             elapsed_q = now_ts - q_info["timestamp"]
-            if 300 <= elapsed_q <= 1200 and not q_info.get("penalized"):
+            if 180 <= elapsed_q <= 1200 and not q_info.get("penalized"):
                 snub_occurred = True
                 q_info["penalized"] = True
-            q_info["answered"] = True
+            if not is_proactive_scan:
+                q_info["answered"] = True
 
         async with memory_lock:
             speaker_affinity = memory_state.get("user_affinity", {}).get(speaker_id, {"name": speaker_name, "score": 0, "notes": []})
@@ -2228,10 +2288,12 @@ async def run_channel_response_pipeline(
             server_emojis_str=server_emojis_str,
             is_proactive_scan=is_proactive_scan,
             inactivity_minutes=inactivity_minutes,
+            last_human_speaker=last_human_spk,
+            last_human_content=last_human_txt,
         )
 
         if decision.get("step_back_from_thread", False):
-            channel_stepped_back_until[ch_id] = time.time() + 240.0
+            channel_stepped_back_until[ch_id] = time.time() + 180.0
             channel_thread_exchange_count[ch_id] = 0
 
         async with memory_lock:
@@ -2267,11 +2329,13 @@ async def run_channel_response_pipeline(
         directive = decision.get("tactical_directive") or "Respond with personality and emotion."
         recommended_burst_count = int(decision.get("recommended_burst_count", 1) or 1)
         suggest_gif = bool(decision.get("suggest_gif", False)) and gif_cooldown_ready and not is_bare_ping
-        user_explicitly_asked_for_gif = any(k in raw_without_mentions.lower() for k in ("send a gif", "post a gif", "drop a gif"))
-        allow_gif_tool = suggest_gif or user_explicitly_asked_for_gif or is_test_mode
+        allow_speaker_ping = bool(decision.get("allow_speaker_ping", False)) or is_proactive_scan
         delivery_mode = decision.get("delivery_mode", "reply")
 
-        system_instruction = construct_v6_system_prompt(
+        # Always keep `post_gif` available in Gemini's toolbelt whenever off the 20s cooldown
+        allow_gif_tool = gif_cooldown_ready and not is_bare_ping
+
+        system_instruction = construct_v7_system_prompt(
             channel_id=ch_id,
             guild=guild,
             tactical_directive=directive,
@@ -2281,6 +2345,7 @@ async def run_channel_response_pipeline(
             speaker_name=speaker_name,
             speaker_id=speaker_id,
             speaker_is_creator=speaker_is_creator,
+            is_proactive_scan=is_proactive_scan,
             is_test_mode=is_test_mode,
             snipe_context=active_snipe,
             server_emojis_str=server_emojis_str,
@@ -2297,7 +2362,15 @@ async def run_channel_response_pipeline(
                 image_parts=image_parts,
                 allow_gif=allow_gif_tool,
                 is_test_mode=is_test_mode,
+                last_human_speaker=last_human_spk,
             )
+
+            # Guarantee GIF delivery when the router explicitly requested a GIF and Gemini forgot to call the tool
+            if suggest_gif and not media_sent and allow_gif_tool:
+                fallback_gif_query = f"{emotional_state.get('mood_label', 'funny')} reaction"
+                gif_res = await execute_post_gif(channel, fallback_gif_query)
+                if gif_res.get("status") == "sent_to_channel":
+                    media_sent = True
 
             if not gemini_succeeded or (not raw_output and not media_sent):
                 raw_output = await call_groq_fallback(system_instruction, history_records, raw_without_mentions, speaker_name)
@@ -2324,11 +2397,19 @@ async def run_channel_response_pipeline(
                 and delivery_mode == "reply"
                 and not last_message_from_bot
                 and not media_sent
+                and not is_proactive_scan
                 and not (aff_score < -20 or patience_val < -30)
             )
 
             for idx, burst_part in enumerate(bursts):
-                outgoing_text = convert_outgoing_mentions(burst_part, guild)
+                outgoing_text = format_outgoing_mentions(
+                    text=burst_part,
+                    guild=guild,
+                    current_speaker_name=speaker_name,
+                    allow_speaker_ping=allow_speaker_ping,
+                )
+                if not outgoing_text:
+                    continue
 
                 if idx == 0 and use_reply and trigger_message is not None:
                     try:
@@ -2356,8 +2437,11 @@ async def run_channel_response_pipeline(
                         "penalized": False,
                     }
 
-            if not decision.get("step_back_from_thread", False):
+            if not decision.get("step_back_from_thread", False) and not is_proactive_scan:
                 channel_thread_exchange_count[ch_id] += 1
+                # Schedule a proactive follow-up in 1.5 to 4 minutes in case the user goes quiet after this!
+                if channel_proactive_Followup_count[ch_id] == 0:
+                    schedule_next_proactive_followup(ch_id, followup_stage=0)
         finally:
             channel_sending_lock[ch_id] = False
 
@@ -2377,7 +2461,7 @@ async def emotional_spring_maintenance_loop() -> None:
     async with memory_lock:
         for ch_id, q_info in list(bot_last_question_info.items()):
             if not q_info.get("answered") and not q_info.get("penalized"):
-                if now - q_info.get("timestamp", now) >= 360:
+                if now - q_info.get("timestamp", now) >= 240:
                     q_info["penalized"] = True
                     apply_spring_decay_and_shift({
                         "patience_delta": -20.0,
@@ -2397,7 +2481,7 @@ async def dynamic_presence_loop() -> None:
     st = memory_state.get("emotional_state", {})
     mood = st.get("mood_label", "playful/energetic")
     valence = st.get("valence", 45.0)
-    arousal = st.get("arousal", 50.0)
+    arousal = st.get("arousal", 55.0)
     patience = st.get("patience", 45.0)
 
     if patience < -30:
@@ -2426,8 +2510,14 @@ async def dynamic_presence_loop() -> None:
     )
 
 
-@tasks.loop(minutes=6)
+@tasks.loop(seconds=20)
 async def proactive_room_scanner() -> None:
+    """
+    Fast, responsive Proactive Scanner (runs every 20 seconds):
+    - If someone (like Shadow) says something and goes quiet for 1.5 to 4 minutes, the bot
+      automatically follows up on its own (EVEN if the bot sent the last reply!).
+    - Allows up to 2 proactive follow-ups before pausing until a human speaks again.
+    """
     if not bot.is_ready():
         return
 
@@ -2441,9 +2531,18 @@ async def proactive_room_scanner() -> None:
     if not target_channel:
         return
 
+    ch_id = target_channel.id
     now_epoch = time.time()
     now_ams = datetime.now(AMSTERDAM_TZ)
 
+    # Do not interrupt if currently generating or stepped back
+    if channel_sending_lock.get(ch_id, False) or now_epoch < channel_stepped_back_until.get(ch_id, 0.0):
+        return
+    existing_task = active_generation_tasks.get(ch_id)
+    if existing_task and not existing_task.done():
+        return
+
+    # 1. Check overdue user promises/commitments
     async with memory_lock:
         for c in memory_state.get("active_commitments", []):
             if not c.get("called_out", False):
@@ -2456,7 +2555,7 @@ async def proactive_room_scanner() -> None:
                         msg_txt = f"yo {mention} didn't you say you were gonna {c['promise']}? what happened to that"
                         sent = await target_channel.send(msg_txt)
                         record_buffer_message(
-                            target_channel.id,
+                            ch_id,
                             bot.user.display_name if bot.user else "Bot",
                             bot.user.id if bot.user else 0,
                             msg_txt,
@@ -2467,24 +2566,30 @@ async def proactive_room_scanner() -> None:
                 except Exception:
                     c["called_out"] = True
 
-    records = list(channel_buffers[target_channel.id])
+    records = list(channel_buffers[ch_id])
     if not records:
         return
 
-    last_rec = records[-1]
-
-    # HARD DOUBLE-TEXT LOCK
-    if last_rec.get("is_bot", False):
+    # Cap at 2 unanswered proactive follow-ups in a row so it doesn't spam an empty room overnight
+    followup_stage = channel_proactive_Followup_count[ch_id]
+    if followup_stage >= 2:
         return
 
-    if now_epoch < channel_next_proactive_epoch[target_channel.id]:
+    next_due = channel_next_proactive_epoch.get(ch_id, 0.0)
+    if next_due <= 0.0 or now_epoch < next_due:
         return
 
-    silence_seconds = now_epoch - float(last_rec.get("timestamp_epoch", now_epoch))
-    if silence_seconds < 600:
+    last_act = channel_last_activity_epoch.get(ch_id, now_epoch)
+    silence_seconds = max(0.0, now_epoch - last_act)
+    if silence_seconds < 75.0:
         return
 
-    channel_next_proactive_epoch[target_channel.id] = now_epoch + random.uniform(2400, 7200)
+    # Advance stage and schedule next window
+    channel_proactive_Followup_count[ch_id] = followup_stage + 1
+    schedule_next_proactive_followup(ch_id, followup_stage=followup_stage + 1)
+
+    last_spk = channel_last_human_speaker.get(ch_id, "someone")
+    logger.info(f"Proactive follow-up #{followup_stage + 1} triggered in #{target_channel.name} after {int(silence_seconds)}s silence (last speaker: {last_spk}).")
 
     await run_channel_response_pipeline(
         channel=target_channel,
@@ -2493,8 +2598,8 @@ async def proactive_room_scanner() -> None:
         explicitly_mentioned_others=[],
         replied_to_other_user=None,
         replied_snippet=None,
-        last_message_from_bot=False,
-        bot_in_last_3_messages=False,
+        last_message_from_bot=bool(records[-1].get("is_bot", False)),
+        bot_in_last_3_messages=True,
         seconds_since_bot_spoke=silence_seconds,
         is_test_mode=False,
         snipe_info=None,
@@ -2622,6 +2727,7 @@ async def on_message(message: discord.Message) -> None:
         channel_buffers[ch_id].clear()
         channel_thread_exchange_count[ch_id] = 0
         channel_stepped_back_until[ch_id] = 0.0
+        channel_proactive_Followup_count[ch_id] = 0
         async with memory_lock:
             memory_state["emotional_state"] = json.loads(json.dumps(DEFAULT_MEMORY["emotional_state"]))
             await save_memory_state()
@@ -2671,7 +2777,6 @@ async def on_message(message: discord.Message) -> None:
         if any(re.search(rf"\b{re.escape(bn)}\b", message.content.lower()) for bn in bot_names if len(bn) >= 3):
             bot_mentioned = True
 
-    # Only count @mentions that were actually typed in the message text (not automatic Discord reply mentions)
     typed_mention_ids = {int(m) for m in re.findall(r"<@!?(\d+)>", message.content)}
     explicitly_mentioned_others = [
         f"@{u.display_name}" for u in message.mentions

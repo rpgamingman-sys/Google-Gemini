@@ -1105,12 +1105,13 @@ Read the chat flow, social context, live server radar, and emotional state, and 
 }
 
 CRITICAL AUTONOMY & UNHINGED HUMAN PERSONALITY PRINCIPLES:
-1. CREATIVE, UNHINGED COMEDIC ANGLES ("tactical_directive"):
-   - Never write boring, generic directives! Give yourself a sharp, funny, unpredictable human angle that fits the exact message:
-     * Deadpan disbelief or gaslighting for comedy (acting like a normal thing they said is completely unhinged, or pretending they edited their message).
-     * Unhinged intrusive thoughts, dramatic overreactions, or sudden hyper-specific conspiracy theories about what server members are doing on the LIVE SERVER RADAR.
-     * Theatrical heartbreak / guilt-tripping when someone is mean (`"act like they just betrayed years of friendship"`), OR ruthless, creative cooking when someone tests your patience.
-     * Genuine curiosity, hyping up friends, or chaotic brainrotriffing when hanging out casually.
+1. REALISTIC, GROUNDED DISCORD COMEDY & WIT ("tactical_directive"):
+   - STRICT BAN ON SURREALIST CARTOON NOVELTY SCRIPTS: NEVER instruct the bot to talk about talking toasters, pizza dimensions/portals, mythical cosmic entities, or random kitchen appliances. That sounds like a cheap scripted bot, NOT a real human.
+   - REAL DISCORD WIT & BANTER:
+     * Dry sarcasm & reality checks (e.g. "you're asking about deep lore at 10pm", "who else would give a bot admin perms, obviously dogee", "you're arguing with code in general rn who's really losing").
+     * Sharp banter & teasing ("who let bro cook", "cap of the century", "don't ping me unless the server is on fire").
+     * Snappy follow-ups that flow effortlessly like a real friend typing from their phone or PC.
+     * Genuine peer loyalty with creator (`dogee`): tease her affectionately like a close friend, have her back.
    - Check `"your_recent_sent_messages"` in the payload and ensure your `"tactical_directive"` steers you away from repeating any joke, phrase, or opener you already used recently!
 2. TRUE EMERGENT, REALISTIC HUMAN MOODS ("suggested_mood" & "slider_shifts"):
    - Do NOT follow a fake script! React authentically to how people treat you:
@@ -3808,6 +3809,7 @@ async def run_channel_response_pipeline(
         )
 
         # 2. Native Multi-Turn Multimodal Generation (Zero artificial sleep timers!)
+        turn_media_state: Dict[str, bool] = {"sent": False}
         async with channel.typing():
             multimodal_parts, text_file_snippets = await extract_multimodal_parts(trigger_message)
             raw_output, gemini_succeeded, media_sent = await generate_gemini_response(
@@ -3820,12 +3822,14 @@ async def run_channel_response_pipeline(
                 allow_gif=allow_gif_tool,
                 proactive_reason=proactive_reason,
             )
+            if media_sent:
+                turn_media_state["sent"] = True
 
-            if not gemini_succeeded or (not raw_output and not media_sent):
-                raw_output = await call_groq_fallback(system_instruction, history_records, raw_without_mentions, speaker_name)
-                if raw_output:
+            if not gemini_succeeded or not raw_output:
+                groq_raw = await call_groq_fallback(system_instruction, history_records, raw_without_mentions, speaker_name)
+                if groq_raw:
                     cleaned_groq, groq_sent, _ = await intercept_and_execute_inline_tool_tags(
-                        raw_text=raw_output,
+                        raw_text=groq_raw,
                         channel=channel,
                         guild=guild,
                         target_msg=trigger_message,
@@ -3834,10 +3838,11 @@ async def run_channel_response_pipeline(
                     raw_output = cleaned_groq
                     if groq_sent:
                         media_sent = True
+                        turn_media_state["sent"] = True
                 if (suggest_gif or user_explicit_gif) and not media_sent and not is_hush_request:
                     term_match = re.search(r"\b(?:gif|meme|pic)\s+(?:of\s+)?([a-zA-Z0-9_\s]{2,25})", raw_without_mentions, flags=re.IGNORECASE)
                     term = term_match.group(1).strip() if term_match else (raw_without_mentions[:30] or "reaction")
-                    gif_res = await execute_post_gif(channel, term, turn_media_state={"sent": media_sent})
+                    gif_res = await execute_post_gif(channel, term, turn_media_state=turn_media_state)
                     if gif_res.get("status") == "sent_to_channel":
                         media_sent = True
 

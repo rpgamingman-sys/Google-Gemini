@@ -85,15 +85,12 @@ MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")
 CLOUD_BACKUP_MARKER = "[[MEMORY_BACKUP_V9_JSON]]"
 logger.info(f"Persistent memory target: {MEMORY_FILE}")
 
-# Primary Gemini Model: gemini-3.8-flash with automatic cascade to 3.5-lite, 3.1-lite, 3-preview
-ENV_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+# Primary Gemini Model: gemini-3.5-flash-lite (fast, direct, no slow cascade loops)
+ENV_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GEMINI_MODEL_CANDIDATES: List[str] = list(dict.fromkeys([
     ENV_GEMINI_MODEL,
-    "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
-    "gemini-3-flash-preview",
-    "gemini-3.5-flash",
 ]))
 active_gemini_model: str = GEMINI_MODEL_CANDIDATES[0]
 
@@ -1369,7 +1366,7 @@ async def call_hybrid_router(
                 logger.debug(f"Groq router error on {candidate}: {e}")
                 continue
 
-    # 2. Instant Failover to Gemini 3.5 Flash-Lite Router (JSON mode)
+    # 2. Instant Failover to Gemini Flash-Lite Router (JSON mode)
     if genai_client:
         for gem_model in list(GEMINI_MODEL_CANDIDATES):
             try:
@@ -1378,10 +1375,13 @@ async def call_hybrid_router(
                     temperature=0.65,
                     response_mime_type="application/json",
                 )
-                resp = await genai_client.aio.models.generate_content(
-                    model=gem_model,
-                    contents=payload_json_str,
-                    config=router_config,
+                resp = await asyncio.wait_for(
+                    genai_client.aio.models.generate_content(
+                        model=gem_model,
+                        contents=payload_json_str,
+                        config=router_config,
+                    ),
+                    timeout=5.0,
                 )
                 raw_text = extract_clean_gemini_text(resp) or ""
                 match = re.search(r"\{.*\}", raw_text, re.DOTALL)
@@ -1396,6 +1396,9 @@ async def call_hybrid_router(
                     return decision
             except asyncio.CancelledError:
                 raise
+            except asyncio.TimeoutError:
+                logger.warning(f"Gemini router '{gem_model}' timed out after 5.0s; cascading to next candidate...")
+                continue
             except Exception as e:
                 if "404" in str(e) and len(GEMINI_MODEL_CANDIDATES) > 1 and gem_model in GEMINI_MODEL_CANDIDATES:
                     GEMINI_MODEL_CANDIDATES.remove(gem_model)
@@ -3503,20 +3506,26 @@ async def generate_gemini_response(
             turn = 0
 
 
-            while turn < 4:
-                # Once 1 GIF/media has been sent in this turn, remove post_gif from the toolset for subsequent loop steps!
-                step_allow_gif = allow_gif and not turn_media_state["sent"]
-                step_tools = build_genai_tools(allow_gif=step_allow_gif)
+            while turn < 2:
+                # In turn 0, provide tools if media hasn't been sent. In turn 1+, provide no tools so it writes snappy companion text instantly!
+                if turn == 0 and not turn_media_state["sent"]:
+                    step_tools = build_genai_tools(allow_gif=allow_gif)
+                else:
+                    step_tools = None
+
                 config = types.GenerateContentConfig(
                     system_instruction=system_instruction,
                     temperature=0.92,
                     tools=step_tools,
                 )
 
-                response = await genai_client.aio.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=config,
+                response = await asyncio.wait_for(
+                    genai_client.aio.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=config,
+                    ),
+                    timeout=8.0,
                 )
                 active_gemini_model = model_name
 
@@ -3536,7 +3545,7 @@ async def generate_gemini_response(
                         collected_texts.append(cleaned_turn_text)
 
                 if not response.function_calls:
-                    if inline_executed and not collected_texts and turn < 2:
+                    if inline_executed and not collected_texts and turn < 1:
                         summary_str = "; ".join([f"{fn} -> {json.dumps(r)}" for fn, r in inline_executed])
                         contents.append(types.Content(role="model", parts=[types.Part.from_text(text=f"[Executed tool: {summary_str}]")]))
                         contents.append(types.Content(role="user", parts=[types.Part.from_text(text="[Tool finished. Now write your casual Discord chat response!]")]))
@@ -3578,6 +3587,9 @@ async def generate_gemini_response(
 
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            logger.warning(f"Gemini model '{model_name}' timed out after 8.0s; cascading to next candidate...")
+            continue
         except Exception as e:
             err_str = str(e)
             if "404" in err_str or "NOT_FOUND" in err_str:
@@ -4474,6 +4486,8 @@ async def on_message(message: discord.Message) -> None:
             "dumbbot",
         }
         if any(re.search(rf"\b{re.escape(bn)}\b", message.content.lower()) for bn in bot_names if len(bn) >= 3):
+            bot_mentioned = True
+        elif f"<@{bot.user.id}>" in message.content or f"<@!{bot.user.id}>" in message.content or str(bot.user.id) in message.content:
             bot_mentioned = True
 
     is_currently_stepped_back = time.time() < channel_stepped_back_until.get(ch_id, 0.0)

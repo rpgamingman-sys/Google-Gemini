@@ -580,7 +580,7 @@ def format_outgoing_mentions(
         for name_str, uid in candidates:
             if not allow_speaker_ping and name_str.lower() == current_speaker_name.lower():
                 continue
-            pattern = rf"(?<!<)@{re.escape(name_str)}(?=$|\s|[.,!?:;'"\)\]])"
+            pattern = rf"""(?<!<)@{re.escape(name_str)}(?=\$|\s|[.,!?:;'"\)])"""
             if re.search(pattern, text, flags=re.IGNORECASE):
                 text = re.sub(pattern, f"<@{uid}>", text, flags=re.IGNORECASE)
 

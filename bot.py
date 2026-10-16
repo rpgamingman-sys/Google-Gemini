@@ -1123,6 +1123,51 @@ def extract_rich_message_details(message: discord.Message) -> str:
     return (" " + " ".join(extras)) if extras else ""
 
 
+def extract_balanced_json_objects(text: str) -> List[str]:
+    """
+    Extracts all top-level balanced curly-brace blocks { ... } from text, correctly
+    handling strings, escaped characters, and arbitrary nested braces.
+    """
+    results: List[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "{":
+            start = i
+            depth = 0
+            in_string = False
+            escape = False
+            quote_char = None
+            valid = False
+            for j in range(start, n):
+                ch = text[j]
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif ch == "\\":
+                        escape = True
+                    elif ch == quote_char:
+                        in_string = False
+                else:
+                    if ch in ('"', "'"):
+                        in_string = True
+                        quote_char = ch
+                    elif ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            results.append(text[start : j + 1])
+                            i = j
+                            valid = True
+                            break
+            if not valid:
+                i += 1
+        else:
+            i += 1
+    return results
+
+
 def sanitize_output_text(text: str, speaker_name: str = "") -> str:
     if not text:
         return ""
@@ -1137,9 +1182,27 @@ def sanitize_output_text(text: str, speaker_name: str = "") -> str:
     text = re.sub(r"\[thought\][\s\S]*?\[/thought\]", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\[thinking\][\s\S]*?\[/thinking\]", "", text, flags=re.IGNORECASE)
     text = re.sub(r"</?(?:thought|think)>", "", text, flags=re.IGNORECASE)
+
+    # 1. Balanced JSON action/tool call leaks e.g. {"action": "post_gif", "action_input": "...", "message": "..."}
+    json_blocks = extract_balanced_json_objects(text)
+    for raw_json_str in json_blocks:
+        if any(k in raw_json_str for k in ('"action"', '"tool"', '"name"', '"search_term"')):
+            extracted = ""
+            try:
+                parsed_data = json.loads(raw_json_str)
+                extracted = parsed_data.get("message") or parsed_data.get("content") or parsed_data.get("response") or parsed_data.get("reply") or ""
+            except Exception:
+                msg_sub = re.search(r'"(?:message|content|response|reply)"\s*:\s*"([^"]+)"', raw_json_str)
+                if msg_sub:
+                    extracted = msg_sub.group(1)
+            text = text.replace(raw_json_str, extracted)
+
     text = re.sub(r"(?i)(?:\A|\n)\s*(?:\*|\(|\[)?(?:internal\s+)?(?:thought|thinking|reasoning)\s*:\s*[^\n\r]+(?:\*|\)|\])?", "", text)
     text = re.sub(r"(?i)(?:\A|\n)\s*(?:thought|thinking|reasoning)\s*process\s*:\s*[^\n\r]+", "", text)
-    text = re.sub(r"(?:\[|\(|\<)?\bgif\s*:\s*[\"']?[^\"'\n\r\]\)\>\|]+[\"']?(?:\]|\)|\>)?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?i)\b(?:action|action_input|observation)\s*:\s*[^\n\r]+", "", text)
+    text = re.sub(r"(?i)(?:\[|\(|\<|\*|\b)?(?:post_)?gif(?:\s+query|\s+search)?\s*[:=-]\s*[\"']?[^\"'\n\r\]\)\>\*\|]+[\"']?(?:\]|\)|\>|\*)?", "", text)
+    text = re.sub(r"(?i)\*(?:sends|posts|drops)?\s+(?:a\s+)?gif\s+(?:of\s+)?[^*]+\*", "", text)
+    text = re.sub(r"(?i)\bsearch_term\s*[:=]\s*[\"'][^\"'\n\r]+[\"']", "", text)
     text = re.sub(r"\[(?:Sent GIF|Posted Image|Posted Flux Art|Action taken|Executed tool):[^\]]*\]", "", text, flags=re.IGNORECASE)
     text = re.sub(r"https?://(?:media\d*\.|c\.|www\.)?tenor\.com/\S+", "", text, flags=re.IGNORECASE)
     text = re.sub(r"[\(\[](?:post_gif|post_flux_art|search_web|search_web_images|speak_in_voice|change_my_nickname|change_nickname|admin_power_move|tool)[^\)\]]*[\)\]]", "", text, flags=re.IGNORECASE)
@@ -3641,6 +3704,56 @@ async def intercept_and_execute_inline_tool_tags(
             pass
     cleaned = re.sub(tc_pattern, "", cleaned, flags=re.DOTALL)
 
+    # Intercept JSON action / ReAct blocks e.g. {"action": "post_gif", "action_input": "...", "message": "..."}
+    json_blocks = extract_balanced_json_objects(cleaned)
+    for raw_block in json_blocks:
+        if not any(k in raw_block for k in ('"action"', '"tool"', '"name"')):
+            continue
+        action_name = ""
+        extracted_msg = ""
+        action_args: Dict[str, Any] = {}
+        try:
+            parsed = json.loads(raw_block)
+            action_name = parsed.get("action") or parsed.get("tool") or parsed.get("name") or ""
+            extracted_msg = parsed.get("message") or parsed.get("content") or parsed.get("response") or parsed.get("reply") or ""
+            act_in = parsed.get("action_input") or parsed.get("arguments") or parsed.get("args") or {}
+            if isinstance(act_in, dict):
+                action_args = act_in
+            elif isinstance(act_in, str):
+                act_in_clean = act_in.strip()
+                if act_in_clean.startswith("{") and act_in_clean.endswith("}"):
+                    try:
+                        import ast
+                        action_args = ast.literal_eval(act_in_clean)
+                    except Exception:
+                        action_args = {"search_term": act_in_clean}
+                else:
+                    action_args = {"search_term": act_in_clean}
+        except Exception:
+            msg_match = re.search(r'"(?:message|content|response|reply)"\s*:\s*"([^"]+)"', raw_block)
+            if msg_match:
+                extracted_msg = msg_match.group(1)
+            act_match = re.search(r'"(?:action|tool|name)"\s*:\s*"([^"]+)"', raw_block)
+            if act_match:
+                action_name = act_match.group(1)
+            term_match = re.search(r"'(?:search_term|query)':\s*'([^']+)'", raw_block) or re.search(r'"(?:search_term|query)":\s*"([^"]+)"', raw_block)
+            if term_match:
+                action_args = {"search_term": term_match.group(1)}
+
+        cleaned = cleaned.replace(raw_block, extracted_msg)
+
+        if action_name == "post_gif" and not turn_media_state.get("sent", False):
+            search_t = action_args.get("search_term") or action_args.get("query") or "reaction meme"
+            logger.info(f"[INTERCEPTED JSON action: post_gif] execute_post_gif('{search_t}')")
+            gif_res = await execute_post_gif(channel, str(search_t), turn_media_state=turn_media_state)
+            if gif_res.get("status") == "sent_to_channel":
+                turn_media_state["sent"] = True
+                executed_inline.append(("post_gif", gif_res))
+        elif action_name in ("send_voice_message", "speak_in_voice", "change_nickname", "change_my_nickname", "timeout_user", "create_poll"):
+            logger.info(f"[INTERCEPTED JSON action: {action_name}] dispatch_tool_call({action_args})")
+            res = await dispatch_tool_call(action_name, action_args, channel, guild, target_msg, turn_media_state)
+            executed_inline.append((action_name, res))
+
     # Intercept inline GIF searches: e.g. "gif: rolling eyes", "[gif: sarcastic smile]", "(gif: facepalm)"
     gif_matches = re.findall(r"(?:\[|\(|\<)?\bgif\s*:\s*[\"']?([^\"'\n\r\]\)\>\|]+)[\"']?(?:\]|\)|\>)?", cleaned, flags=re.IGNORECASE)
     for g_term in gif_matches:
@@ -4531,6 +4644,19 @@ async def run_channel_response_pipeline(
             if media_sent:
                 turn_media_state["sent"] = True
 
+            if raw_output:
+                cleaned_raw, raw_tool_sent, _ = await intercept_and_execute_inline_tool_tags(
+                    raw_text=raw_output,
+                    channel=channel,
+                    guild=guild,
+                    target_msg=trigger_message,
+                    turn_media_state=turn_media_state,
+                )
+                raw_output = cleaned_raw
+                if raw_tool_sent:
+                    media_sent = True
+                    turn_media_state["sent"] = True
+
             if not gemini_succeeded or not raw_output:
                 groq_raw = await call_groq_fallback(system_instruction, history_records, raw_without_mentions, speaker_name)
                 if groq_raw:
@@ -4552,13 +4678,23 @@ async def run_channel_response_pipeline(
                     if gif_res.get("status") == "sent_to_channel":
                         media_sent = True
 
-
         executed_tools_this_turn = list(channel_last_tool_summaries[ch_id])
         bot_name = bot.user.display_name if bot.user else "Dumb bot"
         bot_id = bot.user.id if bot.user else 0
 
         if not raw_output:
-            raw_output = await call_groq_fallback(system_instruction, history_records, raw_without_mentions, speaker_name)
+            groq_fallback_raw = await call_groq_fallback(system_instruction, history_records, raw_without_mentions, speaker_name)
+            if groq_fallback_raw:
+                cleaned_fb, fb_sent, _ = await intercept_and_execute_inline_tool_tags(
+                    raw_text=groq_fallback_raw,
+                    channel=channel,
+                    guild=guild,
+                    target_msg=trigger_message,
+                    turn_media_state=turn_media_state,
+                )
+                raw_output = cleaned_fb
+                if fb_sent:
+                    media_sent = True
 
         if not raw_output and (media_sent or executed_tools_this_turn):
             default_companions = [
@@ -4944,6 +5080,7 @@ async def on_ready() -> None:
     load_memory_state_sync()
     await restore_memory_from_discord_cloud()
     await discover_available_groq_models()
+    asyncio.create_task(precache_soundboard_sounds(bot))
 
     load_opus_library()
     for g in bot.guilds:
@@ -5028,6 +5165,120 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         )
 
 
+DEFAULT_SOUNDBOARD_SOUNDS: Dict[int, str] = {
+    1: "quack",
+    2: "airhorn",
+    3: "cricket",
+    4: "golf clap",
+    5: "sad horn",
+    7: "ba dum tss",
+}
+soundboard_name_cache: Dict[int, str] = dict(DEFAULT_SOUNDBOARD_SOUNDS)
+
+
+async def precache_soundboard_sounds(client: discord.Client) -> None:
+    try:
+        if hasattr(client, "fetch_soundboard_default_sounds"):
+            defaults = await client.fetch_soundboard_default_sounds()
+            for s in defaults:
+                soundboard_name_cache[s.id] = s.name
+            logger.info(f"[SOUNDBOARD CACHE] Cached {len(defaults)} default Discord sounds.")
+    except Exception as e:
+        logger.debug(f"Pre-caching default soundboard sounds: {e}")
+
+
+async def resolve_soundboard_name(guild: Optional[discord.Guild], effect: discord.VoiceChannelEffect) -> str:
+    if not effect:
+        return "soundboard sound"
+    sound_id = effect.sound.id if effect.sound else None
+    if sound_id is not None:
+        if sound_id in soundboard_name_cache:
+            return soundboard_name_cache[sound_id]
+        if effect.sound and getattr(effect.sound, "is_default", lambda: False)():
+            return DEFAULT_SOUNDBOARD_SOUNDS.get(sound_id, "soundboard sound")
+        if guild:
+            snd = guild.get_soundboard_sound(sound_id)
+            if snd and getattr(snd, "name", None):
+                soundboard_name_cache[sound_id] = snd.name
+                return snd.name
+            for s in getattr(guild, "soundboard_sounds", []):
+                if s.id == sound_id:
+                    soundboard_name_cache[sound_id] = s.name
+                    return s.name
+            try:
+                fetched = await guild.fetch_soundboard_sound(sound_id)
+                if fetched and getattr(fetched, "name", None):
+                    soundboard_name_cache[sound_id] = fetched.name
+                    return fetched.name
+            except Exception:
+                pass
+            try:
+                all_sounds = await guild.fetch_soundboard_sounds()
+                for s in all_sounds:
+                    soundboard_name_cache[s.id] = s.name
+                    if s.id == sound_id:
+                        return s.name
+            except Exception:
+                pass
+    if effect.emoji:
+        em_name = getattr(effect.emoji, "name", str(effect.emoji))
+        if em_name:
+            return em_name
+    return "soundboard sound"
+
+
+def generate_soundboard_reaction(sound_name: str, user_name: str) -> str:
+    s_low = sound_name.lower()
+    if "quack" in s_low or "duck" in s_low:
+        options = [
+            "who brought a duck into the call",
+            f"{user_name} please stop quacking at me :3",
+            "the duck quack is crazy",
+            "quack back at me one more time",
+        ]
+    elif "airhorn" in s_low:
+        options = [
+            "my ears are literally ringing",
+            f"2016 mlg airhorn in 2026 {user_name} really",
+            "alright dj calm down",
+            "my headset is vibrating",
+        ]
+    elif "cricket" in s_low:
+        options = [
+            f"crickets for what {user_name} it wasn't even that bad",
+            "dead silence moment ._.",
+            "the awkward cricket is foul",
+            "crickets in 2026 bro :/",
+        ]
+    elif "golf clap" in s_low or "clap" in s_low:
+        options = [
+            "the sarcastic golf clap is personal",
+            "thank you thank you i'll be here all week ^^",
+            f"polite applause from {user_name} we take those",
+        ]
+    elif "sad horn" in s_low or "wah" in s_low:
+        options = [
+            "wah wah wahhh the dramatic violin was busy",
+            f"biggest tragedy of 2026 thanks {user_name} :3",
+            "womp womp in 4k",
+        ]
+    elif "ba dum" in s_low or "tss" in s_low or "drum" in s_low:
+        options = [
+            "badum tss okay comedy king",
+            f"{user_name} pulled up with the rimshot :D",
+            "pun intended or what",
+        ]
+    else:
+        options = [
+            f"not the {sound_name} {user_name} 😭",
+            f"bro blasted {sound_name} out of nowhere",
+            f"who gave {user_name} aux perms for {sound_name}",
+            f"nah {sound_name} caught me completely off guard :3",
+            f"the {sound_name} sound effect is wilddd",
+        ]
+    return random.choice(options)
+
+
 @bot.event
 async def on_voice_channel_effect(effect: discord.VoiceChannelEffect) -> None:
     """
@@ -5041,11 +5292,7 @@ async def on_voice_channel_effect(effect: discord.VoiceChannelEffect) -> None:
         if not guild:
             return
 
-        sound_name = "soundboard sound"
-        if effect.sound:
-            sound_obj = bot.get_soundboard_sound(effect.sound.id) if hasattr(bot, "get_soundboard_sound") else None
-            sound_name = getattr(sound_obj, "name", None) or f"sound #{effect.sound.id}"
-
+        sound_name = await resolve_soundboard_name(guild, effect)
         desc = f"🔊 {user} blasted '{sound_name}' on the soundboard in VC #{ch}!"
         record_server_event(guild.id, desc)
         logger.info(f"[SOUNDBOARD EVENT] {desc}")
@@ -5054,20 +5301,18 @@ async def on_voice_channel_effect(effect: discord.VoiceChannelEffect) -> None:
         bot_vc_ch = getattr(guild.voice_client, "channel", None) if guild.voice_client else None
         if bot_vc_ch and bot_vc_ch.id == ch_id:
             logger.info(f"[SOUNDBOARD HEARD IN VC] Dumb bot heard soundboard '{sound_name}' in current VC #{ch}")
-            reaction_phrases = [
-                f"yo who just played {sound_name}",
-                "bro the soundboard",
-                "my ears",
-                f"not the {sound_name} lmao",
-                "play another one",
-            ]
-            asyncio.create_task(play_text_in_voice_channel(guild, random.choice(reaction_phrases)))
+            reaction_phrase = generate_soundboard_reaction(sound_name, user)
+            asyncio.create_task(play_text_in_voice_channel(guild, reaction_phrase))
         else:
             await trigger_proactive_event_comment(
                 guild=guild,
                 event_key=f"soundboard_{guild.id}",
-                cooldown_sec=300.0,
-                reason_prompt=f"@{user} just blasted '{sound_name}' on the soundboard in VC #{ch}! React playfully to their soundboard pick in chat!",
+                cooldown_sec=240.0,
+                reason_prompt=(
+                    f"@{user} just blasted '{sound_name}' on the soundboard in VC #{ch}! "
+                    f"React specifically and playfully to them blasting '{sound_name}' "
+                    f"(e.g. roast their comedic timing, laugh at the sound, or tease them for picking it)!"
+                ),
             )
     except Exception as e:
         logger.debug(f"on_voice_channel_effect error: {e}")

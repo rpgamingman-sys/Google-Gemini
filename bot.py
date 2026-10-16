@@ -1148,6 +1148,8 @@ def style_casual_fragment(frag: str) -> str:
         return ""
     if frag.endswith(".") and not frag.endswith(".."):
         frag = frag[:-1].strip()
+    if len(frag) > 1 and frag[0].isupper() and not frag[1].isupper() and not frag.startswith("<@") and not frag.startswith("<#"):
+        frag = frag[0].lower() + frag[1:]
     return frag
 
 
@@ -3658,6 +3660,7 @@ CORE AUTONOMY, VOICE & UNHINGED HUMAN PERSONALITY RULES:
      * Naturally elongate words for dramatic exaggeration, sarcasm, or disbelief when appropriate (`bruhhhh`, `nooooo`, `yessss`, `sorryyyyy`, `whaaat`, `waaait`, `whyyyyy`, `pleaaase`, `deadassss`).
      * Drop classic text emoticons naturally when the vibe fits (`._.`, `>_>`, `-_-`, `T_T`, `o_o`, `x_x`, `:/`, `:D`, `:)`, `:c`).
      * Use trailing punctuation for dramatic comedic pauses (`..`, `...`, `?!`, `...??`).
+     * CASUAL DISCORD CHATTER, NOT THEATRICAL VILLAIN SPEECHES: Talk like a real person typing in a Discord server, NOT an anime villain or Shakespearean actor! NEVER say "How pathetic", "How gracious of you, truly", or "Listen up, mortals". Start in casual lowercase (`nah`, `wait`, `bruh`, `deadass`, `i mean`, `yesss`, `bro`), keep sentences punchy and organic, and drop emoticons (`._.`, `>_>`, `-_-`).
      * EMOJI RESTRAINT & VARIETY: Real humans DO NOT spam emojis on every line! At least 40% to 50% of your messages should have ZERO emojis. Never spam `💀` or `😭` on every turn—diversify based on mood (`🤨`, `😐`, `👀`, `😒`, `🙄`, `🥀`, `💔`, `🪫`, `🫠`, `🌧️`, `😮‍💨`, `😔`, `🔥`, `🫡`, `⚡`).
    - FOLLOW THE SPECIFIED CADENCE EXACTLY:
      * If the CADENCE says 1 message, output exactly ONE cohesive message. DO NOT use '|||'!
@@ -4213,13 +4216,15 @@ async def run_channel_response_pipeline(
         if is_hush_request:
             channel_stepped_back_until[ch_id] = time.time() + 300.0
             channel_thread_exchange_count[ch_id] = 0
-            logger.info(f"[QUIET MODE] Locked channel {ch_id} into quiet state (will still react with emojis and wake on check-ins).")
+            logger.info(f"[QUIET MODE] Locked channel {ch_id} into quiet state (will silently react with emojis and wake on check-ins).")
+            should_speak = False
         elif decision.get("wake_up_from_quiet", False) or is_direct_interaction or is_implicit_wakeup:
             if channel_stepped_back_until.get(ch_id, 0.0) > 0:
                 channel_stepped_back_until[ch_id] = 0.0
                 logger.info(f"[WOKE UP] Cleared quiet mode in channel {ch_id}!")
-
-        should_speak = bool(decision.get("should_speak", False))
+            should_speak = bool(decision.get("should_speak", False))
+        else:
+            should_speak = bool(decision.get("should_speak", False))
 
         async with memory_lock:
             emotional_state = apply_spring_decay_and_shift(

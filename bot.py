@@ -726,17 +726,16 @@ def format_outgoing_mentions(
                 ch_candidates.append((t.name.strip(), t.id))
         ch_candidates.sort(key=lambda x: len(x[0]), reverse=True)
         for ch_name, ch_id in ch_candidates:
-            pat_ch = rf"(?<!<)#{re.escape(ch_name)}(?=\Z|\s|[.,!?:;\x22\x27\)\]])"
+            pat_ch = rf"(?<!<)#{re.escape(ch_name)}(?=\Z|\s|[.,!?:;\x22\x27\)\]—–\-])"
             if re.search(pat_ch, text, flags=re.IGNORECASE):
                 text = re.sub(pat_ch, f"<#{ch_id}>", text, flags=re.IGNORECASE)
 
     # 2. DISCORD USER MENTIONS: Convert @username to real clickable mention <@uid>
     my_id = guild.me.id if guild.me else 0
+    creator_id = CREATOR_USER_ID or (guild.owner.id if guild.owner else 0)
     member_candidates: List[Tuple[str, int]] = []
-    if CREATOR_USER_ID:
-        member_candidates.append(("dogee", CREATOR_USER_ID))
-    elif guild.owner:
-        member_candidates.append(("dogee", guild.owner.id))
+    if creator_id:
+        member_candidates.append(("dogee", creator_id))
 
     for m in guild.members:
         if m.id == my_id:
@@ -749,9 +748,13 @@ def format_outgoing_mentions(
     # Convert any @Name or @Name#1234 in text
     if "@" in text:
         for name_str, uid in member_candidates:
-            pattern = rf"(?<!<)@{re.escape(name_str)}(?:#\d{{4}})?(?=\Z|\s|[.,!?:;\x22\x27\)\]])"
+            pattern = rf"(?<!<)@{re.escape(name_str)}(?:#\d{{4}})?(?=\Z|\s|[.,!?:;\x22\x27\)\]—–\-])"
             if re.search(pattern, text, flags=re.IGNORECASE):
                 text = re.sub(pattern, f"<@{uid}>", text, flags=re.IGNORECASE)
+
+    # Convert plain references to "creator dogee" into clickable mention
+    if creator_id and f"<@{creator_id}>" not in text:
+        text = re.sub(r"\b(?:my\s+)?creator\s+dogee\b", f"creator <@{creator_id}>", text, flags=re.IGNORECASE)
 
     # 3. If user explicitly commanded to engage a member (force_target_member)
     if force_target_member and force_target_member.id != my_id and f"<@{force_target_member.id}>" not in text:

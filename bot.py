@@ -928,7 +928,21 @@ def build_live_server_radar(guild: Optional[discord.Guild], channel_id: int) -> 
     pres_block = " ; ".join(presence_lines[:15]) if presence_lines else "No members showing online status."
     ev_block = "\n".join(recent_events) if recent_events else "No recent background events."
 
+    now_ams_str = datetime.now(AMSTERDAM_TZ).strftime("%A, %B %d %Y, %H:%M:%S (Europe/Amsterdam, UTC+2)")
+    text_ch_names = []
+    curr_ch_name = "unknown"
+    for c in guild.text_channels:
+        if c.permissions_for(guild.me).read_messages:
+            if c.id == channel_id:
+                curr_ch_name = c.name
+                text_ch_names.append(f"#{c.name} [CURRENT CHAT]")
+            else:
+                text_ch_names.append(f"#{c.name}")
+    ch_block = ", ".join(text_ch_names) if text_ch_names else "No accessible text channels."
+
     return (
+        f"LIVE CLOCK (CURRENT TIME): {now_ams_str}\n"
+        f"SERVER TEXT CHANNELS: {ch_block} (You are chatting in #{curr_ch_name}. Use send_message_to_channel to post in other channels!)\n"
         f"VOICE CHANNELS RIGHT NOW: {vc_block}\n"
         f"ONLINE MEMBERS & LIVE ACTIVITIES: {pres_block}\n"
         f"RECENT SERVER EVENTS & SNIPES:\n{ev_block}"
@@ -1833,6 +1847,25 @@ async def execute_rename_channel(channel: discord.abc.Messageable, new_name: str
         return {"error": f"Rename channel failed: {e}"}
 
 
+async def execute_send_message_to_channel(guild: discord.Guild, channel_name: str, message_text: str) -> Dict[str, Any]:
+    clean_target = channel_name.lower().strip("# ").strip()
+    target_ch = None
+    for ch in guild.text_channels:
+        if ch.name.lower() == clean_target or clean_target in ch.name.lower():
+            target_ch = ch
+            break
+    if not target_ch:
+        return {"error": f"Text channel '{channel_name}' not found in this server."}
+    if not target_ch.permissions_for(guild.me).send_messages:
+        return {"error": f"No permission to send messages in #{target_ch.name}."}
+    clean_msg = sanitize_output_text(message_text)
+    if not clean_msg:
+        return {"error": "Message text cannot be empty."}
+    await target_ch.send(clean_msg)
+    logger.info(f"[CHANNEL SWITCH ACTION] Sent message to #{target_ch.name}: '{clean_msg[:60]}'")
+    return {"status": "success", "channel": target_ch.name, "message_sent": clean_msg}
+
+
 async def execute_set_slowmode(channel: discord.abc.Messageable, seconds: int, reason: str = "") -> Dict[str, Any]:
     cd = check_admin_cooldown("set_slowmode")
     if cd:
@@ -2203,31 +2236,86 @@ async def execute_react_to_message(target_message: Optional[discord.Message], em
 # ---------------------------------------------------------------------------
 # 8. VOICE CHANNEL & GEMINI LIVE AUDIO / TTS SPEAKING ENGINE
 # ---------------------------------------------------------------------------
+async def synthesize_gemini_live_audio(clean_speech: str) -> Optional[str]:
+    """
+    Synthesizes ultra-realistic human audio via Gemini Multimodal Live API.
+    Uses 'Puck' voice for high-energy witty discord delivery.
+    """
+    if not genai_client:
+        return None
+    for live_model in ("gemini-2.0-flash-exp", "gemini-2.0-flash-realtime-exp"):
+        try:
+            live_config = {
+                "response_modalities": ["AUDIO"],
+                "speech_config": {
+                    "voice_config": {
+                        "prebuilt_voice_config": {
+                            "voice_name": "Puck"
+                        }
+                    }
+                }
+            }
+            async with asyncio.timeout(6.0):
+                async with genai_client.aio.live.connect(model=live_model, config=live_config) as session:
+                    await session.send(input=f"Say this out loud naturally with expressive witty human discord tone: {clean_speech}", end_of_turn=True)
+                    audio_chunks = []
+                    async for response in session.receive():
+                        server_content = getattr(response, "server_content", None)
+                        if server_content and getattr(server_content, "model_turn", None):
+                            for part in server_content.model_turn.parts:
+                                inline_data = getattr(part, "inline_data", None)
+                                if inline_data and getattr(inline_data, "data", None):
+                                    audio_chunks.append(inline_data.data)
+                        if server_content and getattr(server_content, "turn_complete", False):
+                            break
+                    if audio_chunks:
+                        raw_pcm = b"".join(audio_chunks)
+                        fd, tmp_wav = tempfile.mkstemp(suffix=".wav")
+                        os.close(fd)
+                        with wave.open(tmp_wav, "wb") as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(2)
+                            wf.setframerate(24000)
+                            wf.writeframes(raw_pcm)
+                        logger.info(f"[VOICE SYNTHESIS] Gemini Live generated {len(raw_pcm)} bytes PCM via {live_model}")
+                        return tmp_wav
+        except Exception as e:
+            logger.debug(f"Gemini live audio error ({live_model}): {e}")
+    return None
+
+
 async def synthesize_voice_audio_to_file(text_to_speak: str) -> Optional[str]:
     """
     Synthesizes spoken audio for Discord Voice Channels:
-    1. Microsoft Edge Neural TTS (edge-tts) -> MP3 file
-    2. Google Translate TTS HTTP stream (zero external dependencies) -> MP3 file
+    1. Gemini Multimodal Live API ('Puck' / 'Charon') -> WAV file
+    2. Microsoft Edge Conversational Neural TTS (Brian / Andrew Multilingual) -> MP3 file
+    3. Google Translate TTS HTTP stream (zero external dependencies) -> MP3 file
     """
     clean_speech = re.sub(r"<@!?\d+>|<#\d+>|<a?:[a-zA-Z0-9_]+:\d+>", "", text_to_speak)
     clean_speech = re.sub(r"\|{2,}", ". ", clean_speech).strip()[:320]
     if not clean_speech:
         return None
 
-    # Tier 1: Microsoft Edge Neural TTS (expressive, natural human inflection, ~0.4s)
-    if EDGE_TTS_AVAILABLE:
-        try:
-            fd, tmp_mp3 = tempfile.mkstemp(suffix=".mp3")
-            os.close(fd)
-            communicate = edge_tts.Communicate(clean_speech, voice="en-US-ChristopherNeural", rate="+6%")
-            await communicate.save(tmp_mp3)
-            if os.path.exists(tmp_mp3) and os.path.getsize(tmp_mp3) > 200:
-                logger.info(f"[VOICE SYNTHESIS] Edge-TTS generated {os.path.getsize(tmp_mp3)} bytes for: '{clean_speech[:40]}'")
-                return tmp_mp3
-        except Exception as e:
-            logger.warning(f"Edge-TTS synthesis fallback: {e}")
+    # Tier 1: Gemini Live Realtime Audio
+    gem_live = await synthesize_gemini_live_audio(clean_speech)
+    if gem_live:
+        return gem_live
 
-    # Tier 2: Google Translate TTS HTTP Endpoint (zero dependencies, reliable universal fallback)
+    # Tier 2: Microsoft Edge Conversational Multilingual Neural Voices (Brian & Andrew)
+    if EDGE_TTS_AVAILABLE:
+        for voice_name in ("en-US-BrianMultilingualNeural", "en-US-AndrewMultilingualNeural", "en-US-ChristopherNeural"):
+            try:
+                fd, tmp_mp3 = tempfile.mkstemp(suffix=".mp3")
+                os.close(fd)
+                communicate = edge_tts.Communicate(clean_speech, voice=voice_name, rate="+4%")
+                await communicate.save(tmp_mp3)
+                if os.path.exists(tmp_mp3) and os.path.getsize(tmp_mp3) > 200:
+                    logger.info(f"[VOICE SYNTHESIS] Edge-TTS ({voice_name}) generated {os.path.getsize(tmp_mp3)} bytes for '{clean_speech[:40]}'")
+                    return tmp_mp3
+            except Exception as e:
+                logger.debug(f"Edge-TTS ({voice_name}) error: {e}")
+
+    # Tier 3: Google Translate TTS HTTP Endpoint (zero dependencies, reliable universal fallback)
     if http_session:
         try:
             tts_url = (
@@ -2612,6 +2700,18 @@ def build_genai_tools(allow_gif: bool = True) -> List[types.Tool]:
             },
         ),
         types.FunctionDeclaration(
+            name="send_message_to_channel",
+            description="Sends a chat message to another text channel in this Discord server (e.g. to #general, #test, etc.).",
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "channel_name": {"type": "STRING", "description": "Target channel name (e.g. 'general' or '#general')."},
+                    "message_text": {"type": "STRING", "description": "Message to send to that channel."},
+                },
+                "required": ["channel_name", "message_text"],
+            },
+        ),
+        types.FunctionDeclaration(
             name="set_slowmode",
             description="Sets or removes slowmode (0 to 30 seconds) in the current channel when chat is chaotic or someone is spamming.",
             parameters={
@@ -2879,6 +2979,10 @@ async def dispatch_tool_call(
             res = await execute_change_my_status(args.get("status_text", ""), args.get("status_type", "online"))
         elif func_name == "rename_channel":
             res = await execute_rename_channel(channel, args.get("new_name", ""))
+        elif func_name == "send_message_to_channel":
+            if not guild:
+                return {"error": "No guild context."}
+            res = await execute_send_message_to_channel(guild, args.get("channel_name", ""), args.get("message_text", ""))
         elif func_name == "set_slowmode":
             res = await execute_set_slowmode(channel, _safe_int(args.get("seconds"), 5), args.get("reason", ""))
         elif func_name == "create_server_emoji":
@@ -4265,6 +4369,12 @@ async def on_ready() -> None:
         f"Voice PyNaCl: {VOICE_NACL_AVAILABLE} | Opus Loaded: {discord.opus.is_loaded()} | "
         f"Edge-TTS: {EDGE_TTS_AVAILABLE} | FFmpeg: {FFMPEG_EXECUTABLE}"
     )
+
+    try:
+        if bot.user and bot.user.avatar is None:
+            asyncio.create_task(execute_change_my_avatar("cool sleek glowing cyberpunk anime robot with purple shades profile icon"))
+    except Exception as e:
+        logger.debug(f"Initial avatar setup skipped: {e}")
 
     if not emotional_spring_maintenance_loop.is_running():
         emotional_spring_maintenance_loop.start()

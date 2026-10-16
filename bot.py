@@ -690,6 +690,10 @@ def format_outgoing_mentions(
     if not text or not guild:
         return text
 
+    # Strip enclosing backticks around mentions or channels if model outputted `@name` or `#channel`
+    text = re.sub(r"`@([a-zA-Z0-9_.\-]+)`", r"@\1", text)
+    text = re.sub(r"`#([a-zA-Z0-9_.\-]+)`", r"#\1", text)
+
     # 1. DISCORD CHANNEL TAGS: Convert #channel-name to clickable Discord link <#channel_id>
     if "#" in text:
         ch_candidates: List[Tuple[str, int]] = []
@@ -708,6 +712,11 @@ def format_outgoing_mentions(
     # 2. DISCORD USER MENTIONS: Convert @username to real clickable mention <@uid>
     my_id = guild.me.id if guild.me else 0
     member_candidates: List[Tuple[str, int]] = []
+    if CREATOR_USER_ID:
+        member_candidates.append(("dogee", CREATOR_USER_ID))
+    elif guild.owner:
+        member_candidates.append(("dogee", guild.owner.id))
+
     for m in guild.members:
         if m.id == my_id:
             continue

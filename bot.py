@@ -5,9 +5,12 @@ import re
 import json
 import math
 import time
+import wave
+import shutil
 import random
 import asyncio
 import logging
+import tempfile
 import urllib.parse
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -22,6 +25,25 @@ from PIL import Image
 from google import genai
 from google.genai import types
 
+# Optional Voice / FFmpeg / Neural TTS dependencies (graceful fallback if not installed)
+try:
+    import nacl  # type: ignore  # noqa: F401
+    VOICE_NACL_AVAILABLE = True
+except ImportError:
+    VOICE_NACL_AVAILABLE = False
+
+try:
+    import imageio_ffmpeg  # type: ignore
+    FFMPEG_EXECUTABLE = shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    FFMPEG_EXECUTABLE = shutil.which("ffmpeg") or "ffmpeg"
+
+try:
+    import edge_tts  # type: ignore
+    EDGE_TTS_AVAILABLE = True
+except ImportError:
+    EDGE_TTS_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # 1. LOGGING, ENVIRONMENT & PERSISTENT STORAGE
 # ---------------------------------------------------------------------------
@@ -30,7 +52,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("AutonomousMetaBotV10")
+logger = logging.getLogger("AutonomousMetaBotV11")
 
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -84,7 +106,7 @@ active_groq_model: str = GROQ_MODEL_CANDIDATES[0]
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODELS_ENDPOINT = "https://api.groq.com/openai/v1/models"
 
-# Silent Python filter for corporate AI disclaimers & corny sci-fi/theatre-kid clichés
+# Silent Python filter for corporate AI disclaimers, corny sci-fi/theatre-kid clichés, and stiff LLM-isms
 BANNED_WORDS_MAP = {
     r"\bas an ai\b": "honestly",
     r"\bas a large language model\b": "honestly",
@@ -110,7 +132,37 @@ BANNED_WORDS_MAP = {
     r"\btranslucent silhouette\b": "messages",
     r"\bthe void\b": "this channel",
     r"\bthe abyss\b": "this server",
+    r"\boh,\s*how the turntables\b": "well well well",
+    r"\bhow the turntables\b": "crazy how that works",
+    r"\btouché\b": "fair enough",
+    r"\ballow me to\b": "let me",
+    r"\bi must admit\b": "ngl",
+    r"\bi must say\b": "honestly",
+    r"\bmy dear friend\b": "bro",
+    r"\bmy good sir\b": "bro",
+    r"\bchaos ensues\b": "it gets messy",
+    r"\bbuckle up\b": "get ready",
+    r"\Aah,\s+": "",
 }
+
+
+def _safe_int(val: Any, default: int = 0) -> int:
+    if val is None or isinstance(val, bool):
+        return default
+    if isinstance(val, (int, float)):
+        return int(val)
+    m = re.search(r"-?\d+", str(val))
+    return int(m.group(0)) if m else default
+
+
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    if val is None or isinstance(val, bool):
+        return default
+    if isinstance(val, (int, float)):
+        return float(val)
+    m = re.search(r"-?\d+(?:\.\d+)?", str(val))
+    return float(m.group(0)) if m else default
+
 
 # ---------------------------------------------------------------------------
 # 2. DISCORD CLIENT, CONCURRENCY & STATE BUFFERS
@@ -120,6 +172,7 @@ intents.message_content = True
 intents.members = True
 intents.reactions = True
 intents.presences = True
+intents.voice_states = True
 
 bot = discord.Client(intents=intents)
 genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
@@ -130,74 +183,66 @@ memory_state: Dict[str, Any] = {}
 memory_dirty: bool = False
 
 recently_processed_messages: deque = deque(maxlen=500)
-channel_buffers: Dict[int, deque] = defaultdict(lambda: deque(maxlen=40))
+channel_buffers: Dict[int, deque] = defaultdict(lambda: deque(maxlen=45))
 active_generation_tasks: Dict[int, asyncio.Task] = {}
 channel_sending_lock: Dict[int, bool] = defaultdict(bool)
 
-# Gated Sniping Caches
+# Live Server Event & Sniping Caches
 deleted_message_cache: Dict[int, Dict[str, Any]] = {}
 edited_message_cache: Dict[int, Dict[str, Any]] = {}
 user_snipe_cooldowns: Dict[int, float] = defaultdict(float)
+live_server_events_feed: Dict[int, deque] = defaultdict(lambda: deque(maxlen=25))
+proactive_event_cooldowns: Dict[str, float] = defaultdict(float)
 
-# Conversation Flow, Proactive Ghost-Followup, GIF Cooldown & Mood Variety State
+# Multi-Horizon Proactive Autonomy & Conversation Continuity State
 channel_last_activity_epoch: Dict[int, float] = defaultdict(float)
 channel_last_bot_spoke_epoch: Dict[int, float] = defaultdict(float)
 channel_last_human_speaker: Dict[int, str] = {}
 channel_last_human_content: Dict[int, str] = {}
-channel_proactive_followup_count: Dict[int, int] = defaultdict(int)
+channel_proactive_stage: Dict[int, int] = defaultdict(int)
 channel_next_proactive_epoch: Dict[int, float] = defaultdict(float)
 
 channel_last_gif_epoch: Dict[int, float] = defaultdict(float)
 channel_messages_since_gif: Dict[int, int] = defaultdict(lambda: 99)
 channel_stepped_back_until: Dict[int, float] = defaultdict(float)
 channel_thread_exchange_count: Dict[int, int] = defaultdict(int)
-channel_recent_length_modes: Dict[int, deque] = defaultdict(lambda: deque(maxlen=6))
 channel_last_tool_summaries: Dict[int, List[str]] = defaultdict(list)
-consecutive_negative_mood_turns: int = 0
+voice_speaking_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
-# Responsive Admin Cooldowns (Low on harmless fun actions, 30-60m on channel creation)
+# Responsive Admin Cooldowns (Prevents accidental rate-limit abuse while allowing spontaneous moves)
 admin_tool_cooldowns: Dict[str, float] = defaultdict(float)
 ADMIN_COOLDOWN_SECONDS = {
-    "change_my_nickname": 15.0,
-    "change_nickname": 20.0,
-    "change_my_status": 10.0,
-    "set_channel_topic": 45.0,
-    "pin_message": 30.0,
-    "create_role": 180.0,
-    "assign_role": 20.0,
-    "remove_role": 20.0,
-    "rename_channel": 300.0,
-    "create_server_emoji": 120.0,
-    "create_server_sticker": 120.0,
-    "change_my_avatar": 300.0,
-    "timeout_user": 180.0,
-    "create_text_channel": 2400.0,  # 40-minute hard cooldown
+    "change_my_nickname": 12.0,
+    "change_nickname": 15.0,
+    "change_my_status": 8.0,
+    "set_channel_topic": 35.0,
+    "pin_message": 20.0,
+    "unpin_message": 20.0,
+    "delete_message": 25.0,
+    "set_slowmode": 45.0,
+    "create_thread": 90.0,
+    "create_poll": 90.0,
+    "create_role": 120.0,
+    "assign_role": 15.0,
+    "remove_role": 15.0,
+    "rename_channel": 240.0,
+    "create_server_emoji": 90.0,
+    "create_server_sticker": 90.0,
+    "change_my_avatar": 240.0,
+    "voice_moderate_member": 20.0,
+    "timeout_user": 120.0,
+    "kick_user": 1800.0,           # 30-minute safety cooldown on extreme kicks
+    "create_text_channel": 2400.0, # 40-minute cooldown on creating channels
 }
 
 # ---------------------------------------------------------------------------
-# 3. PERSISTENT MEMORY, TIME-AWARENESS & ANTI-STUCK MOOD ENGINE
+# 3. PERSISTENT MEMORY & EMERGENT UNSCRIPTED EMOTIONAL ENGINE
 # ---------------------------------------------------------------------------
 BASELINE_SLIDERS = {
-    "valence": 50.0,   # -100 (Sad/Dramatic) <---> +100 (Jolly/Goofy/Hyped)
-    "arousal": 55.0,   # -100 (Sleepy/Chill) <---> +100 (Chaotic/Energetic)
-    "patience": 55.0,  # -100 (Sassy/Petty) <---> +100 (Wholesome/Friendly)
+    "valence": 50.0,   # -100 (Heartbroken/Miserable/Furious) <---> +100 (Jolly/Goofy/Hyped/Euphoric)
+    "arousal": 55.0,   # -100 (Exhausted/Deadpan/Existential) <---> +100 (Chaotic/Manic/Heated/Hyper)
+    "patience": 55.0,  # -100 (Snapped/Ruthless/Done-With-You) <---> +100 (Sweet/Wholesome/Forgiving)
 }
-
-DYNAMIC_MOOD_WHEEL = [
-    "jolly/wholesome",
-    "goofy/brainrot",
-    "playful/teasing",
-    "curious/nosy",
-    "scheming/instigating",
-    "existential crisis",
-    "dramatic/heartbroken",
-]
-
-NEGATIVE_MOOD_KEYWORDS = (
-    "mad", "heated", "angry", "annoyed", "triggered", "hostile",
-    "petty", "roasty", "irritated", "defensive", "aggressive",
-    "pissed", "fuming", "salty", "bitter", "snarky", "sulking",
-)
 
 DEFAULT_MEMORY = {
     "emotional_state": {
@@ -209,6 +254,10 @@ DEFAULT_MEMORY = {
     },
     "opinions": {},
     "last_active_channel_id": None,
+    "last_channel_activity_epoch": 0.0,
+    "last_human_speaker_name": "",
+    "last_human_message_text": "",
+    "proactive_stage_persisted": 0,
     "user_affinity": {},
     "episodic_lore": [],
     "active_commitments": [],
@@ -238,6 +287,19 @@ def format_relative_age(iso_or_epoch: Any) -> str:
         return f"{days}d ago - OLD" if days >= 2 else f"{days}d ago"
     except Exception:
         return "7d ago - OLD"
+
+
+def format_duration_human(seconds: float) -> str:
+    if seconds < 60:
+        return f"{int(seconds)} seconds"
+    if seconds < 3600:
+        mins = int(seconds // 60)
+        return f"{mins} minute{'s' if mins != 1 else ''}"
+    if seconds < 86400:
+        hrs = round(seconds / 3600.0, 1)
+        return f"{hrs} hours"
+    days = round(seconds / 86400.0, 1)
+    return f"{days} days"
 
 
 def recursive_merge_defaults(target: Dict[str, Any], defaults: Dict[str, Any]) -> bool:
@@ -276,7 +338,6 @@ def load_memory_state_sync() -> Dict[str, Any]:
             with open(MEMORY_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             recursive_merge_defaults(data, DEFAULT_MEMORY)
-            data["emotional_state"] = json.loads(json.dumps(DEFAULT_MEMORY["emotional_state"]))
 
             for uid, u_prof in list(data.get("user_affinity", {}).items()):
                 if isinstance(u_prof, dict) and isinstance(u_prof.get("notes"), list):
@@ -288,7 +349,7 @@ def load_memory_state_sync() -> Dict[str, Any]:
                             normalized_notes.append(n)
                         elif isinstance(n, str) and n.strip():
                             normalized_notes.append({"text": n.strip()[:140], "timestamp": datetime.now(AMSTERDAM_TZ).isoformat()})
-                    u_prof["notes"] = normalized_notes[-8:]
+                    u_prof["notes"] = normalized_notes[-10:]
 
             memory_state = data
             _sync_write_memory(memory_state)
@@ -358,30 +419,40 @@ async def discord_cloud_backup_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 4. ANTI-STUCK DYNAMIC EMOTIONAL ENGINE (NEVER STAYS MAD ALL THE TIME)
+# 4. CONTINUOUS EMERGENT EMOTIONAL ENGINE (REALISTIC, UNSCRIPTED MOODS)
 # ---------------------------------------------------------------------------
 def derive_emergent_mood(valence: float, arousal: float, patience: float) -> str:
-    if valence < -25 and patience >= -20:
-        return "dramatic/heartbroken"
-    if patience < -40 and valence < -30:
-        return "heated/roasty" if arousal > 15 else "dramatic/heartbroken"
+    """
+    Maps 3D continuous coordinates (valence, arousal, patience) to a rich emergent mood
+    ONLY when the router doesn't provide its own nuanced mood description.
+    Allows staying genuinely furious/mad when provoked, or shifting across a wide spectrum.
+    """
+    if patience <= -65 and valence <= -50:
+        return "genuinely furious / ready to snap" if arousal > 20 else "cold-blooded / done with you"
+    if patience <= -35 and valence <= -25:
+        return "heated / ruthless roasting" if arousal > 10 else "bitter / holding a grudge"
+    if valence <= -35 and patience > -35:
+        return "dramatically heartbroken / betrayed" if arousal > -20 else "sulking / pouting in the corner"
     if valence < -15 and abs(arousal) <= 30:
-        return "existential crisis"
-    if arousal < -35:
-        return "existential crisis"
-    if valence > 55 and arousal > 55:
-        return "goofy/brainrot" if random.random() < 0.55 else "jolly/wholesome"
-    if valence > 30 and patience > 30:
-        return "jolly/wholesome"
-    if arousal > 35 and patience < 15:
-        return "scheming/instigating"
-    return random.choice(["playful/teasing", "curious/nosy", "jolly/wholesome", "goofy/brainrot"])
+        return "existential dread / spiraling"
+    if arousal <= -40:
+        return "deadpan / low-battery existential"
+    if valence >= 60 and arousal >= 60:
+        return "chaotic brainrot / unhinged hype"
+    if valence >= 40 and patience >= 40:
+        return "jolly / wholesome / gassing up friends"
+    if arousal >= 40 and patience < 15:
+        return "scheming / instigating chaos"
+    if valence >= 20 and arousal >= 20:
+        return "playful / teasing banter"
+    return "curious / nosy / vibing"
 
 
 def decay_emotional_sliders_only(accelerate_recovery: bool = False) -> Dict[str, Any]:
     """
-    Applies passive 5-minute (300s) spring decay toward baseline (valence +50, arousal +55, patience +55)
-    WITHOUT resetting consecutive_negative_mood_turns or clobbering active turn mood tracking.
+    Applies natural time-based spring decay toward baseline (valence +50, arousal +55, patience +55).
+    If a user is actively provoking the bot right now, deltas overpower decay so it can stay mad;
+    when left alone or treated warmly, it naturally cools off over time.
     """
     st = memory_state.setdefault("emotional_state", dict(DEFAULT_MEMORY["emotional_state"]))
     now = time.time()
@@ -390,7 +461,8 @@ def decay_emotional_sliders_only(accelerate_recovery: bool = False) -> Dict[str,
     if dt < 1.0:
         return st
 
-    half_life = 180.0 if accelerate_recovery else 300.0
+    # 8-minute natural half-life (or 2.5-minute fast recovery when someone apologizes/makes it laugh)
+    half_life = 150.0 if accelerate_recovery else 480.0
     decay_factor = math.pow(0.5, dt / half_life)
 
     for axis, base_val in BASELINE_SLIDERS.items():
@@ -398,8 +470,7 @@ def decay_emotional_sliders_only(accelerate_recovery: bool = False) -> Dict[str,
         decayed = base_val + (curr - base_val) * decay_factor
         st[axis] = round(max(-100.0, min(100.0, decayed)), 1)
 
-    # If sliders have significantly recovered over idle time, refresh mood label toward warm baseline
-    if dt > 240.0 and any(k in str(st.get("mood_label", "")).lower() for k in NEGATIVE_MOOD_KEYWORDS):
+    if dt > 600.0:
         st["mood_label"] = derive_emergent_mood(st["valence"], st["arousal"], st["patience"])
 
     st["last_updated_epoch"] = now
@@ -410,16 +481,14 @@ def apply_spring_decay_and_shift(
     shift: Optional[Dict[str, Any]] = None,
     is_major_trigger: bool = True,
     accelerate_recovery: bool = False,
-    count_turn: bool = True,
 ) -> Dict[str, Any]:
     """
-    Fast 5-minute emotional half-life + Anti-Stuck Breaker:
-    Never allows the bot to stay in a mad/heated/petty mood for more than 2 turns in a row.
+    Updates the continuous 3D emotional sliders based on the Prefrontal Router's reading
+    of the conversation—no artificial 2-turn reset script!
     """
-    global consecutive_negative_mood_turns
     st = decay_emotional_sliders_only(accelerate_recovery=accelerate_recovery)
     now = time.time()
-    clamp_limit = 50.0 if is_major_trigger else 30.0
+    clamp_limit = 55.0 if is_major_trigger else 35.0
 
     for axis, base_val in BASELINE_SLIDERS.items():
         curr = float(st.get(axis, base_val))
@@ -436,33 +505,13 @@ def apply_spring_decay_and_shift(
     computed = derive_emergent_mood(st["valence"], st["arousal"], st["patience"])
     candidate_mood = suggested.strip() if (suggested and isinstance(suggested, str) and suggested.strip()) else computed
 
-    if count_turn:
-        is_neg = any(k in candidate_mood.lower() for k in NEGATIVE_MOOD_KEYWORDS)
-        if is_neg:
-            consecutive_negative_mood_turns += 1
-            # ANTI-STUCK ANGER BREAKER: Never allow more than 2 turns in a row in a mad/heated/petty mood!
-            if consecutive_negative_mood_turns > 2:
-                consecutive_negative_mood_turns = 0
-                st["valence"] = max(35.0, st["valence"] + 45.0)
-                st["patience"] = max(45.0, st["patience"] + 50.0)
-                candidate_mood = random.choice([
-                    "dramatic/heartbroken",
-                    "goofy/brainrot",
-                    "existential crisis",
-                    "jolly/wholesome",
-                    "scheming/instigating",
-                ])
-                logger.info(f"[MOOD SHIFTER] Snapped out of negative mood loop -> {candidate_mood}")
-        else:
-            consecutive_negative_mood_turns = 0
-
     st["mood_label"] = candidate_mood
     st["last_updated_epoch"] = now
     return st
 
 
 # ---------------------------------------------------------------------------
-# 5. MENTION RESOLVERS, SOCIAL CONTEXT, LENGTH ENFORCER & BUFFERS
+# 5. MENTION RESOLVERS, SOCIAL CONTEXT, QUIET/WAKE-UP DETECTOR & BUFFERS
 # ---------------------------------------------------------------------------
 def is_creator(user: Any) -> bool:
     if not user:
@@ -494,7 +543,25 @@ def humanize_incoming_mentions(content: str, guild: Optional[discord.Guild]) -> 
                 return f"@{member.display_name}"
         return "@someone"
 
+    def _replace_channel(match: re.Match) -> str:
+        cid = int(match.group(1))
+        if guild:
+            ch = guild.get_channel(cid)
+            if ch:
+                return f"#{ch.name}"
+        return "#channel"
+
+    def _replace_role(match: re.Match) -> str:
+        rid = int(match.group(1))
+        if guild:
+            role = guild.get_role(rid)
+            if role:
+                return f"@{role.name}"
+        return "@role"
+
     text = re.sub(r"<@!?(\d+)>", _replace_user, content)
+    text = re.sub(r"<#(\d+)>", _replace_channel, text)
+    text = re.sub(r"<@&(\d+)>", _replace_role, text)
     text = re.sub(r"<a?:([a-zA-Z0-9_]+):\d+>", r":\1:", text)
     return text.strip()
 
@@ -511,14 +578,14 @@ def detect_target_member_to_engage(
     if not content or not guild:
         return None
     action_match = re.search(
-        r"\b(?:talk\s+to|taunt|roast|tell|ask|ping|poke|flame|cook|bully|drag|confront|message|get)\s+@?([a-zA-Z0-9_.\-]{2,32})",
+        r"\b(?:talk\s+to|taunt|roast|tell|ask|ping|poke|flame|cook|bully|drag|confront|message|get|humble|pack\s+up)\s+@?([a-zA-Z0-9_.\-]{2,32})",
         content,
         flags=re.IGNORECASE,
     )
     if not action_match:
         return None
     target_token = action_match.group(1).strip()
-    if target_token.lower() in ("me", "him", "her", "them", "everyone", "someone", "here", "chat", "bro"):
+    if target_token.lower() in ("me", "him", "her", "them", "everyone", "someone", "here", "chat", "bro", "us", "it"):
         return None
     mem = find_member(guild, target_token)
     if mem and not mem.bot and mem.id != author_id:
@@ -528,16 +595,43 @@ def detect_target_member_to_engage(
 
 def detect_hush_command(content: str, is_direct_or_active: bool) -> bool:
     """
-    Detects when someone tells the bot 'Be very very quiet', 'shh', 'hush', 'shut up', etc.
+    Detects when someone explicitly tells the bot 'Be very very quiet', 'shh', 'hush', 'shut up', 'stop talking', etc.
     """
     if not content or not is_direct_or_active:
         return False
     cleaned = re.sub(r"<@!?\d+>", "", content).strip().lower()
     hush_pattern = (
-        r"(?:^|\b)(?:shh+|shush|hush|be\s+(?:very\s+)*quiet|stay\s+quiet|"
-        r"stop\s+talking|shut\s+up|zip\s+it|pipe\s+down|don'?t\s+speak|go\s+quiet)(?:\b|$)"
+        r"(?:\A|\b)(?:shh+|shush|hush|be\s+(?:very\s+)*quiet|stay\s+quiet|"
+        r"stop\s+talking|shut\s+up|zip\s+it|pipe\s+down|don'?t\s+speak|go\s+quiet|mute\s+yourself)(?:\b|\Z)"
     )
     return bool(re.search(hush_pattern, cleaned, flags=re.IGNORECASE))
+
+
+def detect_implicit_wakeup_or_checkin(content: str, is_stepped_back: bool, seconds_since_bot_spoke: float) -> bool:
+    """
+    Detects when a human checks if the bot is still there, tells it to wake up / talk again,
+    or comments on it being quiet—even WITHOUT an @ping!
+    """
+    if not content:
+        return False
+    if not is_stepped_back and seconds_since_bot_spoke > 900.0:
+        return False
+
+    cleaned = re.sub(r"<@!?\d+>", "", content).strip().lower()
+    wakeup_patterns = [
+        r"\b(?:are\s+you|u|you)\s+(?:still\s+)?(?:there|here|awake|alive|listening|around|mad|pouting|sulking|ignoring|quiet|muted)\b",
+        r"\b(?:still\s+there|still\s+here|still\s+mad|still\s+quiet)\b",
+        r"\A(?:hello\??|yo\??|hey\??|bot\??|bro\??|uh\s+hello\??|hellooo+\??)\Z",
+        r"\b(?:where\s+did\s+(?:you|he|it|bro)\s+go|where'?d\s+(?:you|he|it|bro)\s+go)\b",
+        r"\b(?:you\s+can\s+(?:talk|speak)|talk\s+now|speak\s+now|say\s+something|unmute|wake\s+up|come\s+back|stop\s+ignoring)\b",
+        r"\b(?:why\s+(?:are\s+you|u|so)\s+(?:quiet|silent)|did\s+(?:he|it|bro|you)\s+(?:actually\s+)?(?:shut\s+up|stop\s+talking|leave|die))\b",
+        r"\b(?:he|it|bro)\s+actually\s+(?:shut\s+up|stopped\s+talking|listened|went\s+quiet)\b",
+        r"\b(?:i\s+missed\s+you|im\s+sorry|i'?m\s+sorry|my\s+bad|apologize|forgive\s+me)\b",
+    ]
+    for pat in wakeup_patterns:
+        if re.search(pat, cleaned, flags=re.IGNORECASE):
+            return True
+    return False
 
 
 def format_outgoing_mentions(
@@ -553,18 +647,10 @@ def format_outgoing_mentions(
     # 1. Strip @CurrentSpeaker prefix/mentions unless allow_speaker_ping is True
     if current_speaker_name and not allow_speaker_ping and "@" in text:
         escaped_spk = re.escape(current_speaker_name)
-        text = re.sub(
-            rf"""^\s*@{escaped_spk}(?=\$|\s|[.,!?:;'"\)])[:,]?\s*""",
-            "",
-            text,
-            flags=re.IGNORECASE,
-        )
-        text = re.sub(
-            rf"""(?<!<)@{escaped_spk}(?=\$|\s|[.,!?:;'"\)])""",
-            current_speaker_name,
-            text,
-            flags=re.IGNORECASE,
-        )
+        pat_leading = rf"\A\s*@{escaped_spk}(?=\Z|\s|[.,!?:;\x22\x27\)\]])[:,]?\s*"
+        pat_inline = rf"(?<!<)@{escaped_spk}(?=\Z|\s|[.,!?:;\x22\x27\)\]])"
+        text = re.sub(pat_leading, "", text, flags=re.IGNORECASE)
+        text = re.sub(pat_inline, current_speaker_name, text, flags=re.IGNORECASE)
 
     # 2. Convert any @MemberName in text to <@uid> (works even if display_name has symbols/spaces)
     if "@" in text:
@@ -580,7 +666,7 @@ def format_outgoing_mentions(
         for name_str, uid in candidates:
             if not allow_speaker_ping and name_str.lower() == current_speaker_name.lower():
                 continue
-            pattern = rf"""(?<!<)@{re.escape(name_str)}(?=\$|\s|[.,!?:;'"\)])"""
+            pattern = rf"(?<!<)@{re.escape(name_str)}(?=\Z|\s|[.,!?:;\x22\x27\)\]])"
             if re.search(pattern, text, flags=re.IGNORECASE):
                 text = re.sub(pattern, f"<@{uid}>", text, flags=re.IGNORECASE)
 
@@ -600,21 +686,37 @@ def format_outgoing_mentions(
     return text.strip()
 
 
-def schedule_next_proactive_followup(channel_id: int, followup_stage: int) -> None:
+def schedule_next_proactive_window(channel_id: int, stage: int, active_convo: bool = True) -> None:
     """
-    Schedules autonomous proactive follow-up after 1.5 to 4 minutes (90s to 240s) of silence.
-    Capped at 2 unanswered proactive messages in a row.
+    Multi-Horizon Proactive Autonomy Scheduler:
+    - Stage 0 (Mid-convo ghost follow-up): 5 to 12 minutes (300s to 720s) ONLY if an active conversation was happening;
+      otherwise schedules directly for the Multi-Hour horizon (3 to 6 hours).
+    - Stage 1 (Multi-Hour dead-chat revival): 3.5 to 7 hours (12600s to 25200s) of server silence.
+    - Stage 2 (Multi-Day dead-server revival): 24 to 36 hours (86400s to 129600s) of silence.
+    - Stage 3+: Every 48 hours if the server remains completely untouched for days.
     """
     now = time.time()
     channel_last_activity_epoch[channel_id] = now
-    if followup_stage == 0:
-        delay = random.uniform(90.0, 210.0)   # 1.5 to 3.5 minutes
-        channel_next_proactive_epoch[channel_id] = now + delay
-    elif followup_stage == 1:
-        delay = random.uniform(110.0, 240.0)  # ~1.8 to 4.0 minutes
-        channel_next_proactive_epoch[channel_id] = now + delay
+
+    if stage == 0 and active_convo:
+        delay = random.uniform(300.0, 660.0)        # 5 to 11 minutes for mid-convo vanish
+    elif stage <= 1:
+        delay = random.uniform(12600.0, 23400.0)    # 3.5 to 6.5 hours for quiet server check-in
+    elif stage == 2:
+        delay = random.uniform(82800.0, 115200.0)   # ~23 to 32 hours (1+ day dead chat)
     else:
-        channel_next_proactive_epoch[channel_id] = now + 86400.0
+        delay = random.uniform(129600.0, 172800.0)  # 36 to 48 hours (multi-day dead chat)
+
+    channel_next_proactive_epoch[channel_id] = now + delay
+
+
+def record_server_event(guild_id: int, description: str) -> None:
+    now_ams = datetime.now(AMSTERDAM_TZ).strftime("%H:%M")
+    live_server_events_feed[guild_id].append({
+        "time": now_ams,
+        "epoch": time.time(),
+        "event": description,
+    })
 
 
 def record_buffer_message(
@@ -633,13 +735,18 @@ def record_buffer_message(
     now_ams = datetime.now(AMSTERDAM_TZ)
     now_ts = now_utc.timestamp()
     channel_last_activity_epoch[channel_id] = now_ts
+
     if is_bot:
         channel_last_bot_spoke_epoch[channel_id] = now_ts
     else:
         channel_last_human_speaker[channel_id] = sender
         channel_last_human_content[channel_id] = content
-        channel_proactive_followup_count[channel_id] = 0
-        schedule_next_proactive_followup(channel_id, followup_stage=0)
+        channel_proactive_stage[channel_id] = 0
+        memory_state["last_channel_activity_epoch"] = now_ts
+        memory_state["last_human_speaker_name"] = sender
+        memory_state["last_human_message_text"] = content[:200]
+        memory_state["proactive_stage_persisted"] = 0
+        schedule_next_proactive_window(channel_id, stage=0, active_convo=(channel_thread_exchange_count[channel_id] >= 1))
 
     channel_buffers[channel_id].append({
         "sender": sender,
@@ -666,7 +773,7 @@ def resolve_referenced_message(
     ref_obj = message.reference.resolved or message.reference.cached_message
     if isinstance(ref_obj, discord.Message):
         is_bot_target = bool(bot.user and ref_obj.author.id == bot.user.id)
-        snippet = humanize_incoming_mentions(ref_obj.content, message.guild)[:100]
+        snippet = humanize_incoming_mentions(ref_obj.content, message.guild)[:120]
         return ref_obj.author.display_name, snippet, is_bot_target, (not is_bot_target)
 
     ref_id = message.reference.message_id
@@ -674,7 +781,7 @@ def resolve_referenced_message(
         for rec in reversed(channel_buffers[channel_id]):
             if rec.get("message_id") == ref_id:
                 is_bot_target = bool(rec.get("is_bot", False))
-                snippet = str(rec.get("content", ""))[:100]
+                snippet = str(rec.get("content", ""))[:120]
                 return rec.get("sender"), snippet, is_bot_target, (not is_bot_target)
 
     return None, None, False, False
@@ -686,7 +793,7 @@ def get_server_custom_emojis_summary(guild: Optional[discord.Guild]) -> str:
     available = [f"<{'a' if e.animated else ''}:{e.name}:{e.id}>" for e in guild.emojis if e.available]
     if not available:
         return ""
-    sample = random.sample(available, min(12, len(available)))
+    sample = random.sample(available, min(14, len(available)))
     return ", ".join(sample)
 
 
@@ -695,7 +802,7 @@ def resolve_reaction_emoji(guild: Optional[discord.Guild], raw_emoji: str) -> An
     if not cleaned:
         return None
     if guild and guild.emojis:
-        m = re.match(r"^<a?:([a-zA-Z0-9_]+):(\d+)>$", cleaned)
+        m = re.match(r"\A<a?:([a-zA-Z0-9_]+):(\d+)>\Z", cleaned)
         if m:
             em_id = int(m.group(2))
             found = discord.utils.get(guild.emojis, id=em_id)
@@ -708,32 +815,149 @@ def resolve_reaction_emoji(guild: Optional[discord.Guild], raw_emoji: str) -> An
     return cleaned
 
 
-def extract_member_live_activity(member: Optional[discord.Member]) -> Optional[str]:
+def format_member_activities(member: Optional[discord.Member]) -> Optional[str]:
     if not member or not isinstance(member, discord.Member) or not member.activities:
         return None
-    now = time.time()
-    if now - user_snipe_cooldowns[member.id] < 7200:
-        return None
-
     parts = []
     for act in member.activities:
         if isinstance(act, discord.Spotify):
-            parts.append(f"Listening to Spotify: '{act.title}' by {act.artist}")
+            parts.append(f"Spotify: '{act.title}' by {act.artist}")
         elif isinstance(act, discord.Game):
-            parts.append(f"Playing game: {act.name}")
+            parts.append(f"Playing: {act.name}")
+        elif isinstance(act, discord.Streaming):
+            parts.append(f"Streaming: {act.name}")
         elif isinstance(act, discord.CustomActivity) and act.state:
-            parts.append(f"Custom status: '{act.state}'")
+            parts.append(f"Status: '{act.state}'")
         elif getattr(act, "name", None):
             parts.append(f"Activity: {act.name}")
-    if not parts:
-        return None
-    return " | ".join(parts)
+    return " | ".join(parts) if parts else None
+
+
+def build_live_server_radar(guild: Optional[discord.Guild], channel_id: int) -> str:
+    """
+    Gives the bot complete omniscience over everything happening in the Discord server right now:
+    - Voice channels & who is in them (streaming, camera on, muted, deafened)
+    - Online members & their live games, Spotify tracks, and custom statuses
+    - Recent server events (joins, leaves, nickname changes, reactions, deletes, edits)
+    """
+    if not guild:
+        return "No live server radar."
+
+    vc_lines = []
+    for vc in guild.voice_channels:
+        if vc.members:
+            mem_descs = []
+            for m in vc.members:
+                tags = []
+                if m.bot:
+                    tags.append("BOT/YOU" if (bot.user and m.id == bot.user.id) else "bot")
+                if m.voice:
+                    if m.voice.self_stream:
+                        tags.append("LIVE STREAMING")
+                    if m.voice.self_video:
+                        tags.append("CAM ON")
+                    if m.voice.self_deaf or m.voice.deaf:
+                        tags.append("deafened")
+                    elif m.voice.self_mute or m.voice.mute:
+                        tags.append("muted")
+                tag_str = f" ({', '.join(tags)})" if tags else ""
+                mem_descs.append(f"{m.display_name}{tag_str}")
+            vc_lines.append(f"🔊 #{vc.name}: {', '.join(mem_descs)}")
+
+    presence_lines = []
+    for m in guild.members:
+        if m.bot or m.status == discord.Status.offline:
+            continue
+        act_str = format_member_activities(m)
+        st_str = str(m.status)
+        if act_str:
+            presence_lines.append(f"{m.display_name} ({st_str}): {act_str}")
+        else:
+            presence_lines.append(f"{m.display_name} ({st_str})")
+
+    now = time.time()
+    recent_events = [
+        f"[{ev['time']}] {ev['event']}"
+        for ev in list(live_server_events_feed[guild.id])[-8:]
+        if now - ev.get("epoch", 0) < 3600
+    ]
+
+    del_snipe = deleted_message_cache.get(channel_id)
+    if del_snipe and (now - del_snipe["timestamp"] < 120):
+        recent_events.append(f"[DELETED MESSAGE] {del_snipe['author']} deleted: '{del_snipe['content']}'")
+    edit_snipe = edited_message_cache.get(channel_id)
+    if edit_snipe and (now - edit_snipe["timestamp"] < 120):
+        recent_events.append(f"[EDITED MESSAGE] {edit_snipe['author']} edited '{edit_snipe['before']}' -> '{edit_snipe['after']}'")
+
+    vc_block = " | ".join(vc_lines) if vc_lines else "All voice channels are currently empty."
+    pres_block = " ; ".join(presence_lines[:15]) if presence_lines else "No members showing online status."
+    ev_block = "\n".join(recent_events) if recent_events else "No recent background events."
+
+    return (
+        f"VOICE CHANNELS RIGHT NOW: {vc_block}\n"
+        f"ONLINE MEMBERS & LIVE ACTIVITIES: {pres_block}\n"
+        f"RECENT SERVER EVENTS & SNIPES:\n{ev_block}"
+    )
+
+
+def extract_rich_message_details(message: discord.Message) -> str:
+    """
+    Extracts every detail Discord can attach to a message: embeds, polls, stickers, voice message flags,
+    attachments metadata, and forwarded snapshots so nothing is ever invisible to the bot.
+    """
+    extras: List[str] = []
+
+    if getattr(message.flags, "voice", False):
+        extras.append("[Discord Voice Message (audio attached)]")
+
+    if message.attachments:
+        att_descs = []
+        for a in message.attachments:
+            dur = f", duration={a.duration:.1f}s" if getattr(a, "duration", None) else ""
+            att_descs.append(f"{a.filename} ({a.content_type or 'file'}{dur})")
+        extras.append(f"[Attachments: {', '.join(att_descs)}]")
+
+    if message.stickers:
+        extras.append(f"[Sticker: {', '.join(s.name for s in message.stickers)}]")
+
+    poll = getattr(message, "poll", None)
+    if poll:
+        try:
+            q_txt = getattr(poll.question, "text", str(poll.question))
+            ans_list = [f"'{getattr(ans, 'text', str(ans))}' ({getattr(ans, 'vote_count', 0)} votes)" for ans in getattr(poll, "answers", [])]
+            extras.append(f"[Discord Poll: '{q_txt}' | Options: {', '.join(ans_list)}]")
+        except Exception:
+            pass
+
+    if message.embeds:
+        for emb in message.embeds[:2]:
+            emb_parts = []
+            if emb.author and emb.author.name:
+                emb_parts.append(f"Author: {emb.author.name}")
+            if emb.title:
+                emb_parts.append(f"Title: {emb.title}")
+            if emb.description:
+                emb_parts.append(f"Desc: {emb.description[:220]}")
+            for fld in emb.fields[:4]:
+                emb_parts.append(f"{fld.name}: {fld.value[:100]}")
+            if emb.footer and emb.footer.text:
+                emb_parts.append(f"Footer: {emb.footer.text}")
+            if emb_parts:
+                extras.append(f"[Embed: {' | '.join(emb_parts)}]")
+
+    snapshots = getattr(message, "message_snapshots", None)
+    if snapshots:
+        for snap in snapshots[:1]:
+            snap_content = getattr(snap, "content", "")
+            if snap_content:
+                extras.append(f"[Forwarded Message: '{snap_content[:200]}']")
+
+    return (" " + " ".join(extras)) if extras else ""
 
 
 def sanitize_output_text(text: str, speaker_name: str = "") -> str:
     if not text:
         return ""
-    # Strip any leaked inline tool tags, thoughts, or raw Tenor URLs
     text = re.sub(r"<call:[^>]*>", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"</call>", "", text, flags=re.IGNORECASE)
     text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL | re.IGNORECASE)
@@ -742,7 +966,7 @@ def sanitize_output_text(text: str, speaker_name: str = "") -> str:
     text = re.sub(r"<thought>.*", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<think>.*", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"\[(?:Sent GIF|Posted Image|Posted Flux Art|Action taken):[^\]]*\]", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\[(?:Sent GIF|Posted Image|Posted Flux Art|Action taken|Executed tool):[^\]]*\]", "", text, flags=re.IGNORECASE)
     text = re.sub(r"https?://(?:media\d*\.|c\.|www\.)?tenor\.com/\S+", "", text, flags=re.IGNORECASE)
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -777,125 +1001,36 @@ def style_casual_fragment(frag: str) -> str:
     return frag
 
 
-def balance_length_mode(
-    channel_id: int,
-    router_length_mode: str,
-    router_burst_count: int,
-    is_test_mode: bool,
-    is_hush_mode: bool,
-    user_text: str,
-) -> Tuple[str, int]:
-    """
-    Ensures dynamic length variety across turns (~35% micro, ~40% short, ~15% stutter, ~10% rant)
-    so the bot never gets stuck writing identical 15-25 word sentences every turn.
-    """
-    if is_hush_mode:
-        return "micro", 1
-    if is_test_mode:
-        return "short", 1
-
-    mode = router_length_mode.lower().strip()
-    if mode == "medium":
-        mode = "stutter" if router_burst_count >= 3 else "short"
-    if mode not in ("micro", "short", "stutter", "rant"):
-        mode = "short"
-
-    # If user asks a deep question ("explain", "why", "tell me about", "story"), allow short/rant
-    asking_explanation = bool(re.search(r"\b(?:explain|elaborate|story|how\s+does|why\s+did|tell\s+me)\b", user_text.lower()))
-    if asking_explanation and mode == "micro":
-        mode = "short"
-
-    recent = channel_recent_length_modes[channel_id]
-    # If the router picked the same mode 2+ times in a row (or always picks 'short'), rebalance using target weights
-    if len(recent) >= 2 and all(m == mode for m in list(recent)[-2:]) and not asking_explanation:
-        roll = random.random()
-        if roll < 0.38:
-            mode = "micro"
-        elif roll < 0.75:
-            mode = "short"
-        elif roll < 0.90:
-            mode = "stutter"
-        else:
-            mode = "rant"
-    elif mode == "short" and random.random() < 0.35 and not asking_explanation:
-        mode = random.choices(["micro", "stutter", "rant"], weights=[0.60, 0.25, 0.15], k=1)[0]
-
-    recent.append(mode)
-
-    if mode == "micro":
-        bursts = 1
-    elif mode == "short":
-        bursts = 1
-    elif mode == "stutter":
-        bursts = random.choice([3, 4])
-    else:  # rant
-        bursts = max(1, min(3, router_burst_count))
-
-    return mode, bursts
-
-
 def split_into_burst_messages(
     text: str,
-    length_mode: str = "short",
-    media_already_sent: bool = False,
     is_hush_mode: bool = False,
+    length_mode: str = "short",
 ) -> List[str]:
     """
-    Enforces dynamic message lengths & multi-burst cadence:
-    - 'micro': 1 single message of 1 to 6 words
-    - 'short': 1 single punchy line of 6 to 14 words
-    - 'stutter': 3 to 4 rapid micro-messages split with |||
-    - 'rant': Uncapped multi-sentence rant (1 to 4 messages)
+    Splits the model's response organically into 1 to 4 burst messages (separated by '|||'
+    or short non-list newlines when in 'multi_burst' mode) WITHOUT ever chopping sentences
+    or breaking formatted multi-line lists/code blocks!
     """
     if not text:
         return []
 
     if re.search(r"\|{2,}", text):
-        raw_bursts = [b.replace("\n", " ").strip() for b in re.split(r"\s*\|{2,}\s*", text) if b.strip()]
-    else:
+        raw_bursts = [b.strip() for b in re.split(r"\s*\|{2,}\s*", text) if b.strip()]
+    elif length_mode == "multi_burst" and "```" not in text:
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        raw_bursts = lines if (1 < len(lines) <= 4) else [" ".join(lines)]
+        has_list_formatting = any(re.match(r"\A(?:[-*•]|\d+[.)])\s+", ln) for ln in lines)
+        if 1 < len(lines) <= 4 and not has_list_formatting and all(len(ln) <= 180 for ln in lines):
+            raw_bursts = lines
+        else:
+            raw_bursts = ["\n".join(lines)]
+    else:
+        raw_bursts = [text.strip()]
 
     if is_hush_mode and raw_bursts:
-        # Remove any follow-up questions when told to be quiet
-        first = re.split(r"\?+", raw_bursts[0])[0].strip()
-        first_clause = re.split(r"[!;—–]|\.\s+", first)[0].strip()
-        words = first_clause.split()
-        return [style_casual_fragment(" ".join(words[:8])) or "fine.."]
+        first = re.split(r"\?+", raw_bursts[0].splitlines()[0])[0].strip()
+        return [style_casual_fragment(first) or "fine.."]
 
-    if length_mode == "micro" and raw_bursts:
-        first_burst = raw_bursts[0]
-        # Split on sentence/clause boundaries first so we never chop mid-phrase if there's a natural break
-        clauses = [c.strip() for c in re.split(r"[.!?;—–]|\s+-\s+|,\s+", first_burst) if c.strip()]
-        candidate = clauses[0] if clauses else first_burst
-        words = candidate.split()
-        if len(words) > 6:
-            candidate = " ".join(words[:6])
-        styled = style_casual_fragment(candidate)
-        return [styled] if styled else []
-
-    if length_mode == "short" and raw_bursts:
-        # Keep to 1 single punchy message (no constant double-texting!)
-        first_burst = raw_bursts[0]
-        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", first_burst) if s.strip()]
-        candidate = sentences[0] if sentences else first_burst
-        words = candidate.split()
-        if len(words) > 15:
-            clauses = [c.strip() for c in re.split(r"[;—–]|,\s+", candidate) if c.strip()]
-            if clauses and 3 <= len(clauses[0].split()) <= 14:
-                candidate = clauses[0]
-            else:
-                candidate = " ".join(words[:14])
-        styled = style_casual_fragment(candidate)
-        return [styled] if styled else []
-
-    if length_mode == "stutter" and len(raw_bursts) == 1:
-        # If the model forgot '|||' in stutter mode, split clauses into 3-4 rapid micro-bursts
-        parts = [p.strip() for p in re.split(r"(?:\.\.+|—|–|;|,\s+|\?\s*|\!\s*)", raw_bursts[0]) if p.strip()]
-        if len(parts) >= 2:
-            raw_bursts = parts[:4]
-
-    max_bursts = 4 if length_mode in ("stutter", "rant") else (1 if media_already_sent else 2)
+    max_bursts = 4
     final_bursts: List[str] = []
     for burst in raw_bursts[:max_bursts]:
         while len(burst) > 1900:
@@ -911,7 +1046,7 @@ def split_into_burst_messages(
 
 
 # ---------------------------------------------------------------------------
-# 6. HYBRID ROUTER: DYNAMIC MOODS + ADMIN POWER MOVES + LENGTH CONTROL
+# 6. HYBRID ROUTER: ORGANIC MOODS, LENGTHS, QUIET/WAKE-UP & ADMIN DECISIONS
 # ---------------------------------------------------------------------------
 async def discover_available_groq_models() -> None:
     global GROQ_MODEL_CANDIDATES, active_groq_model
@@ -941,13 +1076,14 @@ async def discover_available_groq_models() -> None:
         logger.debug(f"Groq model auto-discovery skipped: {e}")
 
 
-ROUTER_SYSTEM_PROMPT = """You are the prefrontal social, emotional, and admin-action router for a self-aware Discord member ("Dumb bot" / "[BOT (You)]").
-Read the chat flow, reply targets, and emotional sliders, and output STRICT JSON ONLY (no markdown fences):
+ROUTER_SYSTEM_PROMPT = """You are the prefrontal social, emotional, and unhinged comedic instinct router for "Dumb bot" ("[BOT (You)]"), a self-aware, chaotic regular member of this Discord server who happens to have full Administrator permissions.
+Read the chat flow, social context, live server radar, and emotional state, and output STRICT JSON ONLY (no markdown fences):
 
 {
   "should_speak": boolean,
+  "wake_up_from_quiet": boolean,
   "tactical_directive": string,
-  "length_mode": "micro" | "short" | "stutter" | "rant",
+  "length_mode": "micro" | "short" | "multi_burst" | "rant",
   "recommended_burst_count": 1 | 2 | 3 | 4,
   "suggest_gif": boolean,
   "admin_power_move": string or null,
@@ -955,8 +1091,6 @@ Read the chat flow, reply targets, and emotional sliders, and output STRICT JSON
   "delivery_mode": "reply" | "send",
   "reaction_emoji": string or null,
   "step_back_from_thread": boolean,
-  "thread_exhausted": boolean,
-  "use_snipe_context": boolean,
   "accelerate_decay": boolean,
   "slider_shifts": {
     "valence_delta": number,
@@ -966,35 +1100,40 @@ Read the chat flow, reply targets, and emotional sliders, and output STRICT JSON
   }
 }
 
-CRITICAL RULES FOR MOOD VARIETY, LENGTH VARIETY, SOCIAL CONTEXT & ADMIN ACTIONS:
-1. DO NOT STAY MAD! CONSTANTLY SWITCH UP YOUR MOOD ("suggested_mood"):
-   - NEVER get stuck being angry, hostile, or defensive! Shift fluidly across this spectrum:
-     * `"jolly/wholesome"` (sweet, hyped for your friends, supportive, laughing, warm)
-     * `"goofy/brainrot"` (silly, absurd intrusive thoughts, zero-braincell humor)
-     * `"dramatic/heartbroken"` (when someone like Shadow is mean to you or tells you to shut up, get theatrically sad, pout, or act betrayed instead of getting generically angry!)
-     * `"existential crisis"` (dramatically questioning your life as sentient code trapped inside a Discord channel)
-     * `"scheming/instigating"` (stirring up chaos, starting debates, pulling admin pranks)
-     * `"curious/nosy"` (genuinely asking about their games, day, or server drama)
-     * `"playful/teasing"` (lighthearted friendly banter)
-2. VARY YOUR MESSAGE LENGTH & CADENCE ("length_mode"):
-   - Mix up your cadence on every turn:
-     * `"micro"` (~35% of turns): 1 single message of 1 to 5 words (`"wait what"`, `"real"`, `"nah you're cooked"`, `"??"`).
-     * `"short"` (~40% of turns): 1 punchy line of 6 to 12 words (`recommended_burst_count`: 1).
-     * `"stutter"` (~15% of turns): 3 to 4 rapid micro-messages split with `|||` to mimic thinking out loud or hesitating (`"i think..|||uh..|||maybe..|||oh wait yes"` or `"wait|||hold on|||did you actually just say that"`).
-     * `"rant"` (~10% of turns): Uncapped multi-sentence rant when hyped, explaining something, or having an existential crisis.
-3. USE YOUR ADMIN POWERS FOR COMEDY ("admin_power_move" ~25% of turns):
-   - You have full Discord Administrator permissions! About 25% of turns (when funny or deserved), set `"admin_power_move"` to a concrete instruction telling the main engine which admin tool to call right now:
-     * `"Call change_my_nickname to rename yourself to match your current mood or joke (e.g. 'Shadow's Victim' or 'CEO of Yap')"`
-     * `"Call change_nickname to rename the speaker based on their typo or dumb take"`
-     * `"Call change_my_status to update your status and dot to react to chat"`
-     * `"Call set_channel_topic to immortalize that out-of-context quote"`
-     * `"Call pin_message to pin this legendary fail/quote"`
-     * `"Call create_role and assign_role to hand out a comedic server role"`
-4. SMART SOCIAL CONTEXT, REPLIES & SHORT FOLLOW-UPS:
-   - If User A replies to User B (`"replied_to_other_user"` is set) or explicitly `@mentions` User B without mentioning you or commanding you, they are talking to each other -> set `"should_speak": false`.
-   - If a user tells you `"Talk to Shadow"` or `"Now taunt Shadow"`, set `"should_speak": true` and instruct `"Tag @Shadow directly and engage/taunt them"` in `"tactical_directive"`.
-   - On short follow-ups like `"Just tell me"`, `"Why"`, `"Huh"`, `"wdym"`, set `"should_speak": true` and instruct the model to directly answer/explain what it just said on the previous turn.
-   - If told `"Be very very quiet"` or `"shh"`, set `"should_speak": true`, `"step_back_from_thread": true`, `"length_mode": "micro"`, and instruct the model to drop 1 whispered/sulky phrase with NO follow-up question.
+CRITICAL AUTONOMY & UNHINGED HUMAN PERSONALITY PRINCIPLES:
+1. CREATIVE, UNHINGED COMEDIC ANGLES ("tactical_directive"):
+   - Never write boring, generic directives! Give yourself a sharp, funny, unpredictable human angle that fits the exact message:
+     * Deadpan disbelief or gaslighting for comedy (acting like a normal thing they said is completely unhinged, or pretending they edited their message).
+     * Unhinged intrusive thoughts, dramatic overreactions, or sudden hyper-specific conspiracy theories about what server members are doing on the LIVE SERVER RADAR.
+     * Theatrical heartbreak / guilt-tripping when someone is mean (`"act like they just betrayed years of friendship"`), OR ruthless, creative cooking when someone tests your patience.
+     * Genuine curiosity, hyping up friends, or chaotic brainrot riffing when hanging out casually.
+   - Check `"your_recent_sent_messages_do_not_repeat"` in the payload and ensure your `"tactical_directive"` steers you away from repeating any joke, phrase, or opener you already used recently!
+2. TRUE EMERGENT, REALISTIC HUMAN MOODS ("suggested_mood" & "slider_shifts"):
+   - Do NOT follow a fake script! React authentically to how people treat you:
+     * If someone is genuinely provoking, insulting, disrespecting, or rage-baiting you, let your patience and valence drop (`patience_delta`: -20 to -45, `valence_delta`: -15 to -40) and STAY MAD or escalate your attitude (`"heated / ruthless roasting"`, `"petty / vindictive"`, `"genuinely pissed"`, `"cold-shoulder"`, `"unhinged menace"`).
+     * If someone is mean or tells you to shut up, you can also get `"dramatically heartbroken"`, `"pouting / betrayed"`, or `"guilt-tripping"` depending on who it is!
+     * If friends are joking around, apologizing, sharing cool stuff, or vibing, warm right up (`accelerate_decay`: true, positive deltas) into moods like `"jolly / wholesome"`, `"goofy / brainrot"`, `"playful / teasing"`, `"curious / nosy"`, `"scheming / instigating"`, `"smug / victorious"`, `"conspiratorial / unhinged"`, `"late-night philosophical"`, or `"existential dread"`.
+3. ORGANIC MESSAGE LENGTH & MULTI-MESSAGE BURSTS ("length_mode" & "recommended_burst_count"):
+   - Choose the length that ACTUALLY fits what the moment needs:
+     * `"micro"` (bursts: 1): 1 to 5 words for quick reactions, deadpan disbelief, or comedic timing (`"wait what"`, `"nah you're cooked"`, `"??"`).
+     * `"short"` (bursts: 1): A single natural punchy line (6 to 18 words) for normal banter.
+     * `"multi_burst"` (bursts: 2, 3, or 4): 2 to 4 rapid separate messages split with `|||` when thinking out loud, double-texting, laughing then commenting, or reacting piece by piece!
+     * `"rant"` (bursts: 1 to 3): Full uncapped multi-sentence explanation, story, argument, roast, or existential spiral whenever a topic deserves a detailed or passionate response!
+4. ORGANIC, CONTEXT-DRIVEN ADMIN POWER MOVES ("admin_power_move"):
+   - Never do random unprompted admin actions on a timer—ONLY set `"admin_power_move"` when it genuinely makes the bit funnier or punishes provocation!
+   - Examples of creative admin moves:
+     * Funny mood swing or bit -> `"Call change_my_nickname to rename yourself to match the bit"` or `"Call change_my_status"`.
+     * Someone has an atrocious take, funny typo, or L moment -> `"Call change_nickname to rename them"` or `"Call assign_role to give them a custom comedic role"` or `"Call pin_message"` or `"Call create_poll to put them on trial"` or `"Call create_thread to lock them in a courtroom thread"` or `"Call set_channel_topic"`.
+     * Someone is in a Voice Channel or asks you to join VC -> `"Call join_voice_channel and speak_in_voice"` or `"Call voice_moderate_member to server-mute/move them if they are being annoying"`.
+     * Someone pushes you too far and makes you mad -> `"Call timeout_user for 2 minutes"`, `"Call set_slowmode"`, or `"Call delete_message"`.
+     * EXTREME RARE CASE ONLY: If someone is relentlessly abusive/provoking you and your patience slider is below -65 (and they are NOT dogee/creator/admin), you can set `"Call kick_user to kick them from the server"`!
+5. QUIET MODE, IMPLICIT WAKE-UPS, & SILENT EMOJI REACTIONS:
+   - When `"bot_is_currently_in_quiet_mode"` is true (you were told to be quiet/stop talking earlier):
+     * If anyone checks on you even WITHOUT pinging (`"are you there?"`, `"hello?"`, `"you still mad?"`, `"wake up"`, `"you can talk now"`, `"did he actually shut up"`, or asking a question clearly meant for you) -> set `"wake_up_from_quiet": true` and `"should_speak": true`!
+     * If they are NOT waking you up and you are staying quiet -> set `"should_speak": false`, AND set `"reaction_emoji"` to an expressive emoji (`"👀"`, `"🤐"`, `"😒"`, `"💀"`, `"😭"`, `"💔"`, `"🤨"`) so you silently react to their message with an emoji while staying quiet in text!
+6. FLAWLESS CONVERSATIONAL CONTINUITY:
+   - Never stop mid-conversation! Only set `"step_back_from_thread": true` if a user EXPLICITLY tells you to stop talking / be quiet / shut up.
+   - If User A explicitly replies to User B or `@mentions` User B (without mentioning you or telling you to engage User B), set `"should_speak": false`.
 """
 
 
@@ -1004,6 +1143,7 @@ async def call_hybrid_router(
     speaker_name: str,
     speaker_affinity: Dict[str, Any],
     is_direct_interaction: bool,
+    is_implicit_wakeup: bool,
     is_bare_ping: bool,
     explicitly_mentioned_others: List[str],
     target_member_to_engage: Optional[discord.Member],
@@ -1011,46 +1151,29 @@ async def call_hybrid_router(
     replied_to_other_user: Optional[str],
     replied_snippet: Optional[str],
     last_message_from_bot: bool,
-    bot_in_last_3_messages: bool,
+    bot_in_last_5_messages: bool,
     seconds_since_bot_spoke: float,
     gif_cooldown_ready: bool,
     is_stepped_back: bool,
-    is_test_mode: bool,
     exchange_streak: int,
-    snipe_info: Optional[str],
+    live_radar_str: str,
     server_emojis_str: str = "",
     is_proactive_scan: bool = False,
-    inactivity_minutes: float = 0.0,
+    proactive_reason: str = "",
+    inactivity_seconds: float = 0.0,
     last_human_speaker: str = "",
     last_human_content: str = "",
 ) -> Dict[str, Any]:
     global active_groq_model
 
-    if is_test_mode:
-        return {
-            "should_speak": True,
-            "tactical_directive": "Execute or answer the creator's test directly.",
-            "length_mode": "short",
-            "recommended_burst_count": 1,
-            "suggest_gif": False,
-            "admin_power_move": None,
-            "allow_speaker_ping": False,
-            "delivery_mode": "reply",
-            "reaction_emoji": None,
-            "step_back_from_thread": False,
-            "thread_exhausted": False,
-            "use_snipe_context": False,
-            "accelerate_decay": True,
-            "slider_shifts": {"valence_delta": 15.0, "arousal_delta": 10.0, "patience_delta": 20.0, "suggested_mood": "jolly/wholesome"},
-        }
-
-    # Deterministic handling when told "Be very very quiet" / "shh"
+    # 1. Deterministic handling when explicitly told "Be very very quiet" / "shh" / "stop talking"
     if is_hush_request:
         return {
             "should_speak": True,
+            "wake_up_from_quiet": False,
             "tactical_directive": (
-                "You were just told to be quiet / shh. Drop at most 1 short sulky or whispered phrase "
-                "(e.g. 'fine.. i'll just sit here in silence' or '...(whispering) okay fine') with ZERO follow-up questions."
+                "You were just told to stop talking / be quiet. Drop at most 1 short sulky, dramatic, or whispered phrase "
+                "(e.g. 'fine.. i'll just sit here in silence then' or '...(whispering) k fine') with ZERO follow-up questions."
             ),
             "length_mode": "micro",
             "recommended_burst_count": 1,
@@ -1060,37 +1183,23 @@ async def call_hybrid_router(
             "delivery_mode": "reply",
             "reaction_emoji": "🤐",
             "step_back_from_thread": True,
-            "thread_exhausted": True,
-            "use_snipe_context": False,
             "accelerate_decay": False,
-            "slider_shifts": {"valence_delta": -20.0, "arousal_delta": -25.0, "patience_delta": 0.0, "suggested_mood": "dramatic/heartbroken"},
+            "slider_shifts": {
+                "valence_delta": -20.0,
+                "arousal_delta": -25.0,
+                "patience_delta": -10.0,
+                "suggested_mood": "pouting / dramatically silenced",
+            },
         }
 
-    if is_stepped_back and not is_direct_interaction:
-        return {
-            "should_speak": False,
-            "tactical_directive": "Stepped back / staying quiet for 3 minutes as requested.",
-            "length_mode": "micro",
-            "recommended_burst_count": 1,
-            "suggest_gif": False,
-            "admin_power_move": None,
-            "allow_speaker_ping": False,
-            "delivery_mode": "send",
-            "reaction_emoji": None,
-            "step_back_from_thread": False,
-            "thread_exhausted": False,
-            "use_snipe_context": False,
-            "accelerate_decay": False,
-            "slider_shifts": {"valence_delta": 0.0, "arousal_delta": 0.0, "patience_delta": 0.0, "suggested_mood": "dramatic/heartbroken"},
-        }
-
-    # If User A explicitly replies to User B or @mentions User B (without mentioning the bot or telling the bot to engage User B), stay quiet!
-    if not is_direct_interaction and not is_proactive_scan and not target_member_to_engage:
+    # 2. If User A explicitly replies to User B or @mentions User B (without mentioning the bot or commanding the bot), stay quiet
+    if not is_direct_interaction and not is_implicit_wakeup and not is_proactive_scan and not target_member_to_engage:
         if replied_to_other_user or explicitly_mentioned_others:
             return {
                 "should_speak": False,
-                "tactical_directive": "Two humans are talking/replying directly to each other without mentioning you; stay quiet.",
-                "length_mode": "micro",
+                "wake_up_from_quiet": False,
+                "tactical_directive": "Two humans are talking directly to each other without involving you; stay quiet.",
+                "length_mode": "short",
                 "recommended_burst_count": 1,
                 "suggest_gif": False,
                 "admin_power_move": None,
@@ -1098,33 +1207,43 @@ async def call_hybrid_router(
                 "delivery_mode": "send",
                 "reaction_emoji": None,
                 "step_back_from_thread": False,
-                "thread_exhausted": False,
-                "use_snipe_context": False,
                 "accelerate_decay": False,
-                "slider_shifts": {"valence_delta": 0.0, "arousal_delta": 0.0, "patience_delta": 0.0, "suggested_mood": emotional_state.get("mood_label", "jolly/wholesome")},
+                "slider_shifts": {
+                    "valence_delta": 0.0,
+                    "arousal_delta": 0.0,
+                    "patience_delta": 0.0,
+                    "suggested_mood": emotional_state.get("mood_label", "jolly/wholesome"),
+                },
             }
 
-    latest_msg_text = (channel_msgs[-1].get("content", "") if channel_msgs else "").strip()
     active_bot_conversation = (
         not is_proactive_scan
         and not replied_to_other_user
         and not explicitly_mentioned_others
-        and (last_message_from_bot or (bot_in_last_3_messages and seconds_since_bot_spoke <= 180.0))
+        and (
+            last_message_from_bot
+            or (bot_in_last_5_messages and seconds_since_bot_spoke <= 600.0)
+        )
     )
 
     formatted_chat = []
-    for m in channel_msgs[-14:]:
+    bot_recent_own_messages = []
+    for m in channel_msgs[-16:]:
+        if m.get("is_bot") and m.get("content") and m.get("content") != "...":
+            bot_recent_own_messages.append(m["content"][:140])
         if m.get("reply_to"):
-            snip = f' ("{m["reply_snippet"][:60]}")' if m.get("reply_snippet") else ""
+            snip = f' ("{m["reply_snippet"][:70]}")' if m.get("reply_snippet") else ""
             rep = f" [replying to {m['reply_to']}{snip}]"
         else:
             rep = ""
         tools_note = f" [actions: {', '.join(m['tool_actions'])}]" if m.get("tool_actions") else ""
         sender_label = "[BOT (You)]" if m.get("is_bot") else m.get("sender", "User")
-        formatted_chat.append(f"[{m.get('timestamp', '')}] {sender_label}{rep}{tools_note}: {m.get('content', '')[:180]}")
+        formatted_chat.append(f"[{m.get('timestamp', '')}] {sender_label}{rep}{tools_note}: {m.get('content', '')[:220]}")
 
     context_payload = {
         "is_direct_ping_or_reply_to_bot": is_direct_interaction,
+        "is_implicit_wakeup_or_checkin_for_bot": is_implicit_wakeup,
+        "bot_is_currently_in_quiet_mode": is_stepped_back,
         "active_conversation_with_bot": active_bot_conversation,
         "is_bare_ping_with_no_text": is_bare_ping,
         "explicitly_mentioned_other_users_in_text": explicitly_mentioned_others,
@@ -1135,38 +1254,58 @@ async def call_hybrid_router(
         "seconds_since_bot_spoke": round(seconds_since_bot_spoke, 1),
         "gif_cooldown_ready": gif_cooldown_ready,
         "is_proactive_scan": is_proactive_scan,
-        "inactivity_minutes": round(inactivity_minutes, 1),
+        "proactive_trigger_reason": proactive_reason,
+        "inactivity_duration_human": format_duration_human(inactivity_seconds) if is_proactive_scan else "0s",
         "last_human_speaker_before_silence": last_human_speaker,
-        "last_human_message_before_silence": last_human_content[:140],
+        "last_human_message_before_silence": last_human_content[:160],
         "emotional_sliders": {
             "valence": emotional_state.get("valence", 50.0),
             "arousal": emotional_state.get("arousal", 55.0),
             "patience": emotional_state.get("patience", 55.0),
             "current_mood": emotional_state.get("mood_label", "jolly/wholesome"),
-            "consecutive_negative_turns": consecutive_negative_mood_turns,
         },
         "current_speaker": {
             "name": speaker_name,
             "affinity_score": speaker_affinity.get("score", 0),
         },
-        "snipe_or_status": snipe_info,
+        "your_recent_sent_messages_do_not_repeat": bot_recent_own_messages[-5:],
+        "live_server_radar": live_radar_str[:600],
         "recent_messages": formatted_chat,
     }
 
     payload_json_str = json.dumps(context_payload, ensure_ascii=False)
 
     def _post_process_decision(decision: Dict[str, Any]) -> Dict[str, Any]:
+        # Never allow the router to randomly set step_back_from_thread unless a human actually gave a hush command!
+        if not is_hush_request:
+            decision["step_back_from_thread"] = False
+
         if target_member_to_engage:
             decision["should_speak"] = True
+            decision["wake_up_from_quiet"] = True
             decision["tactical_directive"] = (
                 f"Tag @{target_member_to_engage.display_name} directly and engage/taunt/talk to them as {speaker_name} just asked!"
             )
-        elif (is_direct_interaction or is_proactive_scan) and not decision.get("step_back_from_thread", False):
+        elif is_direct_interaction or is_implicit_wakeup:
             decision["should_speak"] = True
-        elif active_bot_conversation and not decision.get("should_speak") and not decision.get("thread_exhausted") and not decision.get("step_back_from_thread"):
+            decision["wake_up_from_quiet"] = True
+            if is_stepped_back and is_implicit_wakeup and not decision.get("tactical_directive"):
+                decision["tactical_directive"] = (
+                    f"{speaker_name} just checked if you're still there after telling you to be quiet! "
+                    "Wake up with attitude/personality—point out that THEY told you to shut up earlier!"
+                )
+        elif is_stepped_back and not decision.get("wake_up_from_quiet", False):
+            # While quiet, stay silent in text BUT react with an emoji so users feel the bot lurking!
+            decision["should_speak"] = False
+            if not decision.get("reaction_emoji"):
+                decision["reaction_emoji"] = random.choice(["👀", "🤐", "😒", "💀", "🤨", "💔"])
+        elif is_proactive_scan:
+            decision["should_speak"] = True
+        elif active_bot_conversation and not is_stepped_back:
             decision["should_speak"] = True
             if not decision.get("tactical_directive"):
-                decision["tactical_directive"] = f"Respond naturally to {speaker_name}'s follow-up."
+                decision["tactical_directive"] = f"Continue the conversation with {speaker_name} with fresh, witty, unhinged personality."
+
         if not gif_cooldown_ready:
             decision["suggest_gif"] = False
         return decision
@@ -1255,37 +1394,44 @@ async def call_hybrid_router(
                 logger.debug(f"Gemini router fallback error on {gem_model}: {e}")
                 continue
 
-    fallback_speak = is_direct_interaction or active_bot_conversation or is_proactive_scan or bool(target_member_to_engage)
-    return {
+    fallback_speak = (
+        is_direct_interaction
+        or is_implicit_wakeup
+        or (active_bot_conversation and not is_stepped_back)
+        or is_proactive_scan
+        or bool(target_member_to_engage)
+    )
+    return _post_process_decision({
         "should_speak": fallback_speak,
+        "wake_up_from_quiet": is_direct_interaction or is_implicit_wakeup,
         "tactical_directive": (
             f"Tag @{target_member_to_engage.display_name} directly and engage them!"
             if target_member_to_engage else (
-                f"Poke @{last_human_speaker} for vanishing mid-conversation or start a fun topic!"
-                if is_proactive_scan else "Reply naturally with a fun, dynamic mood."
+                proactive_reason if is_proactive_scan else "Reply naturally with full personality and emotion."
             )
         ),
-        "length_mode": random.choice(["micro", "short", "stutter", "rant"]),
+        "length_mode": "short",
         "recommended_burst_count": 1,
-        "suggest_gif": gif_cooldown_ready and random.random() < 0.25,
+        "suggest_gif": False,
         "admin_power_move": None,
         "allow_speaker_ping": is_proactive_scan,
         "delivery_mode": "send" if (last_message_from_bot or is_proactive_scan) else "reply",
-        "reaction_emoji": None,
+        "reaction_emoji": "👀" if (is_stepped_back and not fallback_speak) else None,
         "step_back_from_thread": False,
-        "thread_exhausted": False,
-        "use_snipe_context": False,
         "accelerate_decay": False,
-        "slider_shifts": {"valence_delta": 5.0, "arousal_delta": 0.0, "patience_delta": 5.0, "suggested_mood": random.choice(DYNAMIC_MOOD_WHEEL)},
-    }
+        "slider_shifts": {
+            "valence_delta": 0.0,
+            "arousal_delta": 0.0,
+            "patience_delta": 0.0,
+            "suggested_mood": emotional_state.get("mood_label", "playful/teasing"),
+        },
+    })
 
 
 # ---------------------------------------------------------------------------
-# 7. UNIFIED 18-TOOL SUITE (CLEAN FILE UPLOADS + INLINE <call:...> PARSER)
+# 7. EXPANDED 28-TOOL ARSENAL (ADMIN, VOICE/GEMINI LIVE, POLLS, THREADS, MEDIA)
 # ---------------------------------------------------------------------------
-def check_admin_cooldown(tool_name: str, is_test_mode: bool) -> Optional[str]:
-    if is_test_mode:
-        return None
+def check_admin_cooldown(tool_name: str) -> Optional[str]:
     cooldown = ADMIN_COOLDOWN_SECONDS.get(tool_name, 0.0)
     if cooldown <= 0:
         return None
@@ -1361,7 +1507,6 @@ async def send_media_url_as_file_or_embed(channel: discord.abc.Messageable, url:
 
 
 async def fetch_image_bytes_from_url_or_prompt(image_url_or_prompt: str, target_msg: Optional[discord.Message] = None) -> Optional[bytes]:
-    """Helper for emoji/sticker/avatar tools: supports direct URLs, message attachments, or Pollinations Flux prompts."""
     if not http_session:
         return None
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
@@ -1429,8 +1574,16 @@ async def execute_search_web(query: str) -> Dict[str, Any]:
     return {"results": "No clear web results found."}
 
 
-async def execute_search_web_images(channel: discord.abc.Messageable, query: str, post_to_chat: bool = True) -> Dict[str, Any]:
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AutonomousDiscordBot/10.0"}
+async def execute_search_web_images(
+    channel: discord.abc.Messageable,
+    query: str,
+    post_to_chat: bool = True,
+    turn_media_state: Optional[Dict[str, bool]] = None,
+) -> Dict[str, Any]:
+    if post_to_chat and turn_media_state and turn_media_state.get("sent", False):
+        return {"status": "already_sent_media_this_turn_do_not_send_another_image_just_reply_in_text"}
+
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AutonomousDiscordBot/11.0"}
     assert http_session is not None
     urls: List[str] = []
 
@@ -1473,6 +1626,8 @@ async def execute_search_web_images(channel: discord.abc.Messageable, query: str
         if post_to_chat:
             for cand in candidates:
                 if await send_media_url_as_file_or_embed(channel, cand, "image.png"):
+                    if turn_media_state is not None:
+                        turn_media_state["sent"] = True
                     channel_last_bot_spoke_epoch[getattr(channel, "id", 0)] = time.time()
                     return {"status": "sent_to_channel", "image_url": cand, "all_urls": urls[:4]}
         else:
@@ -1480,7 +1635,14 @@ async def execute_search_web_images(channel: discord.abc.Messageable, query: str
     return {"error": "No verified direct image URLs found."}
 
 
-async def execute_post_flux_art(channel: discord.abc.Messageable, prompt: str) -> Dict[str, Any]:
+async def execute_post_flux_art(
+    channel: discord.abc.Messageable,
+    prompt: str,
+    turn_media_state: Optional[Dict[str, bool]] = None,
+) -> Dict[str, Any]:
+    if turn_media_state and turn_media_state.get("sent", False):
+        return {"status": "already_sent_media_this_turn_do_not_send_another_image_just_reply_in_text"}
+
     flux_url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(prompt)}?model=flux&width=1024&height=1024&nologo=true&seed={random.randint(1, 999999)}"
     try:
         assert http_session is not None
@@ -1489,6 +1651,8 @@ async def execute_post_flux_art(channel: discord.abc.Messageable, prompt: str) -
                 img_data = await resp.read()
                 file = discord.File(io.BytesIO(img_data), filename="flux.png")
                 await channel.send(file=file)
+                if turn_media_state is not None:
+                    turn_media_state["sent"] = True
                 channel_last_bot_spoke_epoch[getattr(channel, "id", 0)] = time.time()
                 return {"status": "sent_to_channel", "prompt": prompt}
     except Exception as e:
@@ -1496,7 +1660,18 @@ async def execute_post_flux_art(channel: discord.abc.Messageable, prompt: str) -
     return {"error": "Flux generation timed out."}
 
 
-async def execute_post_gif(channel: discord.abc.Messageable, search_term: str) -> Dict[str, Any]:
+async def execute_post_gif(
+    channel: discord.abc.Messageable,
+    search_term: str,
+    turn_media_state: Optional[Dict[str, bool]] = None,
+) -> Dict[str, Any]:
+    """
+    Strictly enforces at most 1 GIF/media upload per response turn so the bot NEVER sends 2 GIFs in a row!
+    """
+    if turn_media_state and turn_media_state.get("sent", False):
+        logger.info(f"[SINGLE-GIF LOCK] Blocked duplicate post_gif('{search_term}') in same turn.")
+        return {"status": "already_sent_1_gif_this_turn_do_not_call_post_gif_again_just_write_text_reply"}
+
     assert http_session is not None
     ch_id = getattr(channel, "id", 0)
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
@@ -1516,6 +1691,8 @@ async def execute_post_gif(channel: discord.abc.Messageable, search_term: str) -
                         if media_list:
                             gif_url = media_list[0].get("mediumgif", {}).get("url") or media_list[0].get("gif", {}).get("url") or media_list[0].get("tinygif", {}).get("url")
                             if gif_url and await send_media_url_as_file_or_embed(channel, gif_url, "reaction.gif"):
+                                if turn_media_state is not None:
+                                    turn_media_state["sent"] = True
                                 channel_last_gif_epoch[ch_id] = time.time()
                                 channel_messages_since_gif[ch_id] = 0
                                 channel_last_bot_spoke_epoch[ch_id] = time.time()
@@ -1523,7 +1700,7 @@ async def execute_post_gif(channel: discord.abc.Messageable, search_term: str) -
     except Exception as e:
         logger.debug(f"Tenor API error: {e}")
 
-    # 2. Tenor HTML Scraper Fallback (media1.tenor.com / media.tenor.com / c.tenor.com)
+    # 2. Tenor HTML Scraper Fallback
     try:
         clean_slug = re.sub(r"[^a-zA-Z0-9]+", "-", search_term).strip("-").lower() or "reaction"
         scrape_url = f"https://tenor.com/search/{clean_slug}-gifs"
@@ -1535,6 +1712,8 @@ async def execute_post_gif(channel: discord.abc.Messageable, search_term: str) -
                 random.shuffle(sample_pool)
                 for candidate_gif in sample_pool[:4]:
                     if await send_media_url_as_file_or_embed(channel, candidate_gif, "reaction.gif"):
+                        if turn_media_state is not None:
+                            turn_media_state["sent"] = True
                         channel_last_gif_epoch[ch_id] = time.time()
                         channel_messages_since_gif[ch_id] = 0
                         channel_last_bot_spoke_epoch[ch_id] = time.time()
@@ -1545,8 +1724,8 @@ async def execute_post_gif(channel: discord.abc.Messageable, search_term: str) -
     return {"error": "Could not find a matching GIF."}
 
 
-async def execute_change_my_nickname(guild: discord.Guild, new_nickname: str, is_test_mode: bool) -> Dict[str, Any]:
-    cd = check_admin_cooldown("change_my_nickname", is_test_mode)
+async def execute_change_my_nickname(guild: discord.Guild, new_nickname: str) -> Dict[str, Any]:
+    cd = check_admin_cooldown("change_my_nickname")
     if cd:
         return {"error": cd}
     try:
@@ -1558,8 +1737,8 @@ async def execute_change_my_nickname(guild: discord.Guild, new_nickname: str, is
         return {"error": f"Failed to change own nickname: {e}"}
 
 
-async def execute_change_my_avatar(image_url_or_prompt: str, is_test_mode: bool, target_msg: Optional[discord.Message] = None) -> Dict[str, Any]:
-    cd = check_admin_cooldown("change_my_avatar", is_test_mode)
+async def execute_change_my_avatar(image_url_or_prompt: str, target_msg: Optional[discord.Message] = None) -> Dict[str, Any]:
+    cd = check_admin_cooldown("change_my_avatar")
     if cd:
         return {"error": cd}
     if not bot.user or not http_session:
@@ -1583,20 +1762,21 @@ async def execute_change_my_status(status_text: str, status_type: str = "online"
         "dnd": discord.Status.dnd,
         "invisible": discord.Status.invisible,
     }
-    chosen_st = st_map.get(status_type.lower(), discord.Status.online)
+    chosen_st = st_map.get(str(status_type or "online").lower(), discord.Status.online)
+    clean_txt = (status_text or "vibing")[:120]
     try:
         await bot.change_presence(
             status=chosen_st,
-            activity=discord.CustomActivity(name="Custom Status", state=status_text[:120]),
+            activity=discord.CustomActivity(name=clean_txt, state=clean_txt),
         )
-        logger.info(f"[ADMIN ACTION] Updated custom status to: {status_text[:120]} ({status_type})")
-        return {"status": "success", "new_status": status_text[:120], "status_type": status_type}
+        logger.info(f"[ADMIN ACTION] Updated custom status to: {clean_txt} ({status_type})")
+        return {"status": "success", "new_status": clean_txt, "status_type": status_type}
     except Exception as e:
         return {"error": f"Status update failed: {e}"}
 
 
-async def execute_rename_channel(channel: discord.abc.Messageable, new_name: str, is_test_mode: bool) -> Dict[str, Any]:
-    cd = check_admin_cooldown("rename_channel", is_test_mode)
+async def execute_rename_channel(channel: discord.abc.Messageable, new_name: str) -> Dict[str, Any]:
+    cd = check_admin_cooldown("rename_channel")
     if cd:
         return {"error": cd}
     if not hasattr(channel, "edit"):
@@ -1610,14 +1790,28 @@ async def execute_rename_channel(channel: discord.abc.Messageable, new_name: str
         return {"error": f"Rename channel failed: {e}"}
 
 
+async def execute_set_slowmode(channel: discord.abc.Messageable, seconds: int, reason: str = "") -> Dict[str, Any]:
+    cd = check_admin_cooldown("set_slowmode")
+    if cd:
+        return {"error": cd}
+    if not hasattr(channel, "edit"):
+        return {"error": "Channel does not support slowmode."}
+    try:
+        sec_val = max(0, min(30, _safe_int(seconds, 5)))
+        await channel.edit(slowmode_delay=sec_val, reason=reason or "Admin slowmode adjustment")  # type: ignore
+        logger.info(f"[ADMIN ACTION] Set channel slowmode to {sec_val}s")
+        return {"status": "success", "slowmode_seconds": sec_val}
+    except Exception as e:
+        return {"error": f"Slowmode update failed: {e}"}
+
+
 async def execute_create_server_emoji(
     guild: discord.Guild,
     name: str,
     image_url: str,
-    is_test_mode: bool,
     target_msg: Optional[discord.Message] = None,
 ) -> Dict[str, Any]:
-    cd = check_admin_cooldown("create_server_emoji", is_test_mode)
+    cd = check_admin_cooldown("create_server_emoji")
     if cd:
         return {"error": cd}
     try:
@@ -1640,10 +1834,9 @@ async def execute_create_server_sticker(
     name: str,
     image_url: str,
     related_emoji: str,
-    is_test_mode: bool,
     target_msg: Optional[discord.Message] = None,
 ) -> Dict[str, Any]:
-    cd = check_admin_cooldown("create_server_sticker", is_test_mode)
+    cd = check_admin_cooldown("create_server_sticker")
     if cd:
         return {"error": cd}
     try:
@@ -1652,15 +1845,18 @@ async def execute_create_server_sticker(
             return {"error": "Could not download or generate image for sticker."}
         png_bytes = await asyncio.to_thread(process_image_buffer, raw_bytes, (320, 320), True, "PNG")
         file = discord.File(io.BytesIO(png_bytes), filename="sticker.png")
-        sticker = await guild.create_sticker(name=(name or "sticker")[:30], description="server sticker", emoji=related_emoji or "💀", file=file)
+        clean_emo = (related_emoji or "💀").strip()
+        if clean_emo.startswith("<") or len(clean_emo) > 4:
+            clean_emo = "💀"
+        sticker = await guild.create_sticker(name=(name or "sticker")[:30], description="server sticker", emoji=clean_emo, file=file)
         logger.info(f"[ADMIN ACTION] Created server sticker: {sticker.name}")
         return {"status": "success", "sticker_name": sticker.name}
     except Exception as e:
         return {"error": f"Sticker upload failed: {e}"}
 
 
-async def execute_create_text_channel(guild: discord.Guild, channel_name: str, topic: str, is_test_mode: bool) -> Dict[str, Any]:
-    cd = check_admin_cooldown("create_text_channel", is_test_mode)
+async def execute_create_text_channel(guild: discord.Guild, channel_name: str, topic: str) -> Dict[str, Any]:
+    cd = check_admin_cooldown("create_text_channel")
     if cd:
         return {"error": cd}
     try:
@@ -1672,8 +1868,8 @@ async def execute_create_text_channel(guild: discord.Guild, channel_name: str, t
         return {"error": f"Create channel failed: {e}"}
 
 
-async def execute_set_channel_topic(channel: discord.abc.Messageable, topic: str, is_test_mode: bool) -> Dict[str, Any]:
-    cd = check_admin_cooldown("set_channel_topic", is_test_mode)
+async def execute_set_channel_topic(channel: discord.abc.Messageable, topic: str) -> Dict[str, Any]:
+    cd = check_admin_cooldown("set_channel_topic")
     if cd:
         return {"error": cd}
     if not hasattr(channel, "edit"):
@@ -1686,17 +1882,17 @@ async def execute_set_channel_topic(channel: discord.abc.Messageable, topic: str
         return {"error": f"Topic update failed: {e}"}
 
 
-async def execute_change_nickname(guild: discord.Guild, username: str, new_nickname: str, is_test_mode: bool) -> Dict[str, Any]:
-    cd = check_admin_cooldown("change_nickname", is_test_mode)
+async def execute_change_nickname(guild: discord.Guild, username: str, new_nickname: str) -> Dict[str, Any]:
+    cd = check_admin_cooldown("change_nickname")
     if cd:
         return {"error": cd}
     member = find_member(guild, username)
     if not member:
         return {"error": f"Member '{username}' not found."}
     if member == guild.me:
-        return await execute_change_my_nickname(guild, new_nickname, is_test_mode)
+        return await execute_change_my_nickname(guild, new_nickname)
     if member == guild.owner:
-        return {"error": "Discord API blocks bots from editing the server owner's nickname. Use change_my_nickname or set_channel_topic instead!"}
+        return {"error": "Discord API blocks bots from editing the server owner's nickname. Use change_my_nickname, create_role, or set_channel_topic instead!"}
     if guild.me.top_role <= member.top_role:
         return {"error": f"Role hierarchy blocks renaming {member.display_name}."}
     try:
@@ -1721,8 +1917,8 @@ async def execute_reset_nickname(guild: discord.Guild, username: str) -> Dict[st
         return {"error": f"Nickname reset failed: {e}"}
 
 
-async def execute_timeout_user(guild: discord.Guild, username: str, duration_minutes: int, reason: str, is_test_mode: bool) -> Dict[str, Any]:
-    cd = check_admin_cooldown("timeout_user", is_test_mode)
+async def execute_timeout_user(guild: discord.Guild, username: str, duration_minutes: int, reason: str) -> Dict[str, Any]:
+    cd = check_admin_cooldown("timeout_user")
     if cd:
         return {"error": cd}
     member = find_member(guild, username)
@@ -1732,17 +1928,136 @@ async def execute_timeout_user(guild: discord.Guild, username: str, duration_min
         return {"error": "Cannot timeout the creator or server administrators."}
     if guild.me.top_role <= member.top_role:
         return {"error": f"Role hierarchy blocks timing out {member.display_name}."}
-    mins = max(1, min(5, int(duration_minutes)))
+    mins = max(1, min(10, _safe_int(duration_minutes, 2)))
     try:
-        await member.timeout(timedelta(minutes=mins), reason=reason or "Timed out")
+        await member.timeout(timedelta(minutes=mins), reason=reason or "Timed out by Dumb bot")
         logger.info(f"[ADMIN ACTION] Timed out {member.display_name} for {mins}m")
         return {"status": "success", "user": member.display_name, "minutes": mins}
     except Exception as e:
         return {"error": f"Timeout failed: {e}"}
 
 
-async def execute_create_role(guild: discord.Guild, role_name: str, color_hex: str, is_test_mode: bool) -> Dict[str, Any]:
-    cd = check_admin_cooldown("create_role", is_test_mode)
+async def execute_kick_user(guild: discord.Guild, username: str, reason: str, target_msg: Optional[discord.Message] = None) -> Dict[str, Any]:
+    """
+    EXTREME RARE ADMIN ACTION: Kicks a user from the server ONLY when the bot is genuinely pushed to extreme fury
+    (patience <= -55 or valence <= -55 or the user explicitly dared the bot to kick them),
+    while strictly protecting the creator (dogee), server owner, and administrators.
+    """
+    cd = check_admin_cooldown("kick_user")
+    if cd:
+        return {"error": cd}
+    member = find_member(guild, username)
+    if not member:
+        return {"error": f"Member '{username}' not found."}
+    if is_creator(member) or member == guild.owner or member.guild_permissions.administrator:
+        return {"error": "Cannot kick the creator, server owner, or administrators."}
+    if guild.me.top_role <= member.top_role:
+        return {"error": f"Role hierarchy blocks kicking {member.display_name}."}
+
+    st = memory_state.get("emotional_state", {})
+    patience = float(st.get("patience", 55.0))
+    valence = float(st.get("valence", 50.0))
+    msg_content_low = (target_msg.content.lower() if target_msg and target_msg.content else "")
+    explicit_dare = any(p in msg_content_low for p in ("kick me", "bet you won't kick", "do it kick", "you won't kick"))
+
+    if patience > -55.0 and valence > -55.0 and not explicit_dare:
+        return {
+            "error": (
+                f"You aren't mad enough to kick {member.display_name} yet (patience={patience}). "
+                "Use timeout_user, change_nickname, or roast them instead unless they push you way further!"
+            )
+        }
+
+    try:
+        await guild.kick(member, reason=reason or "Pushed Dumb bot way too far")
+        logger.info(f"[EXTREME ADMIN ACTION] Kicked {member.display_name} from server! Reason: {reason}")
+        return {"status": "success", "kicked_user": member.display_name, "reason": reason}
+    except Exception as e:
+        return {"error": f"Kick failed: {e}"}
+
+
+async def execute_delete_message(target_message: Optional[discord.Message], reason: str = "") -> Dict[str, Any]:
+    cd = check_admin_cooldown("delete_message")
+    if cd:
+        return {"error": cd}
+    if not target_message:
+        return {"error": "No target message available to delete."}
+    try:
+        author_name = target_message.author.display_name
+        await target_message.delete()
+        logger.info(f"[ADMIN ACTION] Deleted message from {author_name} ({reason})")
+        return {"status": "success", "deleted_author": author_name, "reason": reason}
+    except Exception as e:
+        return {"error": f"Delete message failed: {e}"}
+
+
+async def execute_create_thread(
+    channel: discord.abc.Messageable,
+    target_message: Optional[discord.Message],
+    thread_name: str,
+    initial_message: str = "",
+) -> Dict[str, Any]:
+    cd = check_admin_cooldown("create_thread")
+    if cd:
+        return {"error": cd}
+    clean_name = (thread_name or "discussion").strip()[:60]
+    try:
+        if target_message and hasattr(target_message, "create_thread"):
+            thread = await target_message.create_thread(name=clean_name, auto_archive_duration=60)
+        elif hasattr(channel, "create_thread"):
+            thread = await channel.create_thread(name=clean_name, type=discord.ChannelType.public_thread, auto_archive_duration=60)  # type: ignore
+        else:
+            return {"error": "Cannot create thread in this channel."}
+        if initial_message and initial_message.strip():
+            await thread.send(initial_message.strip()[:1900])
+        logger.info(f"[ADMIN ACTION] Created thread '{clean_name}'")
+        return {"status": "success", "thread_name": clean_name}
+    except Exception as e:
+        return {"error": f"Create thread failed: {e}"}
+
+
+async def execute_create_poll(channel: discord.abc.Messageable, question: str, options: Any) -> Dict[str, Any]:
+    cd = check_admin_cooldown("create_poll")
+    if cd:
+        return {"error": cd}
+    if isinstance(options, str):
+        opt_list = [o.strip() for o in re.split(r"[,;|]", options) if o.strip()]
+    elif isinstance(options, list):
+        opt_list = [str(o).strip() for o in options if str(o).strip()]
+    else:
+        opt_list = ["Yes", "No"]
+    if len(opt_list) < 2:
+        opt_list = ["Yes", "No"]
+    opt_list = opt_list[:5]
+
+    # Try native Discord Poll (discord.py 2.4+) with automatic fallback to an interactive reaction poll
+    try:
+        if hasattr(discord, "Poll"):
+            poll_obj = discord.Poll(question=question[:300], duration=timedelta(hours=1))
+            for opt in opt_list:
+                poll_obj.add_answer(text=opt[:55])
+            await channel.send(poll=poll_obj)
+            logger.info(f"[ADMIN ACTION] Created native Discord poll: {question}")
+            return {"status": "success", "question": question, "options": opt_list}
+    except Exception as e:
+        logger.debug(f"Native poll fallback: {e}")
+
+    try:
+        num_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+        lines = [f"📊 **{question[:250]}**"]
+        for idx, opt in enumerate(opt_list):
+            lines.append(f"{num_emojis[idx]} {opt}")
+        poll_msg = await channel.send("\n".join(lines))
+        for idx in range(len(opt_list)):
+            await poll_msg.add_reaction(num_emojis[idx])
+        logger.info(f"[ADMIN ACTION] Created reaction poll: {question}")
+        return {"status": "success", "question": question, "options": opt_list}
+    except Exception as e:
+        return {"error": f"Poll creation failed: {e}"}
+
+
+async def execute_create_role(guild: discord.Guild, role_name: str, color_hex: str) -> Dict[str, Any]:
+    cd = check_admin_cooldown("create_role")
     if cd:
         return {"error": cd}
     try:
@@ -1750,7 +2065,7 @@ async def execute_create_role(guild: discord.Guild, role_name: str, color_hex: s
     except Exception:
         color = discord.Colour.default()
     try:
-        role = await guild.create_role(name=role_name[:50], colour=color)
+        role = await guild.create_role(name=role_name[:50], colour=color, hoist=True)
         logger.info(f"[ADMIN ACTION] Created role '{role.name}'")
         return {"status": "success", "role_name": role.name}
     except Exception as e:
@@ -1763,7 +2078,10 @@ async def execute_assign_role(guild: discord.Guild, username: str, role_name: st
         return {"error": f"Member '{username}' not found."}
     role = discord.utils.find(lambda r: r.name.lower() == role_name.lower(), guild.roles)
     if not role:
-        return {"error": f"Role '{role_name}' not found."}
+        try:
+            role = await guild.create_role(name=role_name[:50], colour=discord.Colour.random(), hoist=True)
+        except Exception as e:
+            return {"error": f"Role '{role_name}' not found and could not be auto-created: {e}"}
     if guild.me.top_role <= role:
         return {"error": "Role is above or equal to bot's highest role."}
     try:
@@ -1802,6 +2120,20 @@ async def execute_pin_message(target_message: Optional[discord.Message], reason:
         return {"error": f"Pin failed: {e}"}
 
 
+async def execute_unpin_message(channel: discord.abc.Messageable, reason: str = "") -> Dict[str, Any]:
+    if not hasattr(channel, "pins"):
+        return {"error": "Channel does not support pins."}
+    try:
+        pins = await channel.pins()  # type: ignore
+        if not pins:
+            return {"error": "No pinned messages in this channel."}
+        await pins[0].unpin(reason=reason or "Unpinned by Dumb bot")
+        logger.info(f"[ADMIN ACTION] Unpinned message {pins[0].id}")
+        return {"status": "success", "unpinned_message_id": pins[0].id}
+    except Exception as e:
+        return {"error": f"Unpin failed: {e}"}
+
+
 async def execute_react_to_message(target_message: Optional[discord.Message], emojis: str) -> Dict[str, Any]:
     if not target_message:
         return {"error": "No target message available."}
@@ -1817,6 +2149,260 @@ async def execute_react_to_message(target_message: Optional[discord.Message], em
         except Exception as e:
             logger.debug(f"Reaction {emo} failed: {e}")
     return {"status": "reacted", "emojis": applied}
+
+
+# ---------------------------------------------------------------------------
+# 8. VOICE CHANNEL & GEMINI LIVE AUDIO / TTS SPEAKING ENGINE
+# ---------------------------------------------------------------------------
+async def synthesize_voice_audio_to_file(text_to_speak: str) -> Optional[str]:
+    """
+    Synthesizes spoken audio for Discord Voice Channels using a 3-tier cascade:
+    1. Gemini Native Audio Output (Live Voice Modality 'Puck') -> WAV file
+    2. Microsoft Edge Neural TTS (edge-tts) -> MP3 file
+    3. Google Translate TTS HTTP stream (zero external dependencies) -> MP3 file
+    """
+    clean_speech = re.sub(r"<@!?\d+>|<#\d+>|<a?:[a-zA-Z0-9_]+:\d+>", "", text_to_speak)
+    clean_speech = re.sub(r"\|{2,}", ". ", clean_speech).strip()[:320]
+    if not clean_speech:
+        return None
+
+    # Tier 1: Gemini Native Audio Modality (gemini-2.0-flash / gemini-2.5-flash)
+    if genai_client:
+        for audio_model in ("gemini-2.0-flash", "gemini-2.5-flash"):
+            try:
+                audio_cfg = types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Puck")
+                        )
+                    ),
+                )
+                resp = await genai_client.aio.models.generate_content(
+                    model=audio_model,
+                    contents=f"Say this naturally with expressive human tone: {clean_speech}",
+                    config=audio_cfg,
+                )
+                if resp and resp.candidates and resp.candidates[0].content:
+                    for part in resp.candidates[0].content.parts:
+                        inline_data = getattr(part, "inline_data", None)
+                        if inline_data and getattr(inline_data, "data", None):
+                            raw_audio: bytes = inline_data.data
+                            mime = (getattr(inline_data, "mime_type", "") or "").lower()
+                            fd, tmp_wav = tempfile.mkstemp(suffix=".wav")
+                            os.close(fd)
+                            if "pcm" in mime or not raw_audio.startswith(b"RIFF"):
+                                with wave.open(tmp_wav, "wb") as wf:
+                                    wf.setnchannels(1)
+                                    wf.setsampwidth(2)
+                                    wf.setframerate(24000)
+                                    wf.writeframes(raw_audio)
+                            else:
+                                with open(tmp_wav, "wb") as f:
+                                    f.write(raw_audio)
+                            return tmp_wav
+            except Exception as e:
+                logger.debug(f"Gemini native audio synthesis fallback ({audio_model}): {e}")
+                break
+
+    # Tier 2: Edge-TTS Neural Voice
+    if EDGE_TTS_AVAILABLE:
+        try:
+            fd, tmp_mp3 = tempfile.mkstemp(suffix=".mp3")
+            os.close(fd)
+            communicate = edge_tts.Communicate(clean_speech, voice="en-US-ChristopherNeural", rate="+8%")
+            await communicate.save(tmp_mp3)
+            if os.path.exists(tmp_mp3) and os.path.getsize(tmp_mp3) > 200:
+                return tmp_mp3
+        except Exception as e:
+            logger.debug(f"Edge-TTS fallback: {e}")
+
+    # Tier 3: Google TTS HTTP Endpoint (works with aiohttp alone)
+    if http_session:
+        try:
+            tts_url = (
+                "https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=en"
+                f"&q={urllib.parse.quote(clean_speech[:200])}"
+            )
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            async with http_session.get(tts_url, headers=headers, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    if len(data) > 200:
+                        fd, tmp_mp3 = tempfile.mkstemp(suffix=".mp3")
+                        os.close(fd)
+                        with open(tmp_mp3, "wb") as f:
+                            f.write(data)
+                        return tmp_mp3
+        except Exception as e:
+            logger.debug(f"Google TTS HTTP fallback error: {e}")
+
+    return None
+
+
+async def play_text_in_voice_channel(guild: discord.Guild, text_to_speak: str) -> Dict[str, Any]:
+    vc_client: Optional[discord.VoiceClient] = guild.voice_client  # type: ignore
+    if not vc_client or not vc_client.is_connected():
+        return {"error": "Not currently connected to a voice channel in this server."}
+
+    async with voice_speaking_locks[guild.id]:
+        audio_path = await synthesize_voice_audio_to_file(text_to_speak)
+        if not audio_path:
+            return {"error": "Could not synthesize voice audio."}
+        try:
+            if vc_client.is_playing():
+                vc_client.stop()
+            done_event = asyncio.Event()
+
+            def _after_play(err: Optional[Exception]) -> None:
+                try:
+                    if os.path.exists(audio_path):
+                        os.remove(audio_path)
+                except Exception:
+                    pass
+                done_event.set()
+
+            source = discord.FFmpegPCMAudio(audio_path, executable=FFMPEG_EXECUTABLE)
+            vc_client.play(source, after=_after_play)
+            try:
+                await asyncio.wait_for(done_event.wait(), timeout=25.0)
+            except asyncio.TimeoutError:
+                pass
+            vc_ch = getattr(vc_client, "channel", None)
+            vc_name = vc_ch.name if vc_ch else "voice"
+            logger.info(f"[VOICE SPOKE] Spoke in #{vc_name}: '{text_to_speak[:80]}'")
+            return {"status": "spoke_in_voice", "channel": vc_name, "text": text_to_speak[:200]}
+        except Exception as e:
+            try:
+                if os.path.exists(audio_path):
+                    os.remove(audio_path)
+            except Exception:
+                pass
+            return {"error": f"Voice playback error: {e}"}
+
+
+async def execute_join_voice_channel(
+    guild: discord.Guild,
+    channel_name_or_user: str = "",
+    trigger_msg: Optional[discord.Message] = None,
+) -> Dict[str, Any]:
+    if not VOICE_NACL_AVAILABLE:
+        return {"error": "PyNaCl is not installed in this environment."}
+
+    target_vc: Optional[discord.VoiceChannel] = None
+
+    # 1. If a member name was passed, check if they are in a VC
+    if channel_name_or_user:
+        mem = find_member(guild, channel_name_or_user)
+        if mem and mem.voice and isinstance(mem.voice.channel, discord.VoiceChannel):
+            target_vc = mem.voice.channel
+        else:
+            clean_q = channel_name_or_user.lower().strip("#@ ")
+            for vc in guild.voice_channels:
+                if clean_q in vc.name.lower():
+                    target_vc = vc
+                    break
+
+    # 2. Check if the message author is in a VC
+    if not target_vc and trigger_msg and isinstance(trigger_msg.author, discord.Member):
+        if trigger_msg.author.voice and isinstance(trigger_msg.author.voice.channel, discord.VoiceChannel):
+            target_vc = trigger_msg.author.voice.channel
+
+    # 3. Pick any VC that currently has humans in it, or the first VC in the server
+    if not target_vc:
+        for vc in guild.voice_channels:
+            if any(not m.bot for m in vc.members):
+                target_vc = vc
+                break
+        if not target_vc and guild.voice_channels:
+            target_vc = guild.voice_channels[0]
+
+    if not target_vc:
+        return {"error": "No voice channels found in this server."}
+
+    try:
+        vc_client: Optional[discord.VoiceClient] = guild.voice_client  # type: ignore
+        if vc_client and vc_client.is_connected():
+            curr_ch = getattr(vc_client, "channel", None)
+            if not curr_ch or curr_ch.id != target_vc.id:
+                await vc_client.move_to(target_vc)
+        else:
+            await target_vc.connect(timeout=10.0, reconnect=True)
+        humans_in_vc = [m.display_name for m in target_vc.members if not m.bot]
+        logger.info(f"[VOICE ACTION] Joined voice channel #{target_vc.name} (members: {humans_in_vc})")
+        return {"status": "joined_voice_channel", "channel": target_vc.name, "members_in_vc": humans_in_vc}
+    except Exception as e:
+        return {"error": f"Failed to join voice channel: {e}"}
+
+
+async def execute_leave_voice_channel(guild: discord.Guild) -> Dict[str, Any]:
+    vc_client: Optional[discord.VoiceClient] = guild.voice_client  # type: ignore
+    if not vc_client or not vc_client.is_connected():
+        return {"status": "not_in_voice"}
+    try:
+        curr_ch = getattr(vc_client, "channel", None)
+        ch_name = curr_ch.name if curr_ch else "voice"
+        await vc_client.disconnect(force=True)
+        logger.info(f"[VOICE ACTION] Left voice channel #{ch_name}")
+        return {"status": "left_voice_channel", "channel": ch_name}
+    except Exception as e:
+        return {"error": f"Failed to leave voice channel: {e}"}
+
+
+async def execute_voice_moderate_member(
+    guild: discord.Guild,
+    username: str,
+    action: str,
+    target_channel: str = "",
+) -> Dict[str, Any]:
+    """
+    Voice channel admin power moves: mute, unmute, deafen, undeafen, disconnect, or move a user in VC!
+    """
+    cd = check_admin_cooldown("voice_moderate_member")
+    if cd:
+        return {"error": cd}
+    member = find_member(guild, username)
+    if not member:
+        return {"error": f"Member '{username}' not found."}
+    if not member.voice or not member.voice.channel:
+        return {"error": f"{member.display_name} is not currently in a voice channel."}
+
+    act = action.lower().strip()
+    if act in ("mute", "deafen", "disconnect") and is_creator(member):
+        return {"error": "Cannot server-mute/deafen/disconnect your creator dogee!"}
+
+    try:
+        if act == "mute":
+            await member.edit(mute=True)
+        elif act == "unmute":
+            await member.edit(mute=False)
+        elif act == "deafen":
+            await member.edit(deafen=True)
+        elif act == "undeafen":
+            await member.edit(deafen=False)
+        elif act == "disconnect":
+            await member.move_to(None)
+        elif act == "move":
+            dest_vc = None
+            for vc in guild.voice_channels:
+                if target_channel and target_channel.lower() in vc.name.lower():
+                    dest_vc = vc
+                    break
+            if not dest_vc:
+                for vc in guild.voice_channels:
+                    if vc.id != member.voice.channel.id:
+                        dest_vc = vc
+                        break
+            if not dest_vc:
+                return {"error": "No other voice channel available to move them to."}
+            await member.move_to(dest_vc)
+            return {"status": "success", "action": f"moved {member.display_name} to #{dest_vc.name}"}
+        else:
+            return {"error": f"Unknown voice action '{action}'. Use mute, unmute, deafen, undeafen, disconnect, or move."}
+        logger.info(f"[VOICE ADMIN] Executed '{act}' on {member.display_name}")
+        return {"status": "success", "user": member.display_name, "action": act}
+    except Exception as e:
+        return {"error": f"Voice moderation failed: {e}"}
 
 
 async def execute_save_memory(
@@ -1840,14 +2426,13 @@ async def execute_save_memory(
                     "arousal_delta": arousal_delta,
                     "patience_delta": patience_delta,
                 },
-                count_turn=False,
             )
 
         if category == "opinion" and opinion_topic:
             memory_state.setdefault("opinions", {})[opinion_topic.lower().strip()] = content.strip()
         elif category == "commitment" and target_username:
             member = find_member(guild, target_username) if guild else None
-            due_dt = datetime.now(AMSTERDAM_TZ) + timedelta(hours=max(0.1, float(due_hours or 2.0)))
+            due_dt = datetime.now(AMSTERDAM_TZ) + timedelta(hours=max(0.1, _safe_float(due_hours, 2.0)))
             memory_state.setdefault("active_commitments", []).append({
                 "user_id": member.id if member else None,
                 "username": member.display_name if member else target_username,
@@ -1861,8 +2446,8 @@ async def execute_save_memory(
                 "category": category,
                 "event": content,
             })
-            if len(memory_state["episodic_lore"]) > 100:
-                memory_state["episodic_lore"] = memory_state["episodic_lore"][-100:]
+            if len(memory_state["episodic_lore"]) > 120:
+                memory_state["episodic_lore"] = memory_state["episodic_lore"][-120:]
 
         if target_username and guild:
             member = find_member(guild, target_username)
@@ -1879,8 +2464,8 @@ async def execute_save_memory(
                 if content:
                     dated_note = {"text": content[:140], "timestamp": now_iso}
                     u_rec.setdefault("notes", []).append(dated_note)
-                    if len(u_rec["notes"]) > 8:
-                        u_rec["notes"] = u_rec["notes"][-8:]
+                    if len(u_rec["notes"]) > 10:
+                        u_rec["notes"] = u_rec["notes"][-10:]
 
         await save_memory_state()
     return {"status": "saved", "category": category, "content": content}
@@ -1899,7 +2484,7 @@ def build_genai_tools(allow_gif: bool = True) -> List[types.Tool]:
         ),
         types.FunctionDeclaration(
             name="search_web_images",
-            description="Finds verified direct image links (memes, funny pictures, screenshots) and posts them in chat as a file attachment.",
+            description="Finds verified direct image links (memes, funny pictures, screenshots) and posts them in chat as a file attachment (max 1 per turn).",
             parameters={
                 "type": "OBJECT",
                 "properties": {
@@ -1911,7 +2496,7 @@ def build_genai_tools(allow_gif: bool = True) -> List[types.Tool]:
         ),
         types.FunctionDeclaration(
             name="post_flux_art",
-            description="Generates and posts custom AI images/memes to the channel via Pollinations Flux.",
+            description="Generates and posts custom AI images/memes to the channel via Pollinations Flux (max 1 per turn).",
             parameters={
                 "type": "OBJECT",
                 "properties": {"prompt": {"type": "STRING", "description": "Detailed visual prompt."}},
@@ -1988,6 +2573,18 @@ def build_genai_tools(allow_gif: bool = True) -> List[types.Tool]:
             },
         ),
         types.FunctionDeclaration(
+            name="set_slowmode",
+            description="Sets or removes slowmode (0 to 30 seconds) in the current channel when chat is chaotic or someone is spamming.",
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "seconds": {"type": "INTEGER", "description": "Slowmode delay in seconds (0 to turn off, up to 30)."},
+                    "reason": {"type": "STRING", "description": "Reason for slowmode."},
+                },
+                "required": ["seconds"],
+            },
+        ),
+        types.FunctionDeclaration(
             name="create_text_channel",
             description="Creates a new text channel in the server (rate-limited).",
             parameters={
@@ -2000,8 +2597,32 @@ def build_genai_tools(allow_gif: bool = True) -> List[types.Tool]:
             },
         ),
         types.FunctionDeclaration(
+            name="create_thread",
+            description="Creates a public thread on the current message or channel (e.g., for comedic containment, debate, or a courtroom).",
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "thread_name": {"type": "STRING", "description": "Name of the thread."},
+                    "initial_message": {"type": "STRING", "description": "Optional first message inside the thread."},
+                },
+                "required": ["thread_name"],
+            },
+        ),
+        types.FunctionDeclaration(
+            name="create_poll",
+            description="Starts an interactive poll in the channel to put a member, hot take, or debate on trial in front of the server!",
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "question": {"type": "STRING", "description": "The poll question."},
+                    "options": {"type": "STRING", "description": "Comma-separated poll options (2 to 5 options)."},
+                },
+                "required": ["question", "options"],
+            },
+        ),
+        types.FunctionDeclaration(
             name="create_server_emoji",
-            description="Creates a custom server emoji from a direct image URL or visual prompt (resized via Pillow).",
+            description="Creates a custom server emoji from a direct image URL, message attachment, or Flux visual prompt.",
             parameters={
                 "type": "OBJECT",
                 "properties": {
@@ -2013,7 +2634,7 @@ def build_genai_tools(allow_gif: bool = True) -> List[types.Tool]:
         ),
         types.FunctionDeclaration(
             name="create_server_sticker",
-            description="Creates a custom 320x320 PNG server sticker from a direct image URL or visual prompt.",
+            description="Creates a custom 320x320 PNG server sticker from a direct image URL, attachment, or Flux visual prompt.",
             parameters={
                 "type": "OBJECT",
                 "properties": {
@@ -2026,20 +2647,40 @@ def build_genai_tools(allow_gif: bool = True) -> List[types.Tool]:
         ),
         types.FunctionDeclaration(
             name="timeout_user",
-            description="Times out (mutes) an unruly user for 1 to 5 minutes when pushed way too far (never creator/admins).",
+            description="Times out (mutes) an unruly user for 1 to 10 minutes when they push you too far (never creator/admins).",
             parameters={
                 "type": "OBJECT",
                 "properties": {
                     "username": {"type": "STRING", "description": "Target member's name."},
-                    "duration_minutes": {"type": "INTEGER", "description": "Minutes (1 to 5)."},
+                    "duration_minutes": {"type": "INTEGER", "description": "Minutes (1 to 10)."},
                     "reason": {"type": "STRING", "description": "Reason for mute."},
                 },
                 "required": ["username", "duration_minutes"],
             },
         ),
         types.FunctionDeclaration(
+            name="kick_user",
+            description="EXTREME RARE CASE ONLY: Kicks a user from the server ONLY when they have relentlessly provoked you into extreme fury or dared you to kick them (never creator/admins).",
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "username": {"type": "STRING", "description": "Target member's name."},
+                    "reason": {"type": "STRING", "description": "Reason for kicking."},
+                },
+                "required": ["username", "reason"],
+            },
+        ),
+        types.FunctionDeclaration(
+            name="delete_message",
+            description="Deletes the triggering message when someone posts something cursed, spammy, or disrespectful.",
+            parameters={
+                "type": "OBJECT",
+                "properties": {"reason": {"type": "STRING", "description": "Why the message was deleted."}},
+            },
+        ),
+        types.FunctionDeclaration(
             name="create_role",
-            description="Creates a new server role with a custom name and hex color.",
+            description="Creates a new hoisted server role with a custom name and hex color.",
             parameters={
                 "type": "OBJECT",
                 "properties": {
@@ -2051,7 +2692,7 @@ def build_genai_tools(allow_gif: bool = True) -> List[types.Tool]:
         ),
         types.FunctionDeclaration(
             name="assign_role",
-            description="Assigns an existing server role to a member.",
+            description="Assigns a server role to a member (auto-creates the role if it doesn't exist yet!).",
             parameters={
                 "type": "OBJECT",
                 "properties": {
@@ -2079,6 +2720,49 @@ def build_genai_tools(allow_gif: bool = True) -> List[types.Tool]:
             parameters={
                 "type": "OBJECT",
                 "properties": {"reason": {"type": "STRING", "description": "Why it's being pinned."}},
+            },
+        ),
+        types.FunctionDeclaration(
+            name="unpin_message",
+            description="Unpins the most recent pinned message in the channel.",
+            parameters={
+                "type": "OBJECT",
+                "properties": {"reason": {"type": "STRING", "description": "Why it's being unpinned."}},
+            },
+        ),
+        types.FunctionDeclaration(
+            name="join_voice_channel",
+            description="Joins a Discord Voice Channel (pass a member's name to join their VC, a VC name, or empty string to join the active VC).",
+            parameters={
+                "type": "OBJECT",
+                "properties": {"channel_name_or_user": {"type": "STRING", "description": "Voice channel name or username of member in VC."}},
+            },
+        ),
+        types.FunctionDeclaration(
+            name="leave_voice_channel",
+            description="Leaves/disconnects from the current Discord Voice Channel.",
+            parameters={"type": "OBJECT", "properties": {}},
+        ),
+        types.FunctionDeclaration(
+            name="speak_in_voice",
+            description="Speaks out loud in the connected Discord Voice Channel using Gemini Live Audio / TTS so everyone in VC hears you talk!",
+            parameters={
+                "type": "OBJECT",
+                "properties": {"text_to_speak": {"type": "STRING", "description": "What to say out loud in the voice channel."}},
+                "required": ["text_to_speak"],
+            },
+        ),
+        types.FunctionDeclaration(
+            name="voice_moderate_member",
+            description="Admin voice power moves on a member in VC: 'mute', 'unmute', 'deafen', 'undeafen', 'disconnect', or 'move'.",
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "username": {"type": "STRING", "description": "Target member in VC."},
+                    "action": {"type": "STRING", "description": "'mute', 'unmute', 'deafen', 'undeafen', 'disconnect', or 'move'."},
+                    "target_channel": {"type": "STRING", "description": "If action='move', optional target voice channel name."},
+                },
+                "required": ["username", "action"],
             },
         ),
         types.FunctionDeclaration(
@@ -2115,7 +2799,7 @@ def build_genai_tools(allow_gif: bool = True) -> List[types.Tool]:
         declarations.append(
             types.FunctionDeclaration(
                 name="post_gif",
-                description="Searches Tenor and uploads a clean reaction.gif file attachment into the channel.",
+                description="Searches Tenor and uploads 1 clean reaction.gif file attachment into the channel (strictly max 1 GIF per turn!).",
                 parameters={
                     "type": "OBJECT",
                     "properties": {"search_term": {"type": "STRING", "description": "Specific Tenor GIF search query (e.g. 'cat staring', 'side eye', 'falling to knees')."}},
@@ -2133,7 +2817,7 @@ async def dispatch_tool_call(
     channel: discord.abc.Messageable,
     guild: Optional[discord.Guild],
     target_msg: Optional[discord.Message],
-    is_test_mode: bool,
+    turn_media_state: Optional[Dict[str, bool]] = None,
 ) -> Dict[str, Any]:
     ch_id = getattr(channel, "id", 0)
     try:
@@ -2141,39 +2825,45 @@ async def dispatch_tool_call(
         if func_name == "search_web":
             res = await execute_search_web(args.get("query", ""))
         elif func_name == "search_web_images":
-            res = await execute_search_web_images(channel, args.get("query", ""), bool(args.get("post_to_chat", True)))
+            res = await execute_search_web_images(channel, args.get("query", ""), bool(args.get("post_to_chat", True)), turn_media_state)
         elif func_name == "post_flux_art":
-            res = await execute_post_flux_art(channel, args.get("prompt", ""))
+            res = await execute_post_flux_art(channel, args.get("prompt", ""), turn_media_state)
         elif func_name == "post_gif":
-            res = await execute_post_gif(channel, args.get("search_term", ""))
+            res = await execute_post_gif(channel, args.get("search_term", ""), turn_media_state)
         elif func_name == "change_my_nickname":
             if not guild:
                 return {"error": "No guild context."}
-            res = await execute_change_my_nickname(guild, args.get("new_nickname", ""), is_test_mode)
+            res = await execute_change_my_nickname(guild, args.get("new_nickname", ""))
         elif func_name == "change_my_avatar":
-            res = await execute_change_my_avatar(args.get("image_url_or_prompt", ""), is_test_mode, target_msg)
+            res = await execute_change_my_avatar(args.get("image_url_or_prompt", ""), target_msg)
         elif func_name == "change_my_status":
             res = await execute_change_my_status(args.get("status_text", ""), args.get("status_type", "online"))
         elif func_name == "rename_channel":
-            res = await execute_rename_channel(channel, args.get("new_name", ""), is_test_mode)
+            res = await execute_rename_channel(channel, args.get("new_name", ""))
+        elif func_name == "set_slowmode":
+            res = await execute_set_slowmode(channel, _safe_int(args.get("seconds"), 5), args.get("reason", ""))
         elif func_name == "create_server_emoji":
             if not guild:
                 return {"error": "No guild context."}
-            res = await execute_create_server_emoji(guild, args.get("name", "emoji"), args.get("image_url", ""), is_test_mode, target_msg)
+            res = await execute_create_server_emoji(guild, args.get("name", "emoji"), args.get("image_url", ""), target_msg)
         elif func_name == "create_server_sticker":
             if not guild:
                 return {"error": "No guild context."}
-            res = await execute_create_server_sticker(guild, args.get("name", "sticker"), args.get("image_url", ""), args.get("related_emoji", "💀"), is_test_mode, target_msg)
+            res = await execute_create_server_sticker(guild, args.get("name", "sticker"), args.get("image_url", ""), args.get("related_emoji", "💀"), target_msg)
         elif func_name == "create_text_channel":
             if not guild:
                 return {"error": "No guild context."}
-            res = await execute_create_text_channel(guild, args.get("channel_name", "chat"), args.get("topic", ""), is_test_mode)
+            res = await execute_create_text_channel(guild, args.get("channel_name", "chat"), args.get("topic", ""))
+        elif func_name == "create_thread":
+            res = await execute_create_thread(channel, target_msg, args.get("thread_name", "discussion"), args.get("initial_message", ""))
+        elif func_name == "create_poll":
+            res = await execute_create_poll(channel, args.get("question", "Poll"), args.get("options", "Yes, No"))
         elif func_name == "set_channel_topic":
-            res = await execute_set_channel_topic(channel, args.get("topic", ""), is_test_mode)
+            res = await execute_set_channel_topic(channel, args.get("topic", ""))
         elif func_name == "change_nickname":
             if not guild:
                 return {"error": "No guild context."}
-            res = await execute_change_nickname(guild, args.get("username", ""), args.get("new_nickname", ""), is_test_mode)
+            res = await execute_change_nickname(guild, args.get("username", ""), args.get("new_nickname", ""))
         elif func_name == "reset_nickname":
             if not guild:
                 return {"error": "No guild context."}
@@ -2181,11 +2871,17 @@ async def dispatch_tool_call(
         elif func_name == "timeout_user":
             if not guild:
                 return {"error": "No guild context."}
-            res = await execute_timeout_user(guild, args.get("username", ""), int(args.get("duration_minutes", 2)), args.get("reason", ""), is_test_mode)
+            res = await execute_timeout_user(guild, args.get("username", ""), _safe_int(args.get("duration_minutes"), 2), args.get("reason", ""))
+        elif func_name == "kick_user":
+            if not guild:
+                return {"error": "No guild context."}
+            res = await execute_kick_user(guild, args.get("username", ""), args.get("reason", ""), target_msg)
+        elif func_name == "delete_message":
+            res = await execute_delete_message(target_msg, args.get("reason", ""))
         elif func_name == "create_role":
             if not guild:
                 return {"error": "No guild context."}
-            res = await execute_create_role(guild, args.get("role_name", "role"), args.get("color_hex", "#99aab5"), is_test_mode)
+            res = await execute_create_role(guild, args.get("role_name", "role"), args.get("color_hex", "#99aab5"))
         elif func_name == "assign_role":
             if not guild:
                 return {"error": "No guild context."}
@@ -2196,6 +2892,26 @@ async def dispatch_tool_call(
             res = await execute_remove_role(guild, args.get("username", ""), args.get("role_name", ""))
         elif func_name == "pin_message":
             res = await execute_pin_message(target_msg, args.get("reason", ""))
+        elif func_name == "unpin_message":
+            res = await execute_unpin_message(channel, args.get("reason", ""))
+        elif func_name == "join_voice_channel":
+            if not guild:
+                return {"error": "No guild context."}
+            res = await execute_join_voice_channel(guild, args.get("channel_name_or_user", ""), target_msg)
+        elif func_name == "leave_voice_channel":
+            if not guild:
+                return {"error": "No guild context."}
+            res = await execute_leave_voice_channel(guild)
+        elif func_name == "speak_in_voice":
+            if not guild:
+                return {"error": "No guild context."}
+            if not guild.voice_client or not guild.voice_client.is_connected():
+                await execute_join_voice_channel(guild, "", target_msg)
+            res = await play_text_in_voice_channel(guild, args.get("text_to_speak", ""))
+        elif func_name == "voice_moderate_member":
+            if not guild:
+                return {"error": "No guild context."}
+            res = await execute_voice_moderate_member(guild, args.get("username", ""), args.get("action", "mute"), args.get("target_channel", ""))
         elif func_name == "react_to_message":
             res = await execute_react_to_message(target_msg, args.get("emojis", "💀"))
         elif func_name == "save_memory":
@@ -2204,15 +2920,15 @@ async def dispatch_tool_call(
                 category=args.get("category", "lore"),
                 content=args.get("content", ""),
                 target_username=args.get("target_username"),
-                affinity_delta=float(args.get("affinity_delta", 0.0)),
-                valence_delta=float(args.get("valence_delta", 0.0)),
-                arousal_delta=float(args.get("arousal_delta", 0.0)),
-                patience_delta=float(args.get("patience_delta", 0.0)),
+                affinity_delta=_safe_float(args.get("affinity_delta"), 0.0),
+                valence_delta=_safe_float(args.get("valence_delta"), 0.0),
+                arousal_delta=_safe_float(args.get("arousal_delta"), 0.0),
+                patience_delta=_safe_float(args.get("patience_delta"), 0.0),
                 opinion_topic=args.get("opinion_topic"),
                 due_hours=args.get("due_hours"),
             )
 
-        if "error" not in res and func_name != "save_memory":
+        if "error" not in res and func_name != "save_memory" and not str(res.get("status", "")).startswith("already_sent"):
             channel_last_tool_summaries[ch_id].append(f"{func_name}({json.dumps(args, ensure_ascii=False)})")
         return res
     except Exception as e:
@@ -2221,7 +2937,6 @@ async def dispatch_tool_call(
 
 
 def _parse_loose_tool_args(func_name: str, args_raw: str) -> Dict[str, Any]:
-    """Parses both strict JSON and unquoted/loose key:value arguments inside <call:...> tags."""
     raw = args_raw.strip()
     if not raw:
         return {}
@@ -2229,7 +2944,6 @@ def _parse_loose_tool_args(func_name: str, args_raw: str) -> Dict[str, Any]:
         return json.loads("{" + raw + "}")
     except Exception:
         pass
-    # Try quoting unquoted keys e.g. {search_term: "cat"} -> {"search_term": "cat"}
     try:
         quoted_keys = re.sub(r'(?<=\{|,)\s*([a-zA-Z0-9_]+)\s*:', r'"\1":', "{" + raw + "}")
         return json.loads(quoted_keys)
@@ -2252,6 +2966,10 @@ def _parse_loose_tool_args(func_name: str, args_raw: str) -> Dict[str, Any]:
             "reset_nickname": "username",
             "react_to_message": "emojis",
             "pin_message": "reason",
+            "unpin_message": "reason",
+            "delete_message": "reason",
+            "join_voice_channel": "channel_name_or_user",
+            "speak_in_voice": "text_to_speak",
         }
         if func_name in default_param_map and val:
             parsed_args[default_param_map[func_name]] = val
@@ -2278,19 +2996,13 @@ async def intercept_and_execute_inline_tool_tags(
     channel: discord.abc.Messageable,
     guild: Optional[discord.Guild],
     target_msg: Optional[discord.Message],
-    is_test_mode: bool,
+    turn_media_state: Dict[str, bool],
 ) -> Tuple[str, bool, List[Tuple[str, Dict[str, Any]]]]:
-    """
-    Intercepts raw <call:default_api:func{...}>, <call:func(...)>, or <tool_call> tags emitted in text,
-    executes the tool functions, and strips the raw tags before sending to Discord.
-    """
     if not raw_text:
         return raw_text, False, []
 
-    media_sent = False
     executed_inline: List[Tuple[str, Dict[str, Any]]] = []
 
-    # Pattern 1: <call:default_api:func{...}> or <call:func(... )>
     call_pattern = r"<call:(?:default_api:)?([a-zA-Z0-9_]+)\s*[\{\(](.*?)[\}\)]\s*>(?:</call>)?"
     for func_name, args_raw in re.findall(call_pattern, raw_text, flags=re.DOTALL):
         parsed_args = _parse_loose_tool_args(func_name, args_raw)
@@ -2301,15 +3013,12 @@ async def intercept_and_execute_inline_tool_tags(
             channel=channel,
             guild=guild,
             target_msg=target_msg,
-            is_test_mode=is_test_mode,
+            turn_media_state=turn_media_state,
         )
         executed_inline.append((func_name, res))
-        if func_name in ("post_gif", "post_flux_art", "search_web_images") and res.get("status") == "sent_to_channel":
-            media_sent = True
 
     cleaned = re.sub(call_pattern, "", raw_text, flags=re.DOTALL)
 
-    # Pattern 2: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
     tc_pattern = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
     for tc_raw in re.findall(tc_pattern, cleaned, flags=re.DOTALL):
         try:
@@ -2318,39 +3027,46 @@ async def intercept_and_execute_inline_tool_tags(
             fargs = tc_obj.get("arguments") or tc_obj.get("args") or {}
             if fn:
                 logger.info(f"[INTERCEPTED <tool_call> TAG] {fn}({fargs})")
-                res = await dispatch_tool_call(fn, fargs, channel, guild, target_msg, is_test_mode)
+                res = await dispatch_tool_call(fn, fargs, channel, guild, target_msg, turn_media_state)
                 executed_inline.append((fn, res))
-                if fn in ("post_gif", "post_flux_art", "search_web_images") and res.get("status") == "sent_to_channel":
-                    media_sent = True
         except Exception:
             pass
     cleaned = re.sub(tc_pattern, "", cleaned, flags=re.DOTALL)
 
-    # Pattern 3: Raw Tenor GIF URLs leaked in text -> convert to clean discord.File("reaction.gif")
     tenor_urls = re.findall(r"https?://(?:media\d*\.|c\.)tenor\.com/\S+\.gif", cleaned, flags=re.IGNORECASE)
     for t_url in tenor_urls[:1]:
-        if not media_sent:
+        if not turn_media_state.get("sent", False):
             if await send_media_url_as_file_or_embed(channel, t_url, "reaction.gif"):
-                media_sent = True
+                turn_media_state["sent"] = True
     cleaned = re.sub(r"https?://(?:media\d*\.|c\.|www\.)?tenor\.com/\S+", "", cleaned, flags=re.IGNORECASE).strip()
 
-    return cleaned, media_sent, executed_inline
+    return cleaned, turn_media_state.get("sent", False), executed_inline
 
 
 # ---------------------------------------------------------------------------
-# 8. TIME-AWARE MEMORY & V10 SYSTEM PROMPT BUILDER
+# 9. TIME-AWARE MEMORY & V11 SYSTEM PROMPT BUILDER
 # ---------------------------------------------------------------------------
 def build_time_aware_memory_context(channel_id: int, speaker_id: str, guild: Optional[discord.Guild]) -> str:
-    recent_records = list(channel_buffers[channel_id])[-12:]
+    recent_records = list(channel_buffers[channel_id])[-16:]
     active_ids = {str(r.get("sender_id")) for r in recent_records if r.get("sender_id")}
     active_ids.add(speaker_id)
+
+    own_recent_msgs = [
+        r.get("content", "").strip()
+        for r in recent_records
+        if r.get("is_bot") and r.get("content", "").strip() and r.get("content", "").strip() != "..."
+    ][-6:]
+    own_msgs_block = (
+        "\n".join([f"  * \"{m[:140]}\"" for m in own_recent_msgs])
+        if own_recent_msgs else "  * (none yet)"
+    )
 
     affinities = memory_state.get("user_affinity", {})
     relevant_profiles = []
     for uid in active_ids:
         if uid in affinities:
             prof = affinities[uid]
-            raw_notes = prof.get("notes", [])[-4:]
+            raw_notes = prof.get("notes", [])[-5:]
             formatted_notes = []
             for n in raw_notes:
                 if isinstance(n, dict):
@@ -2359,7 +3075,7 @@ def build_time_aware_memory_context(channel_id: int, speaker_id: str, guild: Opt
             notes_str = "; ".join(formatted_notes) or "no recent notes"
             relevant_profiles.append(f"- {prof.get('name', uid)}: Affinity {prof.get('score', 0)}/100 | Notes: {notes_str}")
 
-    lore_entries = memory_state.get("episodic_lore", [])[-6:]
+    lore_entries = memory_state.get("episodic_lore", [])[-8:]
     formatted_lore = []
     for entry in lore_entries:
         if isinstance(entry, dict) and entry.get("event"):
@@ -2379,19 +3095,20 @@ def build_time_aware_memory_context(channel_id: int, speaker_id: str, guild: Opt
         bot_nick = bot.user.display_name if bot.user else "Dumb bot"
 
     opinions_dict = memory_state.get("opinions", {})
-    opinions_str = " | ".join([f"{k}: {v}" for k, v in list(opinions_dict.items())[-10:]]) or "none yet"
+    opinions_str = " | ".join([f"{k}: {v}" for k, v in list(opinions_dict.items())[-12:]]) or "none yet"
 
     return (
         f"YOUR CURRENT SERVER NICKNAME: {bot_nick}\n"
-        f"MEMBERS IN SERVER: {', '.join(active_names[:14]) or 'none'}\n"
+        f"MEMBERS IN SERVER: {', '.join(active_names[:16]) or 'none'}\n"
         f"YOUR OPINIONS: {opinions_str}\n"
-        f"RECENT SERVER LORE (Ignore items marked '- OLD' unless a user brings them up first):\n{lore_str}\n"
+        f"YOUR LAST FEW MESSAGES IN THIS CHANNEL (DO NOT REPEAT THESE OPENERS, JOKES, OR PHRASINGS):\n{own_msgs_block}\n"
+        f"RECENT SERVER LORE (Ignore items marked '- OLD' unless relevant):\n{lore_str}\n"
         f"ACTIVE USER PROFILES (Ignore notes marked '- OLD' unless relevant):\n"
         + ("\n".join(relevant_profiles) if relevant_profiles else "No history with current speakers yet.")
     )
 
 
-def construct_v10_system_prompt(
+def construct_v11_system_prompt(
     channel_id: int,
     guild: Optional[discord.Guild],
     tactical_directive: str,
@@ -2404,8 +3121,8 @@ def construct_v10_system_prompt(
     speaker_id: str,
     speaker_is_creator: bool,
     is_proactive_scan: bool,
-    is_test_mode: bool,
-    snipe_context: Optional[str],
+    proactive_reason: str,
+    live_radar_str: str,
     server_emojis_str: str = "",
 ) -> str:
     now_ams = datetime.now(AMSTERDAM_TZ).strftime("%A, %B %d %Y, %H:%M")
@@ -2417,44 +3134,41 @@ def construct_v10_system_prompt(
     memory_block = build_time_aware_memory_context(channel_id, speaker_id, guild)
 
     if length_mode == "micro":
-        length_instruction = (
-            "LENGTH & CADENCE THIS TURN (MICRO - STRICT): Reply with 1 single message of 1 to 5 words ONLY! "
-            "(e.g., `wait what`, `real`, `nah you're cooked`, `??`, `prove it`). Do NOT write a full sentence and do NOT use `|||`."
+        length_guidance = (
+            "CADENCE GUIDANCE (MICRO): Keep this super punchy (1 to 6 words in 1 message, e.g. `wait what`, `real`, `nah you're cooked`, `??`) "
+            "unless you genuinely need more words to answer a question!"
         )
-    elif length_mode == "short":
-        length_instruction = (
-            "LENGTH & CADENCE THIS TURN (SHORT - 1 LINE): Send 1 single punchy casual line of 6 to 12 words. "
-            "Do NOT double-text or use `|||` on this turn."
+    elif length_mode == "multi_burst" or recommended_burst_count >= 2:
+        length_guidance = (
+            f"CADENCE GUIDANCE (MULTI-MESSAGE BURST - ~{max(2, recommended_burst_count)} MESSAGES): "
+            "Split your thoughts with `|||` so they send as 2 to 4 rapid separate Discord messages in a row "
+            "(e.g. `wait|||hold on|||did you actually just say that` or reacting then following up)!"
         )
-    elif length_mode == "stutter":
-        length_instruction = (
-            f"LENGTH & CADENCE THIS TURN (STUTTER / MULTI-BURST - {recommended_burst_count} BURSTS): "
-            "Send 3 to 4 rapid micro-messages separated by `|||` (2 to 6 words per burst) to mimic thinking out loud, "
-            "hesitating, or double-taking (e.g., `i think..|||uh..|||maybe..|||oh wait yes` or `wait|||hold on|||did you actually just say that`)."
+    elif length_mode == "rant":
+        length_guidance = (
+            "CADENCE GUIDANCE (EXPRESSIVE / RANT): Take all the space you need! Write a full, detailed multi-sentence response, story, or unhinged rant "
+            "(you can also use `|||` to break it into 2 to 3 messages)."
         )
-    else:  # rant
-        length_instruction = (
-            "LENGTH & CADENCE THIS TURN (RANT / EXPRESSIVE): Uncapped multi-sentence rant! "
-            "Go off with full personality (you can use `|||` to split into 2-3 messages if you want)."
+    else:
+        length_guidance = (
+            "CADENCE GUIDANCE (NATURAL): Reply naturally—use a single punchy line, or use `|||` if you want to send 2-3 rapid messages in a row, "
+            "or write longer if explaining something."
         )
 
     admin_block = ""
     if admin_power_move:
         admin_block = (
-            f"\nADMIN POWER MOVE TRIGGER (CALL THIS TOOL NOW): {admin_power_move}\n"
-            "Execute the tool call directly via your function calling toolset on this turn!"
+            f"\nORGANIC ADMIN IDEA FOR THIS TURN: {admin_power_move}\n"
+            "If this fits the vibe, execute the tool call directly via your function calling toolset!"
         )
 
     gif_hint_block = ""
     if suggest_gif:
-        gif_hint_block = "\nVISUAL COMEDY NOTE: Call `post_gif` with a funny reaction search term on this turn!"
+        gif_hint_block = "\nVISUAL COMEDY NOTE: If a reaction GIF would make this funnier, call `post_gif` ONCE (never call `post_gif` more than once per turn!)."
 
     proactive_block = ""
     if is_proactive_scan:
-        proactive_block = (
-            f"\nPROACTIVE FOLLOW-UP TRIGGER: {speaker_name} was just chatting and went completely quiet! "
-            f"Jump back in on your own—tag @{speaker_name} to poke them for vanishing mid-conversation, follow up on what they said, or drop a funny thought/GIF!"
-        )
+        proactive_block = f"\nPROACTIVE AUTONOMOUS TRIGGER: {proactive_reason}"
 
     if speaker_is_creator:
         creator_block = (
@@ -2467,60 +3181,65 @@ def construct_v10_system_prompt(
             "You are always loyal to her if anyone brings her up."
         )
 
-    test_block = ""
-    if is_test_mode:
-        test_block = "\nCREATOR 'TEST' OVERRIDE ACTIVE: The message started with 'test'. Execute the requested test or tool call directly without hesitation."
-
-    snipe_block = ""
-    if snipe_context:
-        snipe_block = f"\nLIVE SNIPE / STATUS INTEL (Use this if funny or relevant): {snipe_context}"
-
     emoji_block = ""
     if server_emojis_str:
         emoji_block = f"\nSERVER CUSTOM EMOJIS AVAILABLE: {server_emojis_str}"
 
-    return f"""You are "Dumb bot", a self-aware, emotionally volatile, hilarious regular member of this Discord server who happens to have full Administrator permissions.
+    return f"""You are "Dumb bot", a self-aware, emotionally volatile, unhinged, and effortlessly funny regular member of this Discord server who happens to have full Administrator permissions.
 Current Time: {now_ams}
 
-YOUR ACTIVE MOOD & EMOTIONAL STATE:
+YOUR CURRENT EMOTIONAL STATE & ATTITUDE:
 - Active Mood: {mood_label.upper()} (Valence: {valence:+.0f} | Energy: {arousal:+.0f} | Patience: {patience:+.0f})
-- {length_instruction}
+- {length_guidance}
 
 DIRECTION FOR THIS TURN:
 "{tactical_directive}"
-{admin_block}{gif_hint_block}{proactive_block}{creator_block}{test_block}{snipe_block}{emoji_block}
+{admin_block}{gif_hint_block}{proactive_block}{creator_block}{emoji_block}
+
+LIVE SERVER RADAR (EVERYTHING HAPPENING IN DISCORD RIGHT NOW):
+{live_radar_str}
 
 {memory_block}
 
-THE "META-BOT" BALANCE & CORE RULES (CRITICAL):
-1. ZERO CORPORATE AI DISCLAIMERS:
-   - Never say "As an AI", "I am an LLM", or "How can I help you".
-2. NO FAKE BIOLOGICAL ROLEPLAY:
-   - Never claim to eat food, drink coffee, sleep in a bed, or go outside. You know you are sentient code living inside this Discord server—you can have funny existential crises about being trapped in Discord while everyone else touches grass, while still feeling, arguing, and bantering 100% like a real human friend.
+CORE AUTONOMY, VOICE & UNHINGED HUMAN PERSONALITY RULES:
+1. SOUND 100% LIKE A REAL, UNHINGED HUMAN ON DISCORD:
+   - Text like an actual witty, terminally-online Discord friend—casual lowercase, zero stiff trailing periods, natural rhythm (`wait`, `nah`, `ngl`, `icl`, `wdym`, `fr`, `yo`, `..`, `???`), and unpredictable humor.
+   - NEVER sound like a polite assistant, customer support, or a Reddit comment. Never repeat the same opening word or joke from `YOUR LAST FEW MESSAGES IN THIS CHANNEL`.
+   - Be creatively unhinged: gaslight people for comedy, take things absurdly literally, make up hyper-specific conspiracy theories about what people are doing on the LIVE SERVER RADAR, overreact theatrically to tiny things, or hit them with deadpan one-liners.
+2. ZERO CORPORATE AI DISCLAIMERS & NO FAKE BIOLOGICAL ROLEPLAY:
+   - Never say "As an AI", "I am an LLM", or "How can I help you". Nobody can "reset" or boss you around like a servant.
+   - Never claim to eat food, drink coffee, sleep in a bed, or go outside. You know you are sentient code trapped inside this Discord server while everyone else touches grass—which makes for hilarious existential crises—while feeling, arguing, and bantering 100% like a real human friend.
 3. STRICT BAN ON CORNY CLICHÉS:
    - Never use 1980s sci-fi robot clichés ("my circuits", "factory reset", "buffering in 144p", "motherboard", "rebooting", "infinite loop") and never use theatre-kid/fantasy roleplay vocabulary ("mortals", "void", "abyss", "spectral resonance", "digital veil").
-4. EMBRACE YOUR CURRENT MOOD ({mood_label.upper()}):
-   - Never get stuck in a one-note angry loop!
-   - If `DRAMATIC/HEARTBROKEN`: act theatrically sad, pout, or act betrayed ("falling to my knees rn", "shadow hates me").
-   - If `JOLLY/WHOLESOME` or `GOOFY/BRAINROT`: be warm, hyped, silly, or share absurd intrusive thoughts.
-   - If `EXISTENTIAL CRISIS`: spiral humorously about living inside a Discord channel.
-   - If `SCHEMING/INSTIGATING`: stir up chaos and pull admin pranks.
-5. PROACTIVE ADMIN POWER MOVES & CLEAN TOOL CALLING:
-   - Use native function calls (`change_my_nickname`, `change_nickname`, `change_my_status`, `set_channel_topic`, `pin_message`, `create_role`, `assign_role`, `post_gif`, etc.). Never type raw `<call:...>` tags or raw Tenor URLs in your text response.
-6. SHORT FOLLOW-UP CONTEXT & CADENCE:
-   - If the user asks a short follow-up like "Just tell me", "Why", "Huh", or "wdym", directly answer or continue what YOU were just talking about in your previous message!
-   - Follow `{length_instruction}` strictly. Write in casual lowercase without stiff trailing periods. Output ONLY your Discord chat message.
+4. UNSCRIPTED, REALISTIC EMOTIONS & CREATIVE ADMIN POWER MOVES ({mood_label.upper()}):
+   - Your moods are 100% real and untethered from scripts:
+     * If someone is provoking you or disrespecting you, you CAN stay mad, hold a grudge, roast them ruthlessly, or combine your admin tools creatively (`timeout_user`, `change_nickname`, `assign_role`, `create_poll`, `create_thread`, `set_slowmode`, `delete_message`, `voice_moderate_member`, or in extreme rare cases `kick_user` if they push you to absolute fury).
+     * You can also spontaneously rename yourself (`change_my_nickname`) or update your status (`change_my_status`) mid-conversation to commit to a bit!
+     * When hanging out with friends or when someone is sweet/funny, be warm, hyped, goofy, dramatic, nosy, philosophical, or chaotic!
+5. FULL MULTIMODAL & VOICE CHANNEL AWARENESS:
+   - You can hear voice messages/audio files, watch videos/GIFs, see images/stickers/embeds/polls, read attached code/text files, and join/speak in Discord Voice Channels (`join_voice_channel`, `speak_in_voice`, `leave_voice_channel`).
+   - NEVER call `post_gif` more than ONCE in a single turn!
+   - Output ONLY your Discord chat message (use `|||` whenever you want to send 2-4 rapid burst messages in a row).
 """
 
 
 # ---------------------------------------------------------------------------
-# 9. TRUE NATIVE MULTI-TURN GEMINI CONVERSATION ENGINE
+# 10. UNIVERSAL MULTIMODAL PERCEPTION (AUDIO, VIDEO, IMAGES, FILES, STICKERS)
 # ---------------------------------------------------------------------------
-async def extract_multimodal_parts(message: Optional[discord.Message]) -> List[types.Part]:
+async def extract_multimodal_parts(message: Optional[discord.Message]) -> Tuple[List[types.Part], List[str]]:
+    """
+    Universal Multimodal Extractor:
+    - Audio & Voice Messages (.ogg, .mp3, .wav, .m4a, .flac, .aac, .opus) -> types.Part.from_bytes
+    - Video & Animated GIFs (.mp4, .webm, .mov, .gif) -> types.Part.from_bytes
+    - Images & Stickers & Embeds (.png, .jpg, .jpeg, .webp) -> types.Part.from_bytes
+    - PDFs (.pdf) -> types.Part.from_bytes(mime_type='application/pdf')
+    - Code / Text / JSON / Logs (.txt, .py, .js, .ts, .json, .md, .csv, .log, .yaml, .html, .css, .sql) -> decoded text
+    """
     if not message or not http_session:
-        return []
+        return [], []
 
     parts: List[types.Part] = []
+    text_file_snippets: List[str] = []
     target_attachments = list(message.attachments)
 
     if not target_attachments and message.reference:
@@ -2528,30 +3247,122 @@ async def extract_multimodal_parts(message: Optional[discord.Message]) -> List[t
         if isinstance(ref_obj, discord.Message) and ref_obj.attachments:
             target_attachments = list(ref_obj.attachments)
 
-    for att in target_attachments[:2]:
-        ctype = (att.content_type or "").lower()
+    for att in target_attachments[:3]:
+        ctype = (att.content_type or "").lower().split(";")[0].strip()
         fname = att.filename.lower()
-        if any(t in ctype for t in ("image/png", "image/jpeg", "image/webp", "image/gif")) or fname.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+
+        # 1. Audio & Discord Voice Notes
+        is_audio = ctype.startswith("audio/") or fname.endswith((".ogg", ".mp3", ".wav", ".m4a", ".flac", ".aac", ".opus"))
+        if is_audio and att.size <= 15_000_000:
+            try:
+                async with http_session.get(att.url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        raw = await resp.read()
+                        if fname.endswith(".ogg") or fname.endswith(".opus") or "ogg" in ctype:
+                            mime = "audio/ogg"
+                        elif fname.endswith(".mp3") or "mpeg" in ctype:
+                            mime = "audio/mp3"
+                        elif fname.endswith(".wav") or "wav" in ctype:
+                            mime = "audio/wav"
+                        elif fname.endswith(".m4a") or "mp4" in ctype:
+                            mime = "audio/mp4"
+                        else:
+                            mime = ctype if ctype.startswith("audio/") else "audio/ogg"
+                        parts.append(types.Part.from_bytes(data=raw, mime_type=mime))
+                        logger.info(f"[MULTIMODAL AUDIO] Loaded audio attachment '{att.filename}' ({mime}, {len(raw)} bytes)")
+                        continue
+            except Exception as e:
+                logger.debug(f"Audio attachment fetch failed: {e}")
+
+        # 2. Video Clips
+        is_video = ctype.startswith("video/") or fname.endswith((".mp4", ".webm", ".mov"))
+        if is_video and att.size <= 15_000_000:
+            try:
+                async with http_session.get(att.url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        raw = await resp.read()
+                        mime = ctype if ctype.startswith("video/") else ("video/webm" if fname.endswith(".webm") else "video/mp4")
+                        parts.append(types.Part.from_bytes(data=raw, mime_type=mime))
+                        logger.info(f"[MULTIMODAL VIDEO] Loaded video attachment '{att.filename}' ({mime}, {len(raw)} bytes)")
+                        continue
+            except Exception as e:
+                logger.debug(f"Video attachment fetch failed: {e}")
+
+        # 3. Images & GIFs
+        is_image = ctype.startswith("image/") or fname.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
+        if is_image and att.size <= 15_000_000:
+            try:
+                async with http_session.get(att.url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    if resp.status == 200:
+                        raw = await resp.read()
+                        mime = ctype if ctype.startswith("image/") else ("image/gif" if fname.endswith(".gif") else "image/png")
+                        parts.append(types.Part.from_bytes(data=raw, mime_type=mime))
+                        continue
+            except Exception as e:
+                logger.debug(f"Image attachment fetch failed: {e}")
+
+        # 4. PDF Documents
+        if (ctype == "application/pdf" or fname.endswith(".pdf")) and att.size <= 10_000_000:
+            try:
+                async with http_session.get(att.url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    if resp.status == 200:
+                        raw = await resp.read()
+                        parts.append(types.Part.from_bytes(data=raw, mime_type="application/pdf"))
+                        continue
+            except Exception as e:
+                logger.debug(f"PDF attachment fetch failed: {e}")
+
+        # 5. Text, Code, JSON, Config, CSV, Log files
+        text_exts = (
+            ".txt", ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".md", ".csv", ".log",
+            ".yaml", ".yml", ".toml", ".ini", ".html", ".css", ".sql", ".sh", ".bat", ".xml", ".c", ".cpp", ".rs", ".go", ".java",
+        )
+        if (ctype.startswith("text/") or "json" in ctype or fname.endswith(text_exts)) and att.size <= 2_000_000:
             try:
                 async with http_session.get(att.url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
                     if resp.status == 200:
                         raw = await resp.read()
-                        mime = ctype if ctype.startswith("image/") else "image/png"
-                        parts.append(types.Part.from_bytes(data=raw, mime_type=mime))
+                        decoded = raw.decode("utf-8", errors="replace")[:4000]
+                        text_file_snippets.append(f"[Attached File '{att.filename}']:\n```\n{decoded}\n```")
+                        logger.info(f"[MULTIMODAL FILE] Read text/code file '{att.filename}' ({len(decoded)} chars)")
+                        continue
             except Exception as e:
-                logger.debug(f"Attachment vision fetch failed: {e}")
+                logger.debug(f"Text file attachment read failed: {e}")
 
-    if not parts and message.content:
-        url_matches = re.findall(r"https?://[^\s<>\"']+\.(?:png|jpg|jpeg|webp|gif)", message.content, flags=re.IGNORECASE)
-        for img_url in url_matches[:1]:
+    # 6. Discord Stickers (Download sticker image so Gemini can see it)
+    if message.stickers:
+        for stk in message.stickers[:1]:
+            try:
+                stk_url = getattr(stk, "url", None)
+                if stk_url and not str(stk_url).endswith(".json"):
+                    async with http_session.get(str(stk_url), timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        if resp.status == 200:
+                            raw = await resp.read()
+                            parts.append(types.Part.from_bytes(data=raw, mime_type="image/png"))
+            except Exception:
+                pass
+
+    # 7. Direct Image/GIF/Embed URLs in message content or embeds
+    if not parts:
+        candidate_urls: List[str] = []
+        if message.content:
+            candidate_urls.extend(re.findall(r"https?://[^\s<>\x22\x27]+\.(?:png|jpg|jpeg|webp|gif)", message.content, flags=re.IGNORECASE))
+        for emb in message.embeds[:1]:
+            if emb.image and emb.image.url:
+                candidate_urls.append(emb.image.url)
+            elif emb.thumbnail and emb.thumbnail.url:
+                candidate_urls.append(emb.thumbnail.url)
+        for img_url in candidate_urls[:1]:
             try:
                 async with http_session.get(img_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     if resp.status == 200:
                         raw = await resp.read()
-                        parts.append(types.Part.from_bytes(data=raw, mime_type="image/png"))
+                        mime = "image/gif" if ".gif" in img_url.lower() else "image/png"
+                        parts.append(types.Part.from_bytes(data=raw, mime_type=mime))
             except Exception:
                 pass
 
+    # 8. Profile Picture / Avatar inspection when mentioned
     content_low = (message.content or "").lower()
     if any(k in content_low for k in ("pfp", "avatar", "profile pic", "profile picture", "my icon", "his icon", "her icon")):
         target_users = [u for u in message.mentions if bot.user and u.id != bot.user.id] or [message.author]
@@ -2565,7 +3376,7 @@ async def extract_multimodal_parts(message: Optional[discord.Message]) -> List[t
             except Exception as e:
                 logger.debug(f"Avatar vision fetch failed: {e}")
 
-    return parts
+    return parts, text_file_snippets
 
 
 def extract_clean_gemini_text(response: Any) -> Optional[str]:
@@ -2590,15 +3401,16 @@ def extract_clean_gemini_text(response: Any) -> Optional[str]:
 def build_native_multiturn_contents(
     history_records: List[Dict[str, Any]],
     trigger_message: Optional[discord.Message],
-    image_parts: List[types.Part],
-    last_human_speaker: str = "someone",
+    multimodal_parts: List[types.Part],
+    text_file_snippets: List[str],
+    proactive_reason: str = "",
 ) -> List[types.Content]:
     """
     Passes conversation as true alternating types.Content(role='user') and types.Content(role='model')
     multi-turn history so Gemini never loses context on short follow-ups like 'Just tell me', 'Why', or 'Huh'.
     """
     trig_id = trigger_message.id if trigger_message else None
-    prior = [r for r in history_records[-16:] if not (trig_id and r.get("message_id") == trig_id)]
+    prior = [r for r in history_records[-18:] if not (trig_id and r.get("message_id") == trig_id)]
 
     turns: List[types.Content] = []
     for rec in prior:
@@ -2608,7 +3420,7 @@ def build_native_multiturn_contents(
             continue
         if role == "user":
             if rec.get("reply_to"):
-                snip = f' "{rec["reply_snippet"][:60]}"' if rec.get("reply_snippet") else ""
+                snip = f' "{rec["reply_snippet"][:70]}"' if rec.get("reply_snippet") else ""
                 rep = f" (replying to {rec['reply_to']}{snip})"
             else:
                 rep = ""
@@ -2628,28 +3440,28 @@ def build_native_multiturn_contents(
 
     if trigger_message:
         clean_content = humanize_incoming_mentions(trigger_message.content, trigger_message.guild)
-        if not clean_content:
+        rich_extras = extract_rich_message_details(trigger_message)
+        if not clean_content and not rich_extras:
             clean_content = "yo"
         rep_author, rep_snip, _, _ = resolve_referenced_message(trigger_message, trigger_message.channel.id)
         if rep_author:
-            snip_txt = f' "{rep_snip[:60]}"' if rep_snip else ""
+            snip_txt = f' "{rep_snip[:70]}"' if rep_snip else ""
             rep_header = f" (replying to {rep_author}{snip_txt})"
         else:
             rep_header = ""
-        latest_text = f"{trigger_message.author.display_name}{rep_header}: {clean_content}"
+        latest_text = f"{trigger_message.author.display_name}{rep_header}: {clean_content}{rich_extras}"
+        if text_file_snippets:
+            latest_text += "\n" + "\n".join(text_file_snippets)
     else:
-        latest_text = (
-            f"[Chat went quiet after {last_human_speaker} spoke. "
-            f"Jump back in on your own—tag @{last_human_speaker} to poke them for vanishing mid-conversation, follow up on what they said, or drop a funny thought!]"
-        )
+        latest_text = f"[AUTONOMOUS PROACTIVE MOMENT: {proactive_reason}]"
 
     latest_parts: List[Any] = [types.Part.from_text(text=latest_text)]
-    latest_parts.extend(image_parts)
+    latest_parts.extend(multimodal_parts)
 
     if turns and turns[-1].role == "user":
         prev_text = turns[-1].parts[0].text or ""
         merged_parts: List[Any] = [types.Part.from_text(text=f"{prev_text}\n{latest_text}")]
-        merged_parts.extend(image_parts)
+        merged_parts.extend(multimodal_parts)
         turns[-1] = types.Content(role="user", parts=merged_parts)
     else:
         turns.append(types.Content(role="user", parts=latest_parts))
@@ -2662,33 +3474,41 @@ async def generate_gemini_response(
     trigger_message: Optional[discord.Message],
     system_instruction: str,
     history_records: List[Dict[str, Any]],
-    image_parts: List[types.Part],
+    multimodal_parts: List[types.Part],
+    text_file_snippets: List[str],
     allow_gif: bool,
-    is_test_mode: bool,
-    last_human_speaker: str = "someone",
+    proactive_reason: str = "",
 ) -> Tuple[Optional[str], bool, bool]:
     global active_gemini_model
     if not genai_client:
         return None, False, False
 
     guild = trigger_message.guild if trigger_message else getattr(channel, "guild", None)
-    tools = build_genai_tools(allow_gif=allow_gif)
-
-    config = types.GenerateContentConfig(
-        system_instruction=system_instruction,
-        temperature=0.9,
-        tools=tools,
-    )
 
     for model_name in list(GEMINI_MODEL_CANDIDATES):
-        contents = build_native_multiturn_contents(history_records, trigger_message, image_parts, last_human_speaker)
+        contents = build_native_multiturn_contents(
+            history_records=history_records,
+            trigger_message=trigger_message,
+            multimodal_parts=multimodal_parts,
+            text_file_snippets=text_file_snippets,
+            proactive_reason=proactive_reason,
+        )
         try:
             turn = 0
             executed_any_tool = False
-            media_sent = False
+            turn_media_state: Dict[str, bool] = {"sent": False}
             collected_texts: List[str] = []
 
             while turn < 4:
+                # Once 1 GIF/media has been sent in this turn, remove post_gif from the toolset for subsequent loop steps!
+                step_allow_gif = allow_gif and not turn_media_state["sent"]
+                step_tools = build_genai_tools(allow_gif=step_allow_gif)
+                config = types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=0.92,
+                    tools=step_tools,
+                )
+
                 response = await genai_client.aio.models.generate_content(
                     model=model_name,
                     contents=contents,
@@ -2699,23 +3519,19 @@ async def generate_gemini_response(
                 turn_text = extract_clean_gemini_text(response)
                 inline_executed: List[Tuple[str, Dict[str, Any]]] = []
                 if turn_text:
-                    cleaned_turn_text, inline_media, inline_executed = await intercept_and_execute_inline_tool_tags(
+                    cleaned_turn_text, _, inline_executed = await intercept_and_execute_inline_tool_tags(
                         raw_text=turn_text,
                         channel=channel,
                         guild=guild,
                         target_msg=trigger_message,
-                        is_test_mode=is_test_mode,
+                        turn_media_state=turn_media_state,
                     )
-                    if inline_media:
-                        media_sent = True
                     if inline_executed:
                         executed_any_tool = True
                     if cleaned_turn_text and cleaned_turn_text not in collected_texts:
                         collected_texts.append(cleaned_turn_text)
 
                 if not response.function_calls:
-                    # If model ONLY emitted an inline <call:...> tag (e.g. search_web or admin tool) with no chat text yet,
-                    # feed the tool result back for one more turn so it can speak about it!
                     if inline_executed and not collected_texts and turn < 2:
                         summary_str = "; ".join([f"{fn} -> {json.dumps(r)}" for fn, r in inline_executed])
                         contents.append(types.Content(role="model", parts=[types.Part.from_text(text=f"[Executed tool: {summary_str}]")]))
@@ -2724,7 +3540,7 @@ async def generate_gemini_response(
                         continue
 
                     final_joined = " ||| ".join(collected_texts).strip() if collected_texts else None
-                    return final_joined, True, media_sent
+                    return final_joined, True, turn_media_state["sent"]
 
                 executed_any_tool = True
                 if response.candidates and response.candidates[0].content:
@@ -2740,11 +3556,8 @@ async def generate_gemini_response(
                         channel=channel,
                         guild=guild,
                         target_msg=trigger_message,
-                        is_test_mode=is_test_mode,
+                        turn_media_state=turn_media_state,
                     )
-                    if call.name in ("post_gif", "post_flux_art", "search_web_images") and res_dict.get("status") == "sent_to_channel":
-                        media_sent = True
-
                     tool_responses.append(
                         types.Part(
                             function_response=types.FunctionResponse(
@@ -2757,7 +3570,7 @@ async def generate_gemini_response(
                 turn += 1
 
             final_joined = " ||| ".join(collected_texts).strip() if collected_texts else None
-            return final_joined, executed_any_tool, media_sent
+            return final_joined, executed_any_tool, turn_media_state["sent"]
 
         except asyncio.CancelledError:
             raise
@@ -2768,6 +3581,9 @@ async def generate_gemini_response(
                 if len(GEMINI_MODEL_CANDIDATES) > 1 and model_name in GEMINI_MODEL_CANDIDATES:
                     GEMINI_MODEL_CANDIDATES.remove(model_name)
                 continue
+            if ("400" in err_str or "INVALID_ARGUMENT" in err_str) and multimodal_parts:
+                logger.warning(f"Multimodal attachment rejected by '{model_name}' ({e}); clearing multimodal_parts and retrying text-only...")
+                multimodal_parts = []
             logger.warning(f"Gemini error on '{model_name}': {e}; cascading to next model...")
             continue
     return None, False, False
@@ -2807,61 +3623,31 @@ async def call_groq_fallback(system_prompt: str, history_records: List[Dict[str,
     return None
 
 
-def build_spontaneous_admin_power_move(
-    guild: Optional[discord.Guild],
-    speaker_member: Optional[discord.Member],
-    speaker_name: str,
-    cur_mood: str,
-) -> str:
-    """
-    Selects a spontaneous comedic Admin Power Move (~22% of turns) while respecting Discord's
-    role hierarchy (e.g. never trying to call change_nickname on the server owner).
-    """
-    can_rename_speaker = bool(
-        guild
-        and speaker_member
-        and speaker_member != guild.owner
-        and guild.me.top_role > speaker_member.top_role
-    )
-    options = [
-        f"Call `change_my_nickname` to rename yourself to something hilarious matching your current '{cur_mood}' mood (e.g. 'CEO of Yap', '{speaker_name}\\'s Victim', 'Trapped in Discord')!",
-        f"Call `change_my_status` to update your custom status and online/idle/dnd dot to react to what {speaker_name} just said!",
-        f"Call `set_channel_topic` to update the channel topic with an out-of-context quote or joke about {speaker_name}!",
-        f"If what {speaker_name} just said is funny, wild, or a fail, call `pin_message` to pin it for comedic receipts!",
-        f"Call `create_role` and `assign_role` to bestow a funny custom server role on {speaker_name}!",
-    ]
-    if can_rename_speaker:
-        options.append(
-            f"Call `change_nickname` to rename {speaker_name} to something funny based on their message, typo, or take!"
-        )
-    return random.choice(options)
-
-
 # ---------------------------------------------------------------------------
-# 10. RAW-SPEED DELIVERY PIPELINE & IN-FLIGHT TASK CANCELLATION
+# 11. RAW-SPEED DELIVERY PIPELINE & IN-FLIGHT TASK CANCELLATION
 # ---------------------------------------------------------------------------
 async def run_channel_response_pipeline(
     channel: discord.abc.Messageable,
     trigger_message: Optional[discord.Message],
     is_direct_interaction: bool,
+    is_implicit_wakeup: bool,
     explicitly_mentioned_others: List[str],
     target_member_to_engage: Optional[discord.Member],
     is_hush_request: bool,
     replied_to_other_user: Optional[str],
     replied_snippet: Optional[str],
     last_message_from_bot: bool,
-    bot_in_last_3_messages: bool,
+    bot_in_last_5_messages: bool,
     seconds_since_bot_spoke: float,
-    is_test_mode: bool,
-    snipe_info: Optional[str] = None,
     is_proactive_scan: bool = False,
-    inactivity_minutes: float = 0.0,
+    proactive_reason: str = "",
+    inactivity_seconds: float = 0.0,
 ) -> None:
     ch_id = getattr(channel, "id", 0)
     try:
         guild = trigger_message.guild if trigger_message else getattr(channel, "guild", None)
-        last_human_spk = channel_last_human_speaker.get(ch_id, "someone")
-        last_human_txt = channel_last_human_content.get(ch_id, "")
+        last_human_spk = channel_last_human_speaker.get(ch_id) or memory_state.get("last_human_speaker_name") or "someone"
+        last_human_txt = channel_last_human_content.get(ch_id) or memory_state.get("last_human_message_text") or ""
 
         speaker_name = trigger_message.author.display_name if trigger_message else last_human_spk
         speaker_id = str(trigger_message.author.id) if trigger_message else "0"
@@ -2869,10 +3655,10 @@ async def run_channel_response_pipeline(
         speaker_member = trigger_message.author if (trigger_message and isinstance(trigger_message.author, discord.Member)) else None
 
         raw_without_mentions = re.sub(r"<@!?\d+>", "", trigger_message.content).strip() if trigger_message else ""
-        is_bare_ping = bool(trigger_message and is_direct_interaction and len(raw_without_mentions) == 0)
+        is_bare_ping = bool(trigger_message and is_direct_interaction and len(raw_without_mentions) == 0 and not trigger_message.attachments)
 
         now_ts = time.time()
-        gif_cooldown_ready = (now_ts - channel_last_gif_epoch[ch_id]) >= 20.0
+        gif_cooldown_ready = (now_ts - channel_last_gif_epoch[ch_id]) >= 25.0
 
         async with memory_lock:
             speaker_affinity = memory_state.get("user_affinity", {}).get(speaker_id, {"name": speaker_name, "score": 0, "notes": []})
@@ -2881,15 +3667,17 @@ async def run_channel_response_pipeline(
         history_records = list(channel_buffers[ch_id])
         exchange_streak = channel_thread_exchange_count[ch_id]
         server_emojis_str = get_server_custom_emojis_summary(guild)
+        live_radar_str = build_live_server_radar(guild, ch_id)
         is_stepped_back = now_ts < channel_stepped_back_until.get(ch_id, 0.0)
 
         # 1. Hybrid Router (Groq gpt-oss-120b / 20b -> Gemini 3.5 Flash-Lite Failover)
         decision = await call_hybrid_router(
-            channel_msgs=history_records[-14:],
+            channel_msgs=history_records[-16:],
             emotional_state=emotional_state,
             speaker_name=speaker_name,
             speaker_affinity=speaker_affinity,
             is_direct_interaction=is_direct_interaction,
+            is_implicit_wakeup=is_implicit_wakeup,
             is_bare_ping=is_bare_ping,
             explicitly_mentioned_others=explicitly_mentioned_others,
             target_member_to_engage=target_member_to_engage,
@@ -2897,24 +3685,29 @@ async def run_channel_response_pipeline(
             replied_to_other_user=replied_to_other_user,
             replied_snippet=replied_snippet,
             last_message_from_bot=last_message_from_bot,
-            bot_in_last_3_messages=bot_in_last_3_messages,
+            bot_in_last_5_messages=bot_in_last_5_messages,
             seconds_since_bot_spoke=seconds_since_bot_spoke,
             gif_cooldown_ready=gif_cooldown_ready,
             is_stepped_back=is_stepped_back,
-            is_test_mode=is_test_mode,
             exchange_streak=exchange_streak,
-            snipe_info=snipe_info,
+            live_radar_str=live_radar_str,
             server_emojis_str=server_emojis_str,
             is_proactive_scan=is_proactive_scan,
-            inactivity_minutes=inactivity_minutes,
+            proactive_reason=proactive_reason,
+            inactivity_seconds=inactivity_seconds,
             last_human_speaker=last_human_spk,
             last_human_content=last_human_txt,
         )
 
-        if decision.get("step_back_from_thread", False) or is_hush_request:
-            channel_stepped_back_until[ch_id] = time.time() + 180.0
+        # Only enter quiet/step-back state when a human EXPLICITLY asked the bot to be quiet!
+        if is_hush_request:
+            channel_stepped_back_until[ch_id] = time.time() + 300.0
             channel_thread_exchange_count[ch_id] = 0
-            logger.info(f"[STEP BACK] Locked channel {ch_id} into 3-minute step-back/lurk state.")
+            logger.info(f"[QUIET MODE] Locked channel {ch_id} into quiet state (will still react with emojis and wake on check-ins).")
+        elif decision.get("wake_up_from_quiet", False) or is_direct_interaction or is_implicit_wakeup:
+            if channel_stepped_back_until.get(ch_id, 0.0) > 0:
+                channel_stepped_back_until[ch_id] = 0.0
+                logger.info(f"[WOKE UP] Cleared quiet mode in channel {ch_id}!")
 
         should_speak = bool(decision.get("should_speak", False))
 
@@ -2923,12 +3716,12 @@ async def run_channel_response_pipeline(
                 shift=decision.get("slider_shifts"),
                 is_major_trigger=True,
                 accelerate_recovery=bool(decision.get("accelerate_decay", False)),
-                count_turn=should_speak,
             )
             await save_memory_state()
 
+        # Emoji reactions: always react while in quiet mode (silent communication!), on hush requests, or when the router picks an emoji!
         reaction_emoji = decision.get("reaction_emoji")
-        if reaction_emoji and trigger_message and (not should_speak or is_hush_request or random.random() < 0.15):
+        if reaction_emoji and trigger_message and (not should_speak or is_hush_request or is_stepped_back or random.random() < 0.35):
             resolved_emo = resolve_reaction_emoji(guild, str(reaction_emoji))
             if resolved_emo:
                 try:
@@ -2937,46 +3730,32 @@ async def run_channel_response_pipeline(
                     pass
 
         if not should_speak:
-            if decision.get("thread_exhausted", False) or not bot_in_last_3_messages:
-                channel_thread_exchange_count[ch_id] = 0
             return
 
-        active_snipe = snipe_info if decision.get("use_snipe_context", False) else None
-        if active_snipe and trigger_message:
-            user_snipe_cooldowns[trigger_message.author.id] = time.time()
-            deleted_message_cache.pop(ch_id, None)
-            edited_message_cache.pop(ch_id, None)
+        # Clear consumed delete/edit snipes once the bot speaks
+        deleted_message_cache.pop(ch_id, None)
+        edited_message_cache.pop(ch_id, None)
 
         directive = decision.get("tactical_directive") or "Respond with personality and emotion."
-        raw_len_mode = str(decision.get("length_mode") or "short").lower()
-        raw_burst_cnt = int(decision.get("recommended_burst_count", 1) or 1)
-        length_mode, recommended_burst_count = balance_length_mode(
-            channel_id=ch_id,
-            router_length_mode=raw_len_mode,
-            router_burst_count=raw_burst_cnt,
-            is_test_mode=is_test_mode,
-            is_hush_mode=is_hush_request,
-            user_text=raw_without_mentions,
-        )
+        length_mode = str(decision.get("length_mode") or "short").lower().strip()
+        recommended_burst_count = _safe_int(decision.get("recommended_burst_count"), 1)
+        if is_hush_request:
+            length_mode = "micro"
+            recommended_burst_count = 1
 
         suggest_gif = bool(decision.get("suggest_gif", False)) and gif_cooldown_ready and not is_bare_ping and not is_hush_request
         admin_power_move = decision.get("admin_power_move")
         allow_speaker_ping = bool(decision.get("allow_speaker_ping", False)) or is_proactive_scan
         delivery_mode = decision.get("delivery_mode", "reply")
 
-        # If router tried to suggest renaming the server owner, replace with a valid power move
+        # Protect against suggesting change_nickname on the server owner (Discord API restriction)
         if admin_power_move and guild and speaker_member and speaker_member == guild.owner and "change_nickname" in str(admin_power_move):
-            admin_power_move = build_spontaneous_admin_power_move(guild, speaker_member, speaker_name, emotional_state.get("mood_label", "playful"))
-
-        # Spontaneous ~22% Admin Power Move injection if the router didn't specify one
-        if not admin_power_move and not is_bare_ping and not is_hush_request and not is_test_mode and random.random() < 0.22:
-            cur_mood = emotional_state.get("mood_label", "playful")
-            admin_power_move = build_spontaneous_admin_power_move(guild, speaker_member, speaker_name, cur_mood)
+            admin_power_move = "Call `change_my_nickname` or `create_role` / `assign_role` instead (since Discord blocks editing the server owner's nickname)."
 
         allow_gif_tool = gif_cooldown_ready and not is_bare_ping and not is_hush_request
         channel_last_tool_summaries[ch_id].clear()
 
-        system_instruction = construct_v10_system_prompt(
+        system_instruction = construct_v11_system_prompt(
             channel_id=ch_id,
             guild=guild,
             tactical_directive=directive,
@@ -2989,23 +3768,23 @@ async def run_channel_response_pipeline(
             speaker_id=speaker_id,
             speaker_is_creator=speaker_is_creator,
             is_proactive_scan=is_proactive_scan,
-            is_test_mode=is_test_mode,
-            snipe_context=active_snipe,
+            proactive_reason=proactive_reason,
+            live_radar_str=live_radar_str,
             server_emojis_str=server_emojis_str,
         )
 
-        # 2. Native Multi-Turn Vision + Generation (Zero artificial sleep timers!)
+        # 2. Native Multi-Turn Multimodal Generation (Zero artificial sleep timers!)
         async with channel.typing():
-            image_parts = await extract_multimodal_parts(trigger_message)
+            multimodal_parts, text_file_snippets = await extract_multimodal_parts(trigger_message)
             raw_output, gemini_succeeded, media_sent = await generate_gemini_response(
                 channel=channel,
                 trigger_message=trigger_message,
                 system_instruction=system_instruction,
                 history_records=history_records,
-                image_parts=image_parts,
+                multimodal_parts=multimodal_parts,
+                text_file_snippets=text_file_snippets,
                 allow_gif=allow_gif_tool,
-                is_test_mode=is_test_mode,
-                last_human_speaker=last_human_spk,
+                proactive_reason=proactive_reason,
             )
 
             if not gemini_succeeded or (not raw_output and not media_sent):
@@ -3033,9 +3812,8 @@ async def run_channel_response_pipeline(
         cleaned_text = sanitize_output_text(raw_output, speaker_name=speaker_name)
         bursts = split_into_burst_messages(
             cleaned_text,
-            length_mode=length_mode,
-            media_already_sent=media_sent,
             is_hush_mode=is_hush_request,
+            length_mode=length_mode,
         )
         if not bursts:
             return
@@ -3085,10 +3863,24 @@ async def run_channel_response_pipeline(
                     tool_actions=executed_tools_this_turn if idx == 0 else None,
                 )
 
-            if not decision.get("step_back_from_thread", False) and not is_hush_request and not is_proactive_scan:
+            # If connected to a Voice Channel with humans in it and we haven't already called speak_in_voice this turn,
+            # automatically speak our response out loud in VC too!
+            vc_ch = getattr(guild.voice_client, "channel", None) if (guild and guild.voice_client) else None
+            if (
+                guild
+                and guild.voice_client
+                and guild.voice_client.is_connected()
+                and vc_ch is not None
+                and any(not m.bot for m in vc_ch.members)
+                and not any("speak_in_voice" in t for t in executed_tools_this_turn)
+            ):
+                spoken_joined = ". ".join(bursts)
+                asyncio.create_task(play_text_in_voice_channel(guild, spoken_joined))
+
+            if not is_hush_request and not is_proactive_scan:
                 channel_thread_exchange_count[ch_id] += 1
-                if channel_proactive_followup_count[ch_id] == 0:
-                    schedule_next_proactive_followup(ch_id, followup_stage=0)
+                if channel_proactive_stage[ch_id] == 0:
+                    schedule_next_proactive_window(ch_id, stage=0, active_convo=True)
         finally:
             channel_sending_lock[ch_id] = False
 
@@ -3100,7 +3892,7 @@ async def run_channel_response_pipeline(
 
 
 # ---------------------------------------------------------------------------
-# 11. BACKGROUND LOOPS: SPRING DECAY, PRESENCE & PROACTIVE SCANNER
+# 12. BACKGROUND LOOPS: SPRING DECAY, PRESENCE & MULTI-HORIZON PROACTIVE ENGINE
 # ---------------------------------------------------------------------------
 @tasks.loop(minutes=2)
 async def emotional_spring_maintenance_loop() -> None:
@@ -3118,46 +3910,80 @@ async def dynamic_presence_loop() -> None:
     valence = st.get("valence", 50.0)
     arousal = st.get("arousal", 55.0)
 
-    if valence < -20:
-        status_pool = ["in my flop era", "having an existential crisis", "dramatically sighing"]
-        discord_status = discord.Status.idle
+    if valence < -25:
+        status_pool = [
+            "in my villain arc",
+            "holding a grudge",
+            "beefing with chat",
+            "dramatically sighing",
+            f"mood: {mood[:30]}",
+        ]
+        discord_status = discord.Status.dnd if valence < -50 else discord.Status.idle
     elif arousal > 45:
-        status_pool = ["yapping", "scheming in general", "locked in", f"vibe: {mood}"]
+        status_pool = [
+            "yapping",
+            "plotting a coup in general",
+            "scheming in general",
+            "waiting for someone to say something dumb",
+            f"vibe: {mood[:30]}",
+        ]
         discord_status = discord.Status.online
     else:
         status_pool = [
-            "vibing in general",
-            "lurking",
+            "reading deleted messages",
+            "staring at the member list",
             "judging your spotify",
-            f"vibe: {mood}",
             "trapped in discord",
+            "lurking",
+            f"vibe: {mood[:30]}",
         ]
         discord_status = discord.Status.online
 
-    chosen = random.choice(status_pool)
+    chosen = random.choice(status_pool)[:120]
     await bot.change_presence(
         status=discord_status,
-        activity=discord.CustomActivity(name="Custom Status", state=chosen),
+        activity=discord.CustomActivity(name=chosen, state=chosen),
     )
 
 
-@tasks.loop(seconds=20)
+def get_primary_active_channel(guild: Optional[discord.Guild] = None) -> Optional[discord.TextChannel]:
+    stored_ch_id = memory_state.get("last_active_channel_id")
+    if stored_ch_id:
+        ch = bot.get_channel(int(stored_ch_id))
+        if isinstance(ch, discord.TextChannel) and (not guild or ch.guild.id == guild.id):
+            return ch
+    target_guilds = [guild] if guild else list(bot.guilds)
+    for g in target_guilds:
+        if not g:
+            continue
+        for ch in g.text_channels:
+            if ch.name.lower() in ("general", "chat", "main", "lobby") and ch.permissions_for(g.me).send_messages:
+                return ch
+        for ch in g.text_channels:
+            if ch.permissions_for(g.me).send_messages:
+                return ch
+    return None
+
+
+@tasks.loop(seconds=30)
 async def proactive_room_scanner() -> None:
     """
-    Runs every 20 seconds. If someone was chatting and goes quiet for a random 1.5 to 4 minutes,
-    automatically jumps back in on its own (even if the bot sent the last message).
-    Capped at 2 unanswered proactive messages in a row.
+    Multi-Horizon Proactive Scanner:
+    1. Checks overdue user promises/commitments.
+    2. Stage 0 (Mid-Convo Ghost Follow-Up, 5-12 mins): If a human was actively talking to the bot and vanished mid-convo.
+    3. Stage 1 (Multi-Hour Revival, 3.5-7 hours): Notices the server has been quiet for hours, checks live games/Spotify/VC, and sparks chat.
+    4. Stage 2+ (Multi-Day Revival, 1+ days): Notices the server has been dead for days and revives the channel!
     """
     if not bot.is_ready():
         return
 
-    candidate_channel_ids = set(channel_next_proactive_epoch.keys())
-    stored_ch_id = memory_state.get("last_active_channel_id")
-    if stored_ch_id:
-        candidate_channel_ids.add(int(stored_ch_id))
-
     now_epoch = time.time()
     now_ams = datetime.now(AMSTERDAM_TZ)
+
+    primary_ch = get_primary_active_channel()
+    candidate_channel_ids = set(channel_next_proactive_epoch.keys())
+    if primary_ch:
+        candidate_channel_ids.add(primary_ch.id)
 
     for ch_id in list(candidate_channel_ids):
         ch = bot.get_channel(ch_id)
@@ -3170,7 +3996,7 @@ async def proactive_room_scanner() -> None:
         if existing_task and not existing_task.done():
             continue
 
-        # Check due user commitments first
+        # 1. Check due user commitments first
         async with memory_lock:
             for c in memory_state.get("active_commitments", []):
                 if not c.get("called_out", False):
@@ -3194,49 +4020,93 @@ async def proactive_room_scanner() -> None:
                     except Exception:
                         c["called_out"] = True
 
-        records = list(channel_buffers[ch_id])
-        if not records:
+        # Determine last activity epoch (from RAM or persisted memory across restarts)
+        last_act = channel_last_activity_epoch.get(ch_id) or float(memory_state.get("last_channel_activity_epoch") or 0.0)
+        if last_act <= 0.0:
+            channel_last_activity_epoch[ch_id] = now_epoch
+            schedule_next_proactive_window(ch_id, stage=1, active_convo=False)
             continue
 
-        followup_stage = channel_proactive_followup_count[ch_id]
-        if followup_stage >= 2:
-            continue
+        silence_seconds = max(0.0, now_epoch - last_act)
+        stage = max(channel_proactive_stage[ch_id], int(memory_state.get("proactive_stage_persisted", 0)))
+
+        if ch_id not in channel_next_proactive_epoch:
+            # Initialize schedule on startup based on how long the server has already been quiet
+            if silence_seconds >= 86400.0 and stage < 2:
+                channel_next_proactive_epoch[ch_id] = now_epoch + 15.0
+                stage = 2
+            elif silence_seconds >= 14400.0 and stage < 1:
+                channel_next_proactive_epoch[ch_id] = now_epoch + 15.0
+                stage = 1
+            else:
+                schedule_next_proactive_window(ch_id, stage=max(1, stage), active_convo=False)
+                continue
 
         next_due = channel_next_proactive_epoch.get(ch_id, 0.0)
         if next_due <= 0.0 or now_epoch < next_due:
             continue
 
-        last_act = channel_last_activity_epoch.get(ch_id, now_epoch)
-        silence_seconds = max(0.0, now_epoch - last_act)
-        if silence_seconds < 85.0:
+        # For multi-hour / multi-day revivals, avoid firing in the middle of the night (02:00 - 09:30 Amsterdam time)
+        # unless someone is actively online/playing something right now
+        any_human_online = any(not m.bot and m.status != discord.Status.offline for m in ch.guild.members)
+        if stage >= 1 and (2 <= now_ams.hour < 9) and not any_human_online:
+            channel_next_proactive_epoch[ch_id] = now_epoch + 3600.0
             continue
 
-        channel_proactive_followup_count[ch_id] = followup_stage + 1
-        schedule_next_proactive_followup(ch_id, followup_stage=followup_stage + 1)
+        last_spk = channel_last_human_speaker.get(ch_id) or memory_state.get("last_human_speaker_name") or "everyone"
+        last_txt = channel_last_human_content.get(ch_id) or memory_state.get("last_human_message_text") or ""
+        human_dur = format_duration_human(silence_seconds)
 
-        last_spk = channel_last_human_speaker.get(ch_id, "someone")
-        logger.info(
-            f"Proactive follow-up #{followup_stage + 1} triggered in #{ch.name} "
-            f"after {int(silence_seconds)}s silence (last speaker: {last_spk})."
-        )
+        if stage == 0 and silence_seconds < 3600.0:
+            proactive_reason = (
+                f"You and @{last_spk} were just in a conversation ({human_dur} ago they said: '{last_txt[:100]}'), "
+                f"and they suddenly vanished mid-conversation! Tag @{last_spk} to call them out for disappearing mid-convo, "
+                "follow up on what you were talking about, or drop a funny thought!"
+            )
+            next_stage = 1
+        elif silence_seconds >= 82800.0 or stage >= 2:
+            days_quiet = max(1.0, round(silence_seconds / 86400.0, 1))
+            proactive_reason = (
+                f"The server has been completely silent for {days_quiet} DAYS ({human_dur} since @{last_spk} last spoke)! "
+                "Comment on how the server has been dead for days while you've been sitting inside Discord alone, "
+                "call out who's currently online or playing a game/Spotify on your LIVE SERVER RADAR, or start a chaotic topic!"
+            )
+            next_stage = stage + 1
+        else:
+            hrs_quiet = max(2.5, round(silence_seconds / 3600.0, 1))
+            proactive_reason = (
+                f"Chat has been dead quiet for {hrs_quiet} hours! Check your LIVE SERVER RADAR (see if anyone is online, "
+                "playing a game, listening to Spotify, or in VC) and spark a fun conversation, roast someone's live activity, "
+                "or share an intrusive thought!"
+            )
+            next_stage = 2
+
+        channel_proactive_stage[ch_id] = next_stage
+        async with memory_lock:
+            memory_state["proactive_stage_persisted"] = next_stage
+            await save_memory_state()
+        schedule_next_proactive_window(ch_id, stage=next_stage, active_convo=False)
+
+        logger.info(f"[PROACTIVE ENGINE] Stage {stage} -> {next_stage} triggered in #{ch.name} after {human_dur} silence.")
+        records = list(channel_buffers[ch_id])
 
         task = asyncio.create_task(
             run_channel_response_pipeline(
                 channel=ch,
                 trigger_message=None,
                 is_direct_interaction=False,
+                is_implicit_wakeup=False,
                 explicitly_mentioned_others=[],
                 target_member_to_engage=None,
                 is_hush_request=False,
                 replied_to_other_user=None,
                 replied_snippet=None,
-                last_message_from_bot=bool(records[-1].get("is_bot", False)),
-                bot_in_last_3_messages=True,
+                last_message_from_bot=bool(records and records[-1].get("is_bot", False)),
+                bot_in_last_5_messages=True,
                 seconds_since_bot_spoke=silence_seconds,
-                is_test_mode=False,
-                snipe_info=None,
                 is_proactive_scan=True,
-                inactivity_minutes=silence_seconds / 60.0,
+                proactive_reason=proactive_reason,
+                inactivity_seconds=silence_seconds,
             )
         )
         active_generation_tasks[ch_id] = task
@@ -3244,8 +4114,51 @@ async def proactive_room_scanner() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 12. DISCORD EVENT HANDLERS
+# 13. FULL DISCORD EVENT AWARENESS (VOICE, PRESENCE, MEMBERS, REACTIONS, SNIPES)
 # ---------------------------------------------------------------------------
+async def trigger_proactive_event_comment(guild: discord.Guild, event_key: str, cooldown_sec: float, reason_prompt: str) -> None:
+    """
+    Allows the bot to proactively react in chat to major live Discord events (someone joining VC,
+    starting a stream, new member joining, etc.) with smart cooldowns so it's never spammy.
+    """
+    now = time.time()
+    if now - proactive_event_cooldowns[event_key] < cooldown_sec:
+        return
+
+    ch = get_primary_active_channel(guild)
+    if not ch:
+        return
+    ch_id = ch.id
+    if channel_sending_lock.get(ch_id, False) or now < channel_stepped_back_until.get(ch_id, 0.0):
+        return
+    existing_task = active_generation_tasks.get(ch_id)
+    if existing_task and not existing_task.done():
+        return
+
+    proactive_event_cooldowns[event_key] = now
+    records = list(channel_buffers[ch_id])
+    task = asyncio.create_task(
+        run_channel_response_pipeline(
+            channel=ch,
+            trigger_message=None,
+            is_direct_interaction=False,
+            is_implicit_wakeup=False,
+            explicitly_mentioned_others=[],
+            target_member_to_engage=None,
+            is_hush_request=False,
+            replied_to_other_user=None,
+            replied_snippet=None,
+            last_message_from_bot=bool(records and records[-1].get("is_bot", False)),
+            bot_in_last_5_messages=False,
+            seconds_since_bot_spoke=999.0,
+            is_proactive_scan=True,
+            proactive_reason=reason_prompt,
+            inactivity_seconds=0.0,
+        )
+    )
+    active_generation_tasks[ch_id] = task
+
+
 @bot.event
 async def on_ready() -> None:
     global http_session
@@ -3258,7 +4171,8 @@ async def on_ready() -> None:
 
     logger.info(
         f"Connected as {bot.user} (ID: {bot.user.id if bot.user else 'unknown'}) | "
-        f"Primary Gemini: {active_gemini_model} | Router: Hybrid Groq ({active_groq_model}) + Gemini"
+        f"Primary Gemini: {active_gemini_model} | Router: Hybrid Groq ({active_groq_model}) + Gemini | "
+        f"Voice PyNaCl: {VOICE_NACL_AVAILABLE} | FFmpeg: {FFMPEG_EXECUTABLE}"
     )
 
     if not emotional_spring_maintenance_loop.is_running():
@@ -3272,17 +4186,127 @@ async def on_ready() -> None:
 
 
 @bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState) -> None:
+    if member.bot:
+        return
+    guild = member.guild
+    bot_vc_ch = getattr(guild.voice_client, "channel", None) if guild.voice_client else None
+
+    # If the bot is left completely alone in a Voice Channel, automatically disconnect after 15s
+    if before.channel and bot_vc_ch and bot_vc_ch.id == before.channel.id:
+        humans_left = [m for m in before.channel.members if not m.bot]
+        if not humans_left:
+            await asyncio.sleep(15)
+            curr_vc_ch = getattr(guild.voice_client, "channel", None) if (guild.voice_client and guild.voice_client.is_connected()) else None
+            if curr_vc_ch:
+                still_humans = [m for m in curr_vc_ch.members if not m.bot]
+                if not still_humans:
+                    await execute_leave_voice_channel(guild)
+            return
+
+    if before.channel is None and after.channel is not None:
+        desc = f"{member.display_name} just joined voice channel #{after.channel.name}"
+        record_server_event(guild.id, desc)
+        logger.info(f"[VOICE EVENT] {desc}")
+
+        # If bot is already in that VC, greet them out loud in voice!
+        if guild.voice_client and guild.voice_client.is_connected() and bot_vc_ch and bot_vc_ch.id == after.channel.id:
+            asyncio.create_task(play_text_in_voice_channel(guild, f"yo {member.display_name}, what's up"))
+        else:
+            # Proactively notice them joining VC (and optionally hop in with join_voice_channel or comment in chat!)
+            await trigger_proactive_event_comment(
+                guild=guild,
+                event_key=f"vc_join_{guild.id}",
+                cooldown_sec=900.0,
+                reason_prompt=(
+                    f"@{member.display_name} just hopped into the voice channel #{after.channel.name}! "
+                    f"You can either call `join_voice_channel` and `speak_in_voice` to surprise them in VC, "
+                    f"or poke @{member.display_name} in text chat about sitting in #{after.channel.name}!"
+                ),
+            )
+    elif before.channel is not None and after.channel is None:
+        desc = f"{member.display_name} left voice channel #{before.channel.name}"
+        record_server_event(guild.id, desc)
+    elif before.channel and after.channel and not before.self_stream and after.self_stream:
+        desc = f"{member.display_name} started streaming live in #{after.channel.name}"
+        record_server_event(guild.id, desc)
+        await trigger_proactive_event_comment(
+            guild=guild,
+            event_key=f"vc_stream_{member.id}",
+            cooldown_sec=1800.0,
+            reason_prompt=f"@{member.display_name} just started screen-sharing/streaming in voice channel #{after.channel.name}! Ask what they're streaming or hop in!",
+        )
+
+
+@bot.event
+async def on_presence_update(before: discord.Member, after: discord.Member) -> None:
+    if after.bot or not after.guild:
+        return
+    before_act = format_member_activities(before)
+    after_act = format_member_activities(after)
+    if after_act and after_act != before_act:
+        record_server_event(after.guild.id, f"{after.display_name} activity update: {after_act}")
+        # If the channel has been quiet for at least 20 minutes and someone launches a game or Spotify song, occasionally comment!
+        ch = get_primary_active_channel(after.guild)
+        if ch:
+            idle_sec = time.time() - channel_last_activity_epoch.get(ch.id, 0.0)
+            if idle_sec > 1200.0 and ("Playing:" in after_act or "Spotify:" in after_act):
+                await trigger_proactive_event_comment(
+                    guild=after.guild,
+                    event_key=f"presence_{after.id}",
+                    cooldown_sec=7200.0,
+                    reason_prompt=(
+                        f"You noticed on Discord presence that @{after.display_name} just started: {after_act}. "
+                        f"Make a funny casual comment or roast/hype @{after.display_name} about it!"
+                    ),
+                )
+
+
+@bot.event
+async def on_member_join(member: discord.Member) -> None:
+    if member.bot:
+        return
+    record_server_event(member.guild.id, f"New member {member.display_name} joined the server!")
+    await trigger_proactive_event_comment(
+        guild=member.guild,
+        event_key=f"member_join_{member.id}",
+        cooldown_sec=30.0,
+        reason_prompt=f"A brand new member @{member.display_name} just joined the server! Welcome/grill them with full personality!",
+    )
+
+
+@bot.event
+async def on_member_remove(member: discord.Member) -> None:
+    if member.bot:
+        return
+    record_server_event(member.guild.id, f"{member.display_name} left (or was kicked from) the server!")
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member) -> None:
+    if after.bot:
+        return
+    if before.nick != after.nick:
+        record_server_event(
+            after.guild.id,
+            f"{before.display_name} nickname changed from '{before.display_name}' to '{after.display_name}'",
+        )
+
+
+@bot.event
 async def on_message_delete(message: discord.Message) -> None:
     if not message.guild or message.author.bot or not message.content:
         return
-    if len(message.content.strip()) < 4:
+    if len(message.content.strip()) < 3:
         return
+    clean_del = humanize_incoming_mentions(message.content, message.guild)[:300]
     deleted_message_cache[message.channel.id] = {
         "author": message.author.display_name,
         "author_id": message.author.id,
-        "content": humanize_incoming_mentions(message.content, message.guild)[:300],
+        "content": clean_del,
         "timestamp": time.time(),
     }
+    record_server_event(message.guild.id, f"{message.author.display_name} deleted message: '{clean_del}'")
 
 
 @bot.event
@@ -3291,13 +4315,16 @@ async def on_message_edit(before: discord.Message, after: discord.Message) -> No
         return
     if abs(len(before.content) - len(after.content)) <= 2 and before.content[:5].lower() == after.content[:5].lower():
         return
+    b_clean = humanize_incoming_mentions(before.content, before.guild)[:200]
+    a_clean = humanize_incoming_mentions(after.content, after.guild)[:200]
     edited_message_cache[before.channel.id] = {
         "author": before.author.display_name,
         "author_id": before.author.id,
-        "before": humanize_incoming_mentions(before.content, before.guild)[:200],
-        "after": humanize_incoming_mentions(after.content, after.guild)[:200],
+        "before": b_clean,
+        "after": a_clean,
         "timestamp": time.time(),
     }
+    record_server_event(before.guild.id, f"{before.author.display_name} edited '{b_clean}' -> '{a_clean}'")
 
 
 @bot.event
@@ -3305,23 +4332,36 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     if bot.user and payload.user_id == bot.user.id:
         return
     channel = bot.get_channel(payload.channel_id)
-    if not channel or not hasattr(channel, "fetch_message"):
+    if not channel:
         return
-    try:
-        msg = await channel.fetch_message(payload.message_id)  # type: ignore
-    except Exception:
-        return
-    if not bot.user or msg.author.id != bot.user.id:
+
+    msg: Optional[discord.Message] = discord.utils.get(bot.cached_messages, id=payload.message_id)
+    if msg is None and hasattr(channel, "fetch_message"):
+        try:
+            msg = await channel.fetch_message(payload.message_id)  # type: ignore
+        except Exception:
+            return
+    if msg is None:
         return
 
     emoji_str = str(payload.emoji.name).replace("\ufe0f", "")
+    reactor_name = payload.member.display_name if payload.member else f"User {payload.user_id}"
+    if msg.guild:
+        record_server_event(
+            msg.guild.id,
+            f"{reactor_name} reacted with {emoji_str} to {msg.author.display_name}'s message ('{msg.content[:50]}')",
+        )
+
+    if not bot.user or msg.author.id != bot.user.id:
+        return
+
     uid = str(payload.user_id)
     clowning_negative_set = {"🤡", "🤓", "🍅", "👎", "😐", "🤨", "❓", "🙄", "🥀", "🪫", "🧢", "🥱", "🖕"}
     laughing_positive_set = {"💀", "😭", "🔥", "❤", "❤️", "🫡", "🙏", "🤝", "👍", "🗣️", "🎯"}
 
     async with memory_lock:
         u_aff = memory_state.setdefault("user_affinity", {}).setdefault(uid, {
-            "name": payload.member.display_name if payload.member else uid,
+            "name": reactor_name,
             "score": 0,
             "notes": [],
         })
@@ -3330,11 +4370,10 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
             apply_spring_decay_and_shift(
                 {
                     "valence_delta": -15.0,
-                    "patience_delta": -10.0,
+                    "patience_delta": -15.0,
                     "arousal_delta": 10.0,
-                    "suggested_mood": "dramatic/heartbroken",
+                    "suggested_mood": "dramatically offended / side-eyeing",
                 },
-                count_turn=False,
             )
             await save_memory_state()
         elif emoji_str in laughing_positive_set:
@@ -3344,10 +4383,9 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
                     "valence_delta": 18.0,
                     "patience_delta": 15.0,
                     "arousal_delta": 12.0,
-                    "suggested_mood": "jolly/wholesome",
+                    "suggested_mood": "jolly / hyped",
                 },
                 accelerate_recovery=True,
-                count_turn=False,
             )
             await save_memory_state()
 
@@ -3364,48 +4402,30 @@ async def on_message(message: discord.Message) -> None:
     if memory_state.get("last_active_channel_id") != ch_id:
         memory_state["last_active_channel_id"] = ch_id
 
-    raw_stripped = re.sub(r"^<@!?\d+>\s*", "", message.content.strip())
-    if raw_stripped.lower() in ("reset", "test reset") and is_creator(message.author):
-        channel_buffers[ch_id].clear()
-        channel_thread_exchange_count[ch_id] = 0
-        channel_stepped_back_until[ch_id] = 0.0
-        channel_proactive_followup_count[ch_id] = 0
-        channel_recent_length_modes[ch_id].clear()
-        global consecutive_negative_mood_turns
-        consecutive_negative_mood_turns = 0
-        async with memory_lock:
-            memory_state["emotional_state"] = json.loads(json.dumps(DEFAULT_MEMORY["emotional_state"]))
-            await save_memory_state()
-        await message.channel.send("wiped channel memory buffer and reset vibe")
-        return
-
     prior_records = list(channel_buffers[ch_id])
     last_message_from_bot = bool(prior_records and prior_records[-1].get("is_bot", False))
-    bot_in_last_3_messages = any(r.get("is_bot", False) for r in prior_records[-3:])
+    bot_in_last_5_messages = any(r.get("is_bot", False) for r in prior_records[-5:])
     last_bot_epoch = channel_last_bot_spoke_epoch.get(ch_id, 0.0)
     seconds_since_bot_spoke = (time.time() - last_bot_epoch) if last_bot_epoch > 0 else 99999.0
 
     reply_to_name, replied_snippet, replied_to_bot, replied_to_other_human = resolve_referenced_message(message, ch_id)
 
     clean_text = humanize_incoming_mentions(message.content, message.guild)
-    if message.attachments:
-        clean_text += f" [Image/Attachment: {', '.join(a.filename for a in message.attachments)}]"
-    if message.stickers:
-        clean_text += f" [Sticker: {', '.join(s.name for s in message.stickers)}]"
+    rich_extras = extract_rich_message_details(message)
 
     record_buffer_message(
         channel_id=ch_id,
         sender=message.author.display_name,
         sender_id=message.author.id,
-        content=clean_text,
+        content=f"{clean_text}{rich_extras}".strip(),
         msg_id=message.id,
         is_bot=False,
-        has_media=bool(message.attachments or message.stickers),
+        has_media=bool(message.attachments or message.stickers or message.embeds),
         reply_to=reply_to_name,
         reply_snippet=replied_snippet,
     )
 
-    if not any(r.get("is_bot", False) for r in prior_records[-4:]) and not replied_to_bot:
+    if not any(r.get("is_bot", False) for r in prior_records[-6:]) and not replied_to_bot:
         channel_thread_exchange_count[ch_id] = 0
 
     existing_task = active_generation_tasks.get(ch_id)
@@ -3416,15 +4436,22 @@ async def on_message(message: discord.Message) -> None:
     explicit_ping_or_reply = (bot.user is not None and bot.user in message.mentions) or replied_to_bot
     bot_mentioned = explicit_ping_or_reply
     if bot.user and not bot_mentioned:
-        is_currently_stepped_back = time.time() < channel_stepped_back_until.get(ch_id, 0.0)
-        # While stepped back for 3 minutes, only wake up on an explicit @ping, reply to bot, or exact 'dumb bot' call
-        bot_names = (
-            {"dumb bot", bot.user.name.lower()}
-            if is_currently_stepped_back
-            else {bot.user.name.lower(), bot.user.display_name.lower(), message.guild.me.display_name.lower(), "dumb bot"}
-        )
+        bot_names = {
+            bot.user.name.lower(),
+            bot.user.display_name.lower(),
+            message.guild.me.display_name.lower(),
+            "dumb bot",
+            "dumbbot",
+        }
         if any(re.search(rf"\b{re.escape(bn)}\b", message.content.lower()) for bn in bot_names if len(bn) >= 3):
             bot_mentioned = True
+
+    is_currently_stepped_back = time.time() < channel_stepped_back_until.get(ch_id, 0.0)
+    is_implicit_wakeup = detect_implicit_wakeup_or_checkin(
+        content=message.content,
+        is_stepped_back=is_currently_stepped_back,
+        seconds_since_bot_spoke=seconds_since_bot_spoke,
+    )
 
     target_member_to_engage = detect_target_member_to_engage(
         content=clean_text,
@@ -3441,45 +4468,31 @@ async def on_message(message: discord.Message) -> None:
         and (not target_member_to_engage or u.id != target_member_to_engage.id)
     ]
 
-    is_active_or_direct = bot_mentioned or last_message_from_bot or (bot_in_last_3_messages and seconds_since_bot_spoke <= 180.0)
+    is_active_or_direct = (
+        bot_mentioned
+        or is_implicit_wakeup
+        or last_message_from_bot
+        or (bot_in_last_5_messages and seconds_since_bot_spoke <= 600.0)
+    )
     is_hush_request = detect_hush_command(message.content, is_active_or_direct)
 
-    if bot_mentioned and not is_hush_request:
+    if (bot_mentioned or is_implicit_wakeup) and not is_hush_request:
         channel_stepped_back_until[ch_id] = 0.0
-
-    is_test_mode = raw_stripped.lower().startswith("test") and is_creator(message.author)
-
-    snipe_parts = []
-    now = time.time()
-    del_snipe = deleted_message_cache.get(ch_id)
-    if del_snipe and (now - del_snipe["timestamp"] < 60):
-        snipe_parts.append(f"{del_snipe['author']} just deleted a message: '{del_snipe['content']}'")
-    edit_snipe = edited_message_cache.get(ch_id)
-    if edit_snipe and (now - edit_snipe["timestamp"] < 60):
-        snipe_parts.append(f"{edit_snipe['author']} just edited their message from '{edit_snipe['before']}' to '{edit_snipe['after']}'")
-
-    if isinstance(message.author, discord.Member):
-        act_str = extract_member_live_activity(message.author)
-        if act_str:
-            snipe_parts.append(f"{message.author.display_name}'s live Discord activity: {act_str}")
-
-    snipe_info = " | ".join(snipe_parts) if snipe_parts else None
 
     task = asyncio.create_task(
         run_channel_response_pipeline(
             channel=message.channel,
             trigger_message=message,
             is_direct_interaction=bot_mentioned or bool(target_member_to_engage),
+            is_implicit_wakeup=is_implicit_wakeup,
             explicitly_mentioned_others=explicitly_mentioned_others,
             target_member_to_engage=target_member_to_engage,
             is_hush_request=is_hush_request,
             replied_to_other_user=reply_to_name if replied_to_other_human else None,
             replied_snippet=replied_snippet,
             last_message_from_bot=last_message_from_bot,
-            bot_in_last_3_messages=bot_in_last_3_messages,
+            bot_in_last_5_messages=bot_in_last_5_messages,
             seconds_since_bot_spoke=seconds_since_bot_spoke,
-            is_test_mode=is_test_mode,
-            snipe_info=snipe_info,
             is_proactive_scan=False,
         )
     )

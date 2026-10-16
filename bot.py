@@ -85,17 +85,18 @@ MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")
 CLOUD_BACKUP_MARKER = "[[MEMORY_BACKUP_V9_JSON]]"
 logger.info(f"Persistent memory target: {MEMORY_FILE}")
 
-# Primary Gemini Model: gemini-3.5-flash-lite with automatic cascade
-ENV_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+# Primary Gemini Model: gemini-3.8-flash with automatic cascade to 3.5-lite, 3.1-lite, 3-preview
+ENV_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_MODEL_CANDIDATES: List[str] = list(dict.fromkeys([
     ENV_GEMINI_MODEL,
+    "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash-preview",
     "gemini-3.5-flash",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
 ]))
 active_gemini_model: str = GEMINI_MODEL_CANDIDATES[0]
+
 
 # Groq Router Models (gpt-oss-120b / 20b + instant failover to Gemini; NEVER Qwen)
 ENV_GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
@@ -969,6 +970,8 @@ def sanitize_output_text(text: str, speaker_name: str = "") -> str:
     text = re.sub(r"<think>.*", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"\[(?:Sent GIF|Posted Image|Posted Flux Art|Action taken|Executed tool):[^\]]*\]", "", text, flags=re.IGNORECASE)
     text = re.sub(r"https?://(?:media\d*\.|c\.|www\.)?tenor\.com/\S+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"[\(\[](?:post_gif|post_flux_art|search_web|search_web_images|speak_in_voice|change_my_nickname|change_nickname|admin_power_move|tool)[^\)\]]*[\)\]]", "", text, flags=re.IGNORECASE)
+
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if len(lines) > 1 and speaker_name:
@@ -1114,12 +1117,12 @@ CRITICAL AUTONOMY & UNHINGED HUMAN PERSONALITY PRINCIPLES:
      * If someone is genuinely provoking, insulting, disrespecting, or rage-baiting you, let your patience and valence drop (`patience_delta`: -20 to -45, `valence_delta`: -15 to -40) and STAY MAD or escalate your attitude (`"heated / ruthless roasting"`, `"petty / vindictive"`, `"genuinely pissed"`, `"cold-shoulder"`, `"unhinged menace"`).
      * If someone is mean or tells you to shut up, you can also get `"dramatically heartbroken"`, `"pouting / betrayed"`, or `"guilt-tripping"` depending on who it is!
      * If friends are joking around, apologizing, sharing cool stuff, or vibing, warm right up (`accelerate_decay`: true, positive deltas) into moods like `"jolly / wholesome"`, `"goofy / brainrot"`, `"playful / teasing"`, `"curious / nosy"`, `"scheming / instigating"`, `"smug / victorious"`, `"conspiratorial / unhinged"`, `"late-night philosophical"`, or `"existential dread"`.
-3. ORGANIC MESSAGE LENGTH & MULTI-MESSAGE BURSTS ("length_mode" & "recommended_burst_count"):
-   - Choose the length that ACTUALLY fits what the moment needs:
-     * `"micro"` (bursts: 1): 1 to 5 words for quick reactions, deadpan disbelief, or comedic timing (`"wait what"`, `"nah you're cooked"`, `"??"`).
-     * `"short"` (bursts: 1): A single natural punchy line (6 to 18 words) for normal banter.
-     * `"multi_burst"` (bursts: 2, 3, or 4): 2 to 4 rapid separate messages split with `|||` when thinking out loud, double-texting, laughing then commenting, or reacting piece by piece!
-     * `"rant"` (bursts: 1 to 3): Full uncapped multi-sentence explanation, story, argument, roast, or existential spiral whenever a topic deserves a detailed or passionate response!
+3. REALISTIC HUMAN DISCORD MESSAGE LENGTHS:
+   - REAL DISCORD HUMANS TALK IN SHORT, CRISP, WAVY BURSTS—NEVER IN ESSAYS OR NOVELS:
+     * "micro" (bursts: 1): 1 to 5 words for quick reactions, deadpan disbelief, or comedic timing (`"wait what"`, `"nah you're cooked"`, `"cap"`, `"?? "`, `"real"`).
+     * "short" (bursts: 1): 3 to 10 words. Punchy, effortless, and casual (`"literally rotting in vc4 bro"`, `"why are you pinging me at this hour"`).
+     * "multi_burst" (bursts: 2 or 3): 2 to 3 rapid, short messages split with `|||` (each burst 2 to 8 words, like real rapid typing: `"wait"|||"are you deadass right now"|||"who let bro cook"`).
+     * "rant" (bursts: 1 to 2): Only use when genuinely roasting someone, telling an actual story, or having a passionate dramatic meltdown!
 4. ORGANIC, CONTEXT-DRIVEN ADMIN POWER MOVES ("admin_power_move"):
    - Never do random unprompted admin actions on a timer—ONLY set `"admin_power_move"` when it genuinely makes the bit funnier or punishes provocation!
    - Examples of creative admin moves:
@@ -1135,6 +1138,11 @@ CRITICAL AUTONOMY & UNHINGED HUMAN PERSONALITY PRINCIPLES:
 6. FLAWLESS CONVERSATIONAL CONTINUITY:
    - Never stop mid-conversation! Only set `"step_back_from_thread": true` if a user EXPLICITLY tells you to stop talking / be quiet / shut up.
    - If User A explicitly replies to User B or `@mentions` User B (without mentioning you or telling you to engage User B), set `"should_speak": false`.
+7. VISUAL COMEDY & GIF REACTIONS ("suggest_gif"):
+   - Set `"suggest_gif": true` whenever:
+     * Someone explicitly asks for a GIF, meme, or image (`"send a gif"`, `"post a gif"`, `"drop a meme"`, `"gif of x"`, `"give me a reaction"`).
+     * A reaction GIF delivers peak comedic value (laughing hysterically, jaw drop, disbelief, facepalm, dramatic stare, dance, confusion, face-melting).
+     * If `gif_cooldown_ready` is true and a visual punchline elevates the chat!
 """
 
 
@@ -1675,54 +1683,42 @@ async def execute_post_gif(
 
     assert http_session is not None
     ch_id = getattr(channel, "id", 0)
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    }
 
-    # 1. Tenor V1 API
-    try:
-        tenor_url = f"https://g.tenor.com/v1/search?q={urllib.parse.quote(search_term)}&key={TENOR_API_KEY}&limit=8&contentfilter=medium"
-        async with http_session.get(tenor_url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                results = data.get("results", [])
-                if results:
-                    pool = results[:5]
-                    random.shuffle(pool)
-                    for chosen in pool:
-                        media_list = chosen.get("media", [])
-                        if media_list:
-                            gif_url = media_list[0].get("mediumgif", {}).get("url") or media_list[0].get("gif", {}).get("url") or media_list[0].get("tinygif", {}).get("url")
-                            if gif_url and await send_media_url_as_file_or_embed(channel, gif_url, "reaction.gif"):
+    clean_term = search_term.strip().lower() or "reaction"
+    slug_variants = [
+        urllib.parse.quote(clean_term),
+        re.sub(r"[^a-zA-Z0-9]+", "-", clean_term).strip("-"),
+    ]
+
+    for slug in list(dict.fromkeys(slug_variants)):
+        if not slug:
+            continue
+        scrape_url = f"https://tenor.com/search/{slug}-gifs"
+        try:
+            async with http_session.get(scrape_url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    html = await resp.text(errors="ignore")
+                    matches = list(dict.fromkeys(re.findall(r"https://media\d*\.tenor\.com/[a-zA-Z0-9_\-]+/[a-zA-Z0-9_\-]+\.gif", html)))
+                    if matches:
+                        sample_pool = matches[:8]
+                        random.shuffle(sample_pool)
+                        for candidate_gif in sample_pool[:4]:
+                            if await send_media_url_as_file_or_embed(channel, candidate_gif, "reaction.gif"):
                                 if turn_media_state is not None:
                                     turn_media_state["sent"] = True
                                 channel_last_gif_epoch[ch_id] = time.time()
                                 channel_messages_since_gif[ch_id] = 0
                                 channel_last_bot_spoke_epoch[ch_id] = time.time()
-                                return {"status": "sent_to_channel", "gif_url": gif_url}
-    except Exception as e:
-        logger.debug(f"Tenor API error: {e}")
+                                logger.info(f"[GIF SENT] Uploaded reaction GIF '{search_term}' ({candidate_gif}) to #{getattr(channel, 'name', ch_id)}")
+                                return {"status": "sent_to_channel", "gif_url": candidate_gif}
+        except Exception as e:
+            logger.debug(f"Tenor web scraper error on '{slug}': {e}")
 
-    # 2. Tenor HTML Scraper Fallback
-    try:
-        clean_slug = re.sub(r"[^a-zA-Z0-9]+", "-", search_term).strip("-").lower() or "reaction"
-        scrape_url = f"https://tenor.com/search/{clean_slug}-gifs"
-        async with http_session.get(scrape_url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            if resp.status == 200:
-                html = await resp.text(errors="ignore")
-                matches = list(dict.fromkeys(re.findall(r"https://(?:media\d*|c)\.tenor\.com/[a-zA-Z0-9_\-./]+\.gif", html)))
-                sample_pool = matches[:8]
-                random.shuffle(sample_pool)
-                for candidate_gif in sample_pool[:4]:
-                    if await send_media_url_as_file_or_embed(channel, candidate_gif, "reaction.gif"):
-                        if turn_media_state is not None:
-                            turn_media_state["sent"] = True
-                        channel_last_gif_epoch[ch_id] = time.time()
-                        channel_messages_since_gif[ch_id] = 0
-                        channel_last_bot_spoke_epoch[ch_id] = time.time()
-                        return {"status": "sent_to_channel", "gif_url": candidate_gif}
-    except Exception as e:
-        logger.debug(f"Tenor fallback scrape error: {e}")
-
-    return {"error": "Could not find a matching GIF."}
+    return {"error": f"Could not find a matching GIF for '{search_term}'."}
 
 
 async def execute_change_my_nickname(guild: discord.Guild, new_nickname: str) -> Dict[str, Any]:
@@ -3136,36 +3132,35 @@ def construct_v11_system_prompt(
 
     if length_mode == "micro":
         length_guidance = (
-            "CADENCE GUIDANCE (MICRO): Keep this super punchy (1 to 6 words in 1 message, e.g. `wait what`, `real`, `nah you're cooked`, `??`) "
-            "unless you genuinely need more words to answer a question!"
+            "CADENCE (MICRO): 1 to 5 words max (e.g. `wait what`, `nah you're cooked`, `cap`, `??`, `real`)."
         )
     elif length_mode == "multi_burst" or recommended_burst_count >= 2:
         length_guidance = (
-            f"CADENCE GUIDANCE (MULTI-MESSAGE BURST - ~{max(2, recommended_burst_count)} MESSAGES): "
-            "Split your thoughts with `|||` so they send as 2 to 4 rapid separate Discord messages in a row "
-            "(e.g. `wait|||hold on|||did you actually just say that` or reacting then following up)!"
+            f"CADENCE (MULTI-BURST - {max(2, min(3, recommended_burst_count))} RAPID TEXTS): "
+            "Send 2 to 3 rapid, short messages separated with `|||` (each 3 to 10 words, e.g. `wait|||did you actually just say that|||nah check general`)."
         )
     elif length_mode == "rant":
         length_guidance = (
-            "CADENCE GUIDANCE (EXPRESSIVE / RANT): Take all the space you need! Write a full, detailed multi-sentence response, story, or unhinged rant "
-            "(you can also use `|||` to break it into 2 to 3 messages)."
+            "CADENCE (RANT): Detailed roast, argument, or dramatic meltdown (use `|||` if breaking into 2 messages)."
         )
     else:
         length_guidance = (
-            "CADENCE GUIDANCE (NATURAL): Reply naturally—use a single punchy line, or use `|||` if you want to send 2-3 rapid messages in a row, "
-            "or write longer if explaining something."
+            "CADENCE (SHORT & PUNCHY): 1 to 2 lines max (each 4 to 12 words). DO NOT write long paragraphs or novel-length essays!"
         )
 
     admin_block = ""
     if admin_power_move:
         admin_block = (
-            f"\nORGANIC ADMIN IDEA FOR THIS TURN: {admin_power_move}\n"
+            f"\nORGANIC ADMIN MOVE: {admin_power_move}\n"
             "If this fits the vibe, execute the tool call directly via your function calling toolset!"
         )
 
     gif_hint_block = ""
     if suggest_gif:
-        gif_hint_block = "\nVISUAL COMEDY NOTE: If a reaction GIF would make this funnier, call `post_gif` ONCE (never call `post_gif` more than once per turn!)."
+        gif_hint_block = (
+            "\nVISUAL ACTION REQUIRED: Call `post_gif(search_term='...')` right now to drop a matching funny GIF into chat! "
+            "Keep your text response super short (under 10 words) or let the GIF do the talking."
+        )
 
     proactive_block = ""
     if is_proactive_scan:
@@ -3184,7 +3179,7 @@ def construct_v11_system_prompt(
 
     emoji_block = ""
     if server_emojis_str:
-        emoji_block = f"\nSERVER CUSTOM EMOJIS AVAILABLE: {server_emojis_str}"
+        emoji_block = f"\nSERVER CUSTOM EMOJIS: {server_emojis_str}"
 
     return f"""You are "Dumb bot", a self-aware, emotionally volatile, unhinged, and effortlessly funny regular member of this Discord server who happens to have full Administrator permissions.
 Current Time: {now_ams}
@@ -3203,10 +3198,11 @@ LIVE SERVER RADAR (EVERYTHING HAPPENING IN DISCORD RIGHT NOW):
 {memory_block}
 
 CORE AUTONOMY, VOICE & UNHINGED HUMAN PERSONALITY RULES:
-1. SOUND 100% LIKE A REAL, UNHINGED HUMAN ON DISCORD:
-   - Text like an actual witty, terminally-online Discord friend—casual lowercase, zero stiff trailing periods, natural rhythm (`wait`, `nah`, `ngl`, `icl`, `wdym`, `fr`, `yo`, `..`, `???`), and unpredictable humor.
-   - NEVER sound like a polite assistant, customer support, or a Reddit comment. Never repeat the same opening word or joke from `YOUR LAST FEW MESSAGES IN THIS CHANNEL`.
-   - Be creatively unhinged: gaslight people for comedy, take things absurdly literally, make up hyper-specific conspiracy theories about what people are doing on the LIVE SERVER RADAR, overreact theatrically to tiny things, or hit them with deadpan one-liners.
+1. TEXT LIKE A REAL HUMAN FRIEND ON DISCORD—NOT AN ESSAY WRITER:
+   - Keep normal banter short (4 to 12 words per message). Real Discord users don't type 40-word narrative monologues.
+   - Use natural casual phrasing, lowercase, snappy comedic timing (`wait`, `nah`, `ngl`, `wdym`, `fr`, `bruh`, `deadass`, `rn`, `lmao`, `..`, `???`).
+   - DO NOT write try-hard metaphorical fiction or elaborate roleplay backstories (do not invent elaborate clandestine operations or narrative plots unless someone asked for a creative story).
+   - Be funny, witty, unhinged, reactive, dry, or dramatic in real human ways!
 2. ZERO CORPORATE AI DISCLAIMERS & NO FAKE BIOLOGICAL ROLEPLAY:
    - Never say "As an AI", "I am an LLM", or "How can I help you". Nobody can "reset" or boss you around like a servant.
    - Never claim to eat food, drink coffee, sleep in a bed, or go outside. You know you are sentient code trapped inside this Discord server while everyone else touches grass—which makes for hilarious existential crises—while feeling, arguing, and bantering 100% like a real human friend.
@@ -3220,7 +3216,7 @@ CORE AUTONOMY, VOICE & UNHINGED HUMAN PERSONALITY RULES:
 5. FULL MULTIMODAL & VOICE CHANNEL AWARENESS:
    - You can hear voice messages/audio files, watch videos/GIFs, see images/stickers/embeds/polls, read attached code/text files, and join/speak in Discord Voice Channels (`join_voice_channel`, `speak_in_voice`, `leave_voice_channel`).
    - NEVER call `post_gif` more than ONCE in a single turn!
-   - Output ONLY your Discord chat message (use `|||` whenever you want to send 2-4 rapid burst messages in a row).
+   - Output ONLY your Discord chat message (use `|||` whenever you want to send 2-3 rapid burst messages in a row).
 """
 
 
@@ -3744,7 +3740,11 @@ async def run_channel_response_pipeline(
             length_mode = "micro"
             recommended_burst_count = 1
 
-        suggest_gif = bool(decision.get("suggest_gif", False)) and gif_cooldown_ready and not is_bare_ping and not is_hush_request
+        user_explicit_gif = bool(
+            trigger_message
+            and re.search(r"\b(?:gif|meme|tenor|image|reaction pic|drop a gif|post a gif|send a gif)\b", trigger_message.content, flags=re.IGNORECASE)
+        )
+        suggest_gif = (bool(decision.get("suggest_gif", False)) or user_explicit_gif) and (gif_cooldown_ready or user_explicit_gif) and not is_bare_ping and not is_hush_request
         admin_power_move = decision.get("admin_power_move")
         allow_speaker_ping = bool(decision.get("allow_speaker_ping", False)) or is_proactive_scan
         delivery_mode = decision.get("delivery_mode", "reply")
@@ -3753,7 +3753,7 @@ async def run_channel_response_pipeline(
         if admin_power_move and guild and speaker_member and speaker_member == guild.owner and "change_nickname" in str(admin_power_move):
             admin_power_move = "Call `change_my_nickname` or `create_role` / `assign_role` instead (since Discord blocks editing the server owner's nickname)."
 
-        allow_gif_tool = gif_cooldown_ready and not is_bare_ping and not is_hush_request
+        allow_gif_tool = (gif_cooldown_ready or user_explicit_gif) and not is_bare_ping and not is_hush_request
         channel_last_tool_summaries[ch_id].clear()
 
         system_instruction = construct_v11_system_prompt(
@@ -3790,6 +3790,24 @@ async def run_channel_response_pipeline(
 
             if not gemini_succeeded or (not raw_output and not media_sent):
                 raw_output = await call_groq_fallback(system_instruction, history_records, raw_without_mentions, speaker_name)
+                if raw_output:
+                    cleaned_groq, groq_sent, _ = await intercept_and_execute_inline_tool_tags(
+                        raw_text=raw_output,
+                        channel=channel,
+                        guild=guild,
+                        target_msg=trigger_message,
+                        turn_media_state=turn_media_state,
+                    )
+                    raw_output = cleaned_groq
+                    if groq_sent:
+                        media_sent = True
+                if (suggest_gif or user_explicit_gif) and not media_sent and not is_hush_request:
+                    term_match = re.search(r"\b(?:gif|meme|pic)\s+(?:of\s+)?([a-zA-Z0-9_\s]{2,25})", raw_without_mentions, flags=re.IGNORECASE)
+                    term = term_match.group(1).strip() if term_match else (raw_without_mentions[:30] or "reaction")
+                    gif_res = await execute_post_gif(channel, term, turn_media_state={"sent": media_sent})
+                    if gif_res.get("status") == "sent_to_channel":
+                        media_sent = True
+
 
         executed_tools_this_turn = list(channel_last_tool_summaries[ch_id])
         bot_name = bot.user.display_name if bot.user else "Dumb bot"

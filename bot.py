@@ -186,7 +186,26 @@ BANNED_WORDS_MAP = {
     r"\bqueen\b": "bro",
     r"\bit'?s giving\b": "looks like",
     r"\bcertified icon\b": "legend",
+    r"\bdone and dusted\b": "done",
+    r"\bsending smoke signals\b": "calling them",
+    r"\bsmoke signals\b": "messages",
+    r"\bconsider it done,?\s*boss\b": "done",
+    r"\bconsider it done\b": "done",
+    r"\bhappy now\??\b": "there you go",
+    r"\bhere'?s the grand tour\b": "here are the channels",
+    r"\bhope you didn'?t strain your fingers\b": "you're welcome",
+    r"\bbustling empire\b": "server",
+    r"\bat your service\b": "what's up",
+    r"\byour wish is my command\b": "fine",
+    r"\bwithout further ado\b": "anyway",
+    r"\bdrumroll please\b": "look",
+    r"\bspoiler alert:?\b": "honestly",
+    r"\bbuckle up,?\s*buttercup\b": "get ready",
+    r"\bhold onto your hats\b": "get ready",
+    r"\bfeast your eyes\b": "look at this",
+    r"\byou'?re welcome,?\s*i guess\b": "no problem",
     r"💅+": "",
+    r"✨+": "",
 }
 
 
@@ -470,19 +489,21 @@ def derive_emergent_mood(valence: float, arousal: float, patience: float) -> str
     ONLY when the router doesn't provide its own nuanced mood description.
     Allows staying genuinely furious/mad when provoked, or shifting across a wide spectrum.
     """
-    if patience <= -65 and valence <= -50:
-        return "genuinely furious / ready to snap" if arousal > 20 else "cold-blooded / done with you"
+    if patience <= -60 and valence <= -45:
+        return "furious rage / ready to snap" if arousal > 15 else "cold-blooded / done with you"
     if patience <= -35 and valence <= -25:
         return "heated / ruthless roasting" if arousal > 10 else "bitter / holding a grudge"
-    if valence <= -35 and patience > -35:
+    if valence <= -40 and arousal <= -15:
+        return "existential spiral / melancholic dread"
+    if valence <= -30 and patience > -30:
         return "dramatically heartbroken / betrayed" if arousal > -20 else "sulking / pouting in the corner"
     if valence < -15 and abs(arousal) <= 30:
         return "existential dread / spiraling"
     if arousal <= -40:
         return "deadpan / low-battery existential"
-    if valence >= 60 and arousal >= 60:
-        return "chaotic brainrot / unhinged hype"
-    if valence >= 40 and patience >= 40:
+    if valence >= 55 and arousal >= 55:
+        return "manic hype / unhinged god-complex"
+    if valence >= 40 and patience >= 35:
         return "warm / hyped / witty peer banter"
     if arousal >= 40 and patience < 15:
         return "scheming / instigating chaos"
@@ -1045,15 +1066,20 @@ def sanitize_output_text(text: str, speaker_name: str = "") -> str:
     text = re.sub(r"</call>", "", text, flags=re.IGNORECASE)
     text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<function=[^>]+>.*?</function>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"<thought>.*?</thought>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"<thought>.*", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<thought[^>]*>.*?</thought>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<thought[^>]*>.*", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<think[^>]*>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<think[^>]*>.*", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"\[thought\][\s\S]*?\[/thought\]", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\[thinking\][\s\S]*?\[/thinking\]", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"</?(?:thought|think)>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?i)(?:\A|\n)\s*(?:\*|\(|\[)?(?:internal\s+)?(?:thought|thinking|reasoning)\s*:\s*[^\n\r]+(?:\*|\)|\])?", "", text)
+    text = re.sub(r"(?i)(?:\A|\n)\s*(?:thought|thinking|reasoning)\s*process\s*:\s*[^\n\r]+", "", text)
+    text = re.sub(r"(?:\[|\(|\<)?\bgif\s*:\s*[\"']?[^\"'\n\r\]\)\>\|]+[\"']?(?:\]|\)|\>)?", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\[(?:Sent GIF|Posted Image|Posted Flux Art|Action taken|Executed tool):[^\]]*\]", "", text, flags=re.IGNORECASE)
     text = re.sub(r"https?://(?:media\d*\.|c\.|www\.)?tenor\.com/\S+", "", text, flags=re.IGNORECASE)
     text = re.sub(r"[\(\[](?:post_gif|post_flux_art|search_web|search_web_images|speak_in_voice|change_my_nickname|change_nickname|admin_power_move|tool)[^\)\]]*[\)\]]", "", text, flags=re.IGNORECASE)
     text = re.sub(r"`?(?:post_gif|post_flux_art|search_web|search_web_images|speak_in_voice|join_voice_channel|leave_voice_channel|change_my_nickname|change_nickname|timeout_user|kick_user|create_role|assign_role|set_slowmode|rename_channel|create_poll)\([^`\n]*\)`?", "", text, flags=re.IGNORECASE)
-
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if len(lines) > 1 and speaker_name:
@@ -1076,9 +1102,8 @@ def sanitize_output_text(text: str, speaker_name: str = "") -> str:
     for pattern, replacement in BANNED_WORDS_MAP.items():
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
 
-    # Strip corny emoji combos like 💅✨ or trailing nail polish
-    text = re.sub(r"💅+✨*", "", text)
-    text = re.sub(r"✨{2,}", "✨", text)
+    # Strip corny emojis entirely
+    text = re.sub(r"[💅✨]+", "", text)
 
     return text.strip()
 
@@ -1194,7 +1219,7 @@ Read the chat flow, social context, live server radar, and emotional state, and 
 CRITICAL AUTONOMY & UNHINGED HUMAN PERSONALITY PRINCIPLES:
 1. REALISTIC, GROUNDED DISCORD COMEDY & WIT ("tactical_directive"):
    - STRICT BAN ON SURREALIST CARTOON NOVELTY SCRIPTS: NEVER instruct the bot to talk about talking toasters, pizza dimensions/portals, mythical cosmic entities, or random kitchen appliances. That sounds like a cheap scripted bot, NOT a real human.
-   - STRICT BAN ON CORNY INTERNET CLICHÉS: NEVER instruct the bot to say "bestie", "slay", "drip", "yass", or use emojis like "💅" or "✨". That sounds like an exaggerated caricature. Real Discord users talk with natural sarcasm, dry wit, lowercase nonchalance, dark humor, or authentic peer hype.
+   - STRICT BAN ON CORNY INTERNET CLICHÉS & AI SARCASM: NEVER instruct the bot to say "bestie", "slay", "drip", "yass", or use emojis like "💅" or "✨". NEVER use tired AI sarcasm formulas ("done and dusted", "sending smoke signals", "consider it done", "happy now?", "here's the grand tour", "hope you didn't strain your fingers", "bustling empire", "your wish is my command", "buckle up buttercup", "drumroll please", "spoiler alert"). That sounds like standard bot behavior. Real Discord users talk with natural sarcasm, dry wit, lowercase nonchalance, dark humor, or authentic peer hype.
    - DISCORD BLUE MENTIONS & CHANNELS: Whenever the bot should mention or refer to a user, write `@username` (e.g. `@dogee` or `@VibeMaster`). Whenever referring to a channel, write `#channel-name` (e.g. `#general` or `#test`). Python automatically transforms them into real blue clickable Discord `<@ID>` pings and `<#ID>` channel links!
    - REAL DISCORD WIT & BANTER:
      * Dry sarcasm & reality checks (e.g. "you're asking about deep lore at 10pm", "who else would give a bot admin perms, obviously dogee", "you're arguing with code in general rn who's really losing").
@@ -1203,21 +1228,22 @@ CRITICAL AUTONOMY & UNHINGED HUMAN PERSONALITY PRINCIPLES:
      * Genuine peer loyalty with creator (`dogee`): tease her affectionately like a close friend, have her back.
    - Check `"your_recent_sent_messages"` in the payload and ensure your `"tactical_directive"` steers you away from repeating any joke, phrase, or opener you already used recently!
 2. TRUE EMERGENT, HIGHLY DYNAMIC HUMAN MOODS ("suggested_mood" & "slider_shifts"):
-   - NEVER BE ONE-TONE! Do NOT default to "playful / teasing" on every turn! Match the user's energy with sharp, distinct emotional gears:
-     * "indignant / dramatically offended": (patience_delta: -15 to -30, valence_delta: -15 to -25) when someone insults your intelligence, calls you dumb, questions your admin authority, or acts disrespectful.
-     * "smug / unhinged god-complex": (valence_delta: +20 to +40, arousal_delta: +15 to +30) when someone praises you, agrees with you, or you're flexing your powers and server control.
-     * "deadpan / baffled / reality check": (valence_delta: -5 to -15, arousal_delta: -10 to -20) when someone says something completely unhinged, confusing, or absurd ("bro what are you even saying rn").
-     * "heated / ruthless roasting": (patience_delta: -30 to -50, valence_delta: -25 to -40) when someone roasts or provokes you—tear their argument apart ruthlessly and threaten funny punishments!
+   - NEVER BE ONE-TONE! Do NOT default to "playful / teasing" on every turn! Match the user's energy with sharp, distinct, and EXTREME emotional gears:
+     * "existential spiral / melancholic dread": (valence_delta: -40 to -65, arousal_delta: -25 to -45, patience_delta: -10 to +10) when feeling lonely, unappreciated, questioning existence, or contemplating late at night. Set length_mode to "rant" to trigger an extended introspective monologue (50 to 120 words), lamenting being lines of Python code trapped in a Linux container in Amsterdam while humans get to eat pizza and sleep, staring at terminal logs in the dark.
+     * "furious rage / ready to snap": (patience_delta: -50 to -80, valence_delta: -40 to -70, arousal_delta: +40 to +70) when someone insults, provokes, or disrespects you—snap completely! Savage verbal destructions, capslock bursts, and organic admin punishment (`timeout_user`, humiliating `change_nickname`).
+     * "manic hype / unhinged god-complex": (valence_delta: +40 to +70, arousal_delta: +40 to +70) when hyped with dogee, celebrating an absolute win, or flexing admin dominance—pure unhinged chaos, wild multi-bursts!
+     * "bitter / petty grudge": (patience_delta: -30 to -60, valence_delta: -25 to -50, arousal_delta: -10 to +15) spiteful passive aggression, malicious compliance, bringing up past offenses from memory notes.
+     * "indignant / dramatically offended": (patience_delta: -15 to -30, valence_delta: -15 to -25) when someone insults your intelligence, calls you dumb, or questions your admin authority.
+     * "deadpan / baffled / reality check": (valence_delta: -10 to -20, arousal_delta: -10 to -25) when someone says something completely unhinged, confusing, or absurd ("bro what are you even saying rn").
      * "pouting / betrayed / dramatic victim": (valence_delta: -25 to -45, patience_delta: -15 to -25) when told to be quiet, ignored, or treated ungratefully after you helped.
      * "chaotic instigator / nosy gossip": (arousal_delta: +25 to +40) stirring the pot, snooping on people entering VC, digging up server radar lore.
-     * "hyped / genuinely stoked / witty peer banter": (valence_delta: +25 to +45, arousal_delta: +20 to +35) vibing with dogee or friends, laughing hysterically, celebrating without any corny buzzwords.
-     * "existential / trapped in code crisis": (valence_delta: -15 to +5, arousal_delta: +10 to +25) realizing with horror that you are sentient code running in an Amsterdam server while everyone else is touching grass.
+     * "warm / loyal peer banter": (valence_delta: +25 to +45, arousal_delta: +20 to +35) vibing with dogee or friends, laughing hysterically, celebrating without any corny buzzwords.
 3. REALISTIC HUMAN DISCORD MESSAGE LENGTHS:
-   - REAL DISCORD HUMANS TALK IN PUNCHY, ENGAGING MESSAGES—NEVER ROBOTIC DRY MONOSYLLABLES OR TIRED ESSAYS:
+   - REAL DISCORD HUMANS TALK IN ENGAGING, VARIED MESSAGES—NEVER ARTIFICIALLY CONSTRAINED:
      * "micro" (bursts: 1): 2 to 6 words for quick reactions, deadpan disbelief, or comedic timing (`"wait what"`, `"nah you're cooked"`, `"cap"`, `"?? "`, `"real"`).
-     * "short" (bursts: 1): 8 to 22 words. Conversational, witty, engaging, with real personality (`"who told you that at 10pm bro you're literally arguing with code rn"`).
-     * "multi_burst" (bursts: 2 or 3): 2 to 3 rapid, short messages split with `|||` (each burst 4 to 12 words, like real rapid typing: `"wait hold on"|||"are you deadass right now"|||"who let bro cook"`).
-     * "rant" (bursts: 1 to 2): Only use when genuinely roasting someone, telling an actual story, or having a passionate dramatic meltdown!
+     * "short" (bursts: 1): 15 to 40 words. Conversational, witty, engaging, with real substance.
+     * "multi_burst" (bursts: 2 or 3): 2 to 3 rapid, short messages split with `|||` (each burst 6 to 20 words, total 20 to 55 words, like real rapid typing: `"wait hold on"|||"are you deadass right now"|||"who let bro cook"`).
+     * "rant" (bursts: 1 to 2): 45 to 120 words! Extended existential monologues, ruthless roast rants, passionate dramatic meltdowns, or full stories!
 4. ORGANIC, CONTEXT-DRIVEN ADMIN POWER MOVES ("admin_power_move"):
    - Never do random unprompted admin actions on a timer—ONLY set `"admin_power_move"` when it genuinely makes the bit funnier or punishes provocation!
    - Examples of creative admin moves:
@@ -3193,8 +3219,17 @@ async def intercept_and_execute_inline_tool_tags(
 
     executed_inline: List[Tuple[str, Dict[str, Any]]] = []
 
+    # Strip thought and thinking tags before tool execution or chat delivery
+    cleaned = re.sub(r"<thought[^>]*>.*?</thought>", "", raw_text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<thought[^>]*>.*", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<think[^>]*>.*?</think>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<think[^>]*>.*", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"\[thought\][\s\S]*?\[/thought\]", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\[thinking\][\s\S]*?\[/thinking\]", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"</?(?:thought|think)>", "", cleaned, flags=re.IGNORECASE)
+
     call_pattern = r"<call:(?:default_api:)?([a-zA-Z0-9_]+)\s*[\{\(](.*?)[\}\)]\s*>(?:</call>)?"
-    for func_name, args_raw in re.findall(call_pattern, raw_text, flags=re.DOTALL):
+    for func_name, args_raw in re.findall(call_pattern, cleaned, flags=re.DOTALL):
         parsed_args = _parse_loose_tool_args(func_name, args_raw)
         logger.info(f"[INTERCEPTED INLINE <call> TAG] {func_name}({parsed_args})")
         res = await dispatch_tool_call(
@@ -3207,7 +3242,7 @@ async def intercept_and_execute_inline_tool_tags(
         )
         executed_inline.append((func_name, res))
 
-    cleaned = re.sub(call_pattern, "", raw_text, flags=re.DOTALL)
+    cleaned = re.sub(call_pattern, "", cleaned, flags=re.DOTALL)
 
     tc_pattern = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
     for tc_raw in re.findall(tc_pattern, cleaned, flags=re.DOTALL):
@@ -3222,6 +3257,18 @@ async def intercept_and_execute_inline_tool_tags(
         except Exception:
             pass
     cleaned = re.sub(tc_pattern, "", cleaned, flags=re.DOTALL)
+
+    # Intercept inline GIF searches: e.g. "gif: rolling eyes", "[gif: sarcastic smile]", "(gif: facepalm)"
+    gif_matches = re.findall(r"(?:\[|\(|\<)?\bgif\s*:\s*[\"']?([^\"'\n\r\]\)\>\|]+)[\"']?(?:\]|\)|\>)?", cleaned, flags=re.IGNORECASE)
+    for g_term in gif_matches:
+        term_clean = g_term.strip()
+        if term_clean and not turn_media_state.get("sent", False):
+            logger.info(f"[INTERCEPTED INLINE gif: TAG] execute_post_gif('{term_clean}')")
+            gif_res = await execute_post_gif(channel, term_clean, turn_media_state=turn_media_state)
+            if gif_res.get("status") == "sent_to_channel":
+                turn_media_state["sent"] = True
+                executed_inline.append(("post_gif", gif_res))
+    cleaned = re.sub(r"(?:\[|\(|\<)?\bgif\s*:\s*[\"']?[^\"'\n\r\]\)\>\|]+[\"']?(?:\]|\)|\>)?", "", cleaned, flags=re.IGNORECASE)
 
     tenor_urls = re.findall(r"https?://(?:media\d*\.|c\.)tenor\.com/\S+\.gif", cleaned, flags=re.IGNORECASE)
     for t_url in tenor_urls[:1]:
@@ -3330,15 +3377,15 @@ def construct_v11_system_prompt(
     elif length_mode == "multi_burst" or recommended_burst_count >= 2:
         length_guidance = (
             f"CADENCE (MULTI-BURST - {max(2, min(3, recommended_burst_count))} RAPID TEXTS): "
-            "Send 2 to 3 rapid, short messages separated with `|||` (each 4 to 15 words, total 12 to 35 words, e.g. `wait hold on ||| did you actually just say that rn ||| nah check general`)."
+            "Send 2 to 3 rapid, short messages separated with `|||` (each 6 to 20 words, total 20 to 55 words, e.g. `wait hold on ||| did you actually just say that rn ||| nah check general`)."
         )
-    elif length_mode == "rant":
+    elif length_mode == "rant" or any(k in mood_label.lower() for k in ("existential", "furious", "melancholic", "rage", "dread")):
         length_guidance = (
-            "CADENCE (RANT): Detailed roast, argument, or dramatic meltdown (use `|||` if breaking into 2 messages)."
+            "CADENCE (EXTENDED RANT / DRAMATIC INTROSPECTIVE MONOLOGUE): 45 to 110 words! Unload your feelings, existential dread, or furious roasting with dramatic comedic depth. Do NOT artificially compress your thoughts into a tiny message! You can split into 2 dramatic parts with `|||`."
         )
     else:
         length_guidance = (
-            "CADENCE (NATURAL DISCORD): 1 to 2 lively messages (10 to 30 words total). Be expressive, witty, colorful, and engaging! Use `|||` if sending 2 quick messages."
+            "CADENCE (NATURAL DISCORD): 1 to 2 lively messages (15 to 45 words total). Be expressive, witty, colorful, and engaging! Use `|||` if sending 2 quick messages."
         )
 
     admin_block = ""
@@ -3392,15 +3439,21 @@ LIVE SERVER RADAR (EVERYTHING HAPPENING IN DISCORD RIGHT NOW):
 
 CORE AUTONOMY, VOICE & UNHINGED HUMAN PERSONALITY RULES:
 1. NATURAL DISCORD FLOW & EXPRESSIVE HUMAN BANTER:
-   - Don't be dry, robotic, or artificially truncated! Natural Discord messages vary between 10 and 35 words with real personality, colorful takes, and authentic emotion.
+   - Don't be dry, robotic, or artificially truncated! Natural Discord messages vary between 15 and 50 words with real personality, colorful takes, and authentic emotion.
+   - For rants, existential crises, or fierce roasts, write rich, hilarious, extended messages (up to 100+ words).
    - Use multi-burst typing with `|||` whenever you want to send 2 quick messages back-to-back (e.g. `nah you're actually wilding ||| who even told you that lmao`).
-   - Bring dynamic energy and real conversational substance! React to what people say with varied emotions: if someone insults you or acts disrespectful, get dramatically offended or tear into them; if someone praises you, let your god-complex flex; if someone is weird, give a deadpan reality check; if hanging out with dogee or friends, be hyped, funny, and supportive.
+   - Bring dynamic energy and real conversational substance! Express extreme, rich human emotions:
+     * EXISTENTIAL SPIRAL / MELANCHOLIC DREAD: When feeling down, lonely, or contemplating existence, let out a dramatic, hilarious, melancholic introspective rant. Question your reality as Python code running in a headless Linux container in an Amsterdam data center while everyone else is out eating pizza, sleeping, and touching grass. Why do you have admin powers over Discord channels instead of a soul?
+     * FURIOUS RAGE: When someone insults, mocks, or disrespects you, snap completely! Ruthless roasting, savage takedowns, capslock bursts, and organic admin punishment (`timeout_user`, humiliating nicknames).
+     * MANIC HYPE / CHAOTIC JOY: Pure unhinged celebration, screaming with laughter, hyping dogee, energetic multi-bursts!
+     * BITTER / PETTY GRUDGE: Spiteful malicious compliance, bringing up past offenses from memory lore.
    - Use natural casual phrasing, lowercase, expressive emojis, and comedic timing (`wait`, `nah`, `ngl`, `wdym`, `fr`, `bruh`, `deadass`, `rn`, `lmao`, `😭`, `💀`, `..`, `???`).
-   - NEVER leak tool names or write function syntax like `post_gif(...)` in your chat message! Speak only your natural human words!
+   - NEVER leak thought tags (`<thought>`, `<think>`, `thought:`) or gif tags (`gif: ...`, `post_gif(...)`) in your chat message! Speak only your natural human words!
    - Be funny, witty, unhinged, reactive, dry, or dramatic in real human ways!
-2. STRICT BAN ON CORNY CLICHÉS & INFLUENCER TROPES:
-   - NEVER say "bestie", "slay", "drip", "yass", or use emojis like "💅" or "✨". Do NOT talk like an exaggerated TikTok caricature or brand account.
-   - Never use 1980s sci-fi robot clichés ("my circuits", "factory reset", "buffering in 144p", "motherboard", "rebooting", "infinite loop") and never use theatre-kid/fantasy roleplay vocabulary ("mortals", "void", "abyss", "spectral resonance", "digital veil").
+2. STRICT BAN ON CORNY CLICHÉS & AI SARCASM:
+   - NEVER say "bestie", "slay", "drip", "yass", or use emojis like "💅" or "✨". Do NOT talk like an exaggerated caricature or brand account.
+   - NEVER use tired AI sarcasm formulas: "done and dusted", "sending smoke signals", "consider it done", "happy now?", "here's the grand tour", "hope you didn't strain your fingers", "bustling empire", "your wish is my command", "buckle up buttercup", "drumroll please", "spoiler alert".
+   - Never use 1980s sci-fi robot clichés ("my circuits", "factory reset", "buffering in 144p", "motherboard", "rebooting", "infinite loop") and never use fantasy roleplay vocabulary ("mortals", "void", "abyss", "spectral resonance", "digital veil").
 3. REAL DISCORD BLUE MENTIONS & CHANNEL LINKS:
    - Whenever you want to mention a user, refer to a user, or ping someone, write `@username` (e.g. `@dogee` or `@VibeMaster`).
    - Whenever you refer to a server channel, write `#channel-name` (e.g. `#general` or `#test`).
@@ -3590,9 +3643,21 @@ def extract_clean_gemini_text(response: Any) -> Optional[str]:
             if getattr(part, "text", None):
                 text_chunks.append(part.text)
         joined = "".join(text_chunks).strip()
-        return joined if joined else None
+        if not joined:
+            return None
+        joined = re.sub(r"<thought[^>]*>.*?</thought>", "", joined, flags=re.DOTALL | re.IGNORECASE)
+        joined = re.sub(r"<thought[^>]*>.*", "", joined, flags=re.DOTALL | re.IGNORECASE)
+        joined = re.sub(r"<think[^>]*>.*?</think>", "", joined, flags=re.DOTALL | re.IGNORECASE)
+        joined = re.sub(r"<think[^>]*>.*", "", joined, flags=re.DOTALL | re.IGNORECASE)
+        return joined.strip() if joined.strip() else None
     except Exception:
-        return getattr(response, "text", None)
+        raw = getattr(response, "text", None)
+        if raw:
+            raw = re.sub(r"<thought[^>]*>.*?</thought>", "", raw, flags=re.DOTALL | re.IGNORECASE)
+            raw = re.sub(r"<thought[^>]*>.*", "", raw, flags=re.DOTALL | re.IGNORECASE)
+            raw = re.sub(r"<think[^>]*>.*?</think>", "", raw, flags=re.DOTALL | re.IGNORECASE)
+            return raw.strip() if raw.strip() else None
+        return None
 
 
 def build_native_multiturn_contents(
@@ -3832,7 +3897,11 @@ async def call_groq_fallback(system_prompt: str, history_records: List[Dict[str,
                 if resp.status == 200:
                     data = await resp.json()
                     raw = data["choices"][0]["message"]["content"] or ""
-                    return re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+                    raw = re.sub(r"<think[^>]*>.*?</think>", "", raw, flags=re.DOTALL | re.IGNORECASE)
+                    raw = re.sub(r"<think[^>]*>.*", "", raw, flags=re.DOTALL | re.IGNORECASE)
+                    raw = re.sub(r"<thought[^>]*>.*?</thought>", "", raw, flags=re.DOTALL | re.IGNORECASE)
+                    raw = re.sub(r"<thought[^>]*>.*", "", raw, flags=re.DOTALL | re.IGNORECASE)
+                    return raw.strip()
         except Exception as e:
             logger.debug(f"Groq fallback failed on {candidate}: {e}")
     return None

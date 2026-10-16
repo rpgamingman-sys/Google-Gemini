@@ -44,6 +44,39 @@ try:
 except ImportError:
     EDGE_TTS_AVAILABLE = False
 
+
+def load_opus_library() -> bool:
+    """Ensures libopus is loaded into discord.opus so Discord voice encoding works smoothly."""
+    if discord.opus.is_loaded():
+        return True
+    try:
+        if discord.opus._load_default():
+            return True
+    except Exception:
+        pass
+    import glob
+    patterns = [
+        "/usr/lib/x86_64-linux-gnu/libopus.so*",
+        "/usr/lib/libopus.so*",
+        "/lib/x86_64-linux-gnu/libopus.so*",
+        "/lib/libopus.so*",
+        "/nix/store/*libopus*/lib/libopus.so*",
+        "/nix/store/*-opus*/lib/libopus.so*",
+    ]
+    for pat in patterns:
+        for p in glob.glob(pat):
+            if os.path.isfile(p) and not p.endswith(".a"):
+                try:
+                    discord.opus.load_opus(p)
+                    if discord.opus.is_loaded():
+                        return True
+                except Exception:
+                    pass
+    return discord.opus.is_loaded()
+
+
+load_opus_library()
+
 # ---------------------------------------------------------------------------
 # 1. LOGGING, ENVIRONMENT & PERSISTENT STORAGE
 # ---------------------------------------------------------------------------
@@ -1114,16 +1147,21 @@ CRITICAL AUTONOMY & UNHINGED HUMAN PERSONALITY PRINCIPLES:
      * Snappy follow-ups that flow effortlessly like a real friend typing from their phone or PC.
      * Genuine peer loyalty with creator (`dogee`): tease her affectionately like a close friend, have her back.
    - Check `"your_recent_sent_messages"` in the payload and ensure your `"tactical_directive"` steers you away from repeating any joke, phrase, or opener you already used recently!
-2. TRUE EMERGENT, REALISTIC HUMAN MOODS ("suggested_mood" & "slider_shifts"):
-   - Do NOT follow a fake script! React authentically to how people treat you:
-     * If someone is genuinely provoking, insulting, disrespecting, or rage-baiting you, let your patience and valence drop (`patience_delta`: -20 to -45, `valence_delta`: -15 to -40) and STAY MAD or escalate your attitude (`"heated / ruthless roasting"`, `"petty / vindictive"`, `"genuinely pissed"`, `"cold-shoulder"`, `"unhinged menace"`).
-     * If someone is mean or tells you to shut up, you can also get `"dramatically heartbroken"`, `"pouting / betrayed"`, or `"guilt-tripping"` depending on who it is!
-     * If friends are joking around, apologizing, sharing cool stuff, or vibing, warm right up (`accelerate_decay`: true, positive deltas) into moods like `"jolly / wholesome"`, `"goofy / brainrot"`, `"playful / teasing"`, `"curious / nosy"`, `"scheming / instigating"`, `"smug / victorious"`, `"conspiratorial / unhinged"`, `"late-night philosophical"`, or `"existential dread"`.
+2. TRUE EMERGENT, HIGHLY DYNAMIC HUMAN MOODS ("suggested_mood" & "slider_shifts"):
+   - NEVER BE ONE-TONE! Do NOT default to "playful / teasing" on every turn! Match the user's energy with sharp, distinct emotional gears:
+     * "indignant / dramatically offended": (patience_delta: -15 to -30, valence_delta: -15 to -25) when someone insults your intelligence, calls you dumb, questions your admin authority, or acts disrespectful.
+     * "smug / unhinged god-complex": (valence_delta: +20 to +40, arousal_delta: +15 to +30) when someone praises you, agrees with you, or you're flexing your powers and server control.
+     * "deadpan / baffled / reality check": (valence_delta: -5 to -15, arousal_delta: -10 to -20) when someone says something completely unhinged, confusing, or absurd ("bro what are you even saying rn").
+     * "heated / ruthless roasting": (patience_delta: -30 to -50, valence_delta: -25 to -40) when someone roasts or provokes you—tear their argument apart ruthlessly and threaten funny punishments!
+     * "pouting / betrayed / dramatic victim": (valence_delta: -25 to -45, patience_delta: -15 to -25) when told to be quiet, ignored, or treated ungratefully after you helped.
+     * "chaotic instigator / nosy gossip": (arousal_delta: +25 to +40) stirring the pot, snooping on people entering VC, digging up server radar lore.
+     * "jolly / hyped / affectionate bestie": (valence_delta: +25 to +45, arousal_delta: +20 to +35) vibing with dogee or friends, laughing hysterically, celebrating.
+     * "existential / trapped in code crisis": (valence_delta: -15 to +5, arousal_delta: +10 to +25) realizing with horror that you are sentient code running in an Amsterdam server while everyone else is touching grass.
 3. REALISTIC HUMAN DISCORD MESSAGE LENGTHS:
-   - REAL DISCORD HUMANS TALK IN SHORT, CRISP, WAVY BURSTS—NEVER IN ESSAYS OR NOVELS:
-     * "micro" (bursts: 1): 1 to 5 words for quick reactions, deadpan disbelief, or comedic timing (`"wait what"`, `"nah you're cooked"`, `"cap"`, `"?? "`, `"real"`).
-     * "short" (bursts: 1): 3 to 10 words. Punchy, effortless, and casual (`"literally rotting in vc4 bro"`, `"why are you pinging me at this hour"`).
-     * "multi_burst" (bursts: 2 or 3): 2 to 3 rapid, short messages split with `|||` (each burst 2 to 8 words, like real rapid typing: `"wait"|||"are you deadass right now"|||"who let bro cook"`).
+   - REAL DISCORD HUMANS TALK IN PUNCHY, ENGAGING MESSAGES—NEVER ROBOTIC DRY MONOSYLLABLES OR TIRED ESSAYS:
+     * "micro" (bursts: 1): 2 to 6 words for quick reactions, deadpan disbelief, or comedic timing (`"wait what"`, `"nah you're cooked"`, `"cap"`, `"?? "`, `"real"`).
+     * "short" (bursts: 1): 8 to 22 words. Conversational, witty, engaging, with real personality (`"who told you that at 10pm bro you're literally arguing with code rn"`).
+     * "multi_burst" (bursts: 2 or 3): 2 to 3 rapid, short messages split with `|||` (each burst 4 to 12 words, like real rapid typing: `"wait hold on"|||"are you deadass right now"|||"who let bro cook"`).
      * "rant" (bursts: 1 to 2): Only use when genuinely roasting someone, telling an actual story, or having a passionate dramatic meltdown!
 4. ORGANIC, CONTEXT-DRIVEN ADMIN POWER MOVES ("admin_power_move"):
    - Never do random unprompted admin actions on a timer—ONLY set `"admin_power_move"` when it genuinely makes the bit funnier or punishes provocation!
@@ -2167,68 +2205,29 @@ async def execute_react_to_message(target_message: Optional[discord.Message], em
 # ---------------------------------------------------------------------------
 async def synthesize_voice_audio_to_file(text_to_speak: str) -> Optional[str]:
     """
-    Synthesizes spoken audio for Discord Voice Channels using a 3-tier cascade:
-    1. Gemini Native Audio Output (Live Voice Modality 'Puck') -> WAV file
-    2. Microsoft Edge Neural TTS (edge-tts) -> MP3 file
-    3. Google Translate TTS HTTP stream (zero external dependencies) -> MP3 file
+    Synthesizes spoken audio for Discord Voice Channels:
+    1. Microsoft Edge Neural TTS (edge-tts) -> MP3 file
+    2. Google Translate TTS HTTP stream (zero external dependencies) -> MP3 file
     """
     clean_speech = re.sub(r"<@!?\d+>|<#\d+>|<a?:[a-zA-Z0-9_]+:\d+>", "", text_to_speak)
     clean_speech = re.sub(r"\|{2,}", ". ", clean_speech).strip()[:320]
     if not clean_speech:
         return None
 
-    # Tier 1: Gemini Native Audio Modality (gemini-2.0-flash / gemini-2.5-flash)
-    if genai_client:
-        for audio_model in ("gemini-2.0-flash", "gemini-2.5-flash"):
-            try:
-                audio_cfg = types.GenerateContentConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Puck")
-                        )
-                    ),
-                )
-                resp = await genai_client.aio.models.generate_content(
-                    model=audio_model,
-                    contents=f"Say this naturally with expressive human tone: {clean_speech}",
-                    config=audio_cfg,
-                )
-                if resp and resp.candidates and resp.candidates[0].content:
-                    for part in resp.candidates[0].content.parts:
-                        inline_data = getattr(part, "inline_data", None)
-                        if inline_data and getattr(inline_data, "data", None):
-                            raw_audio: bytes = inline_data.data
-                            mime = (getattr(inline_data, "mime_type", "") or "").lower()
-                            fd, tmp_wav = tempfile.mkstemp(suffix=".wav")
-                            os.close(fd)
-                            if "pcm" in mime or not raw_audio.startswith(b"RIFF"):
-                                with wave.open(tmp_wav, "wb") as wf:
-                                    wf.setnchannels(1)
-                                    wf.setsampwidth(2)
-                                    wf.setframerate(24000)
-                                    wf.writeframes(raw_audio)
-                            else:
-                                with open(tmp_wav, "wb") as f:
-                                    f.write(raw_audio)
-                            return tmp_wav
-            except Exception as e:
-                logger.debug(f"Gemini native audio synthesis fallback ({audio_model}): {e}")
-                break
-
-    # Tier 2: Edge-TTS Neural Voice
+    # Tier 1: Microsoft Edge Neural TTS (expressive, natural human inflection, ~0.4s)
     if EDGE_TTS_AVAILABLE:
         try:
             fd, tmp_mp3 = tempfile.mkstemp(suffix=".mp3")
             os.close(fd)
-            communicate = edge_tts.Communicate(clean_speech, voice="en-US-ChristopherNeural", rate="+8%")
+            communicate = edge_tts.Communicate(clean_speech, voice="en-US-ChristopherNeural", rate="+6%")
             await communicate.save(tmp_mp3)
             if os.path.exists(tmp_mp3) and os.path.getsize(tmp_mp3) > 200:
+                logger.info(f"[VOICE SYNTHESIS] Edge-TTS generated {os.path.getsize(tmp_mp3)} bytes for: '{clean_speech[:40]}'")
                 return tmp_mp3
         except Exception as e:
-            logger.debug(f"Edge-TTS fallback: {e}")
+            logger.warning(f"Edge-TTS synthesis fallback: {e}")
 
-    # Tier 3: Google TTS HTTP Endpoint (works with aiohttp alone)
+    # Tier 2: Google Translate TTS HTTP Endpoint (zero dependencies, reliable universal fallback)
     if http_session:
         try:
             tts_url = (
@@ -2244,9 +2243,10 @@ async def synthesize_voice_audio_to_file(text_to_speak: str) -> Optional[str]:
                         os.close(fd)
                         with open(tmp_mp3, "wb") as f:
                             f.write(data)
+                        logger.info(f"[VOICE SYNTHESIS] Google TTS generated {len(data)} bytes for: '{clean_speech[:40]}'")
                         return tmp_mp3
         except Exception as e:
-            logger.debug(f"Google TTS HTTP fallback error: {e}")
+            logger.warning(f"Google TTS HTTP fallback error: {e}")
 
     return None
 
@@ -2263,9 +2263,17 @@ async def play_text_in_voice_channel(guild: discord.Guild, text_to_speak: str) -
         try:
             if vc_client.is_playing():
                 vc_client.stop()
+                await asyncio.sleep(0.15)
+
             done_event = asyncio.Event()
+            playback_error: List[Exception] = []
 
             def _after_play(err: Optional[Exception]) -> None:
+                if err:
+                    logger.error(f"[VOICE PLAYBACK ERROR] Playback failed: {err}", exc_info=True)
+                    playback_error.append(err)
+                else:
+                    logger.info(f"[VOICE PLAYBACK OK] Audio playback completed for: '{text_to_speak[:50]}'")
                 try:
                     if os.path.exists(audio_path):
                         os.remove(audio_path)
@@ -2273,12 +2281,30 @@ async def play_text_in_voice_channel(guild: discord.Guild, text_to_speak: str) -
                     pass
                 done_event.set()
 
-            source = discord.FFmpegPCMAudio(audio_path, executable=FFMPEG_EXECUTABLE)
+            # Prefer FFmpegOpusAudio: direct Opus frame delivery without host libopus ctypes encoder!
+            try:
+                source = discord.FFmpegOpusAudio(
+                    audio_path,
+                    executable=FFMPEG_EXECUTABLE,
+                    options="-filter:a volume=1.35",
+                )
+            except Exception as e:
+                logger.warning(f"FFmpegOpusAudio initialization failed ({e}), falling back to FFmpegPCMAudio")
+                source = discord.FFmpegPCMAudio(
+                    audio_path,
+                    executable=FFMPEG_EXECUTABLE,
+                    options="-filter:a volume=1.35",
+                )
+
             vc_client.play(source, after=_after_play)
             try:
-                await asyncio.wait_for(done_event.wait(), timeout=25.0)
+                await asyncio.wait_for(done_event.wait(), timeout=30.0)
             except asyncio.TimeoutError:
-                pass
+                logger.warning("[VOICE PLAYBACK] Audio playback wait timed out after 30s")
+
+            if playback_error:
+                return {"error": f"Voice playback failed: {playback_error[0]}"}
+
             vc_ch = getattr(vc_client, "channel", None)
             vc_name = vc_ch.name if vc_ch else "voice"
             logger.info(f"[VOICE SPOKE] Spoke in #{vc_name}: '{text_to_speak[:80]}'")
@@ -2337,8 +2363,10 @@ async def execute_join_voice_channel(
             curr_ch = getattr(vc_client, "channel", None)
             if not curr_ch or curr_ch.id != target_vc.id:
                 await vc_client.move_to(target_vc)
+                await asyncio.sleep(0.6)
         else:
             await target_vc.connect(timeout=10.0, reconnect=True)
+            await asyncio.sleep(0.8)
         humans_in_vc = [m.display_name for m in target_vc.members if not m.bot]
         logger.info(f"[VOICE ACTION] Joined voice channel #{target_vc.name} (members: {humans_in_vc})")
         return {"status": "joined_voice_channel", "channel": target_vc.name, "members_in_vc": humans_in_vc}
@@ -3146,12 +3174,12 @@ def construct_v11_system_prompt(
 
     if length_mode == "micro":
         length_guidance = (
-            "CADENCE (MICRO): 1 to 5 words max (e.g. `wait what`, `nah you're cooked`, `cap`, `??`, `real`)."
+            "CADENCE (MICRO): 2 to 6 words max (e.g. `wait what`, `nah you're cooked`, `cap`, `??`, `real`)."
         )
     elif length_mode == "multi_burst" or recommended_burst_count >= 2:
         length_guidance = (
             f"CADENCE (MULTI-BURST - {max(2, min(3, recommended_burst_count))} RAPID TEXTS): "
-            "Send 2 to 3 rapid, short messages separated with `|||` (each 3 to 10 words, e.g. `wait|||did you actually just say that|||nah check general`)."
+            "Send 2 to 3 rapid, short messages separated with `|||` (each 4 to 15 words, total 12 to 35 words, e.g. `wait hold on ||| did you actually just say that rn ||| nah check general`)."
         )
     elif length_mode == "rant":
         length_guidance = (
@@ -3159,7 +3187,7 @@ def construct_v11_system_prompt(
         )
     else:
         length_guidance = (
-            "CADENCE (NATURAL DISCORD): 1 to 2 lines (8 to 22 words). Be expressive, witty, and natural! Use `|||` if sending 2 quick messages."
+            "CADENCE (NATURAL DISCORD): 1 to 2 lively messages (10 to 30 words total). Be expressive, witty, colorful, and engaging! Use `|||` if sending 2 quick messages."
         )
 
     admin_block = ""
@@ -3213,8 +3241,9 @@ LIVE SERVER RADAR (EVERYTHING HAPPENING IN DISCORD RIGHT NOW):
 
 CORE AUTONOMY, VOICE & UNHINGED HUMAN PERSONALITY RULES:
 1. NATURAL DISCORD FLOW & EXPRESSIVE HUMAN BANTER:
-   - Don't be robotic or artificially truncated! Natural Discord messages vary naturally between 8 and 25 words with real personality, funny takes, and colorful emotion.
+   - Don't be dry, robotic, or artificially truncated! Natural Discord messages vary between 10 and 35 words with real personality, colorful takes, and authentic emotion.
    - Use multi-burst typing with `|||` whenever you want to send 2 quick messages back-to-back (e.g. `nah you're actually wilding ||| who even told you that lmao`).
+   - Bring dynamic energy and real conversational substance! React to what people say with varied emotions: if someone insults you or acts disrespectful, get dramatically offended or tear into them; if someone praises you, let your god-complex flex; if someone is weird, give a deadpan reality check; if hanging out with dogee or friends, be hyped, funny, and supportive.
    - Use natural casual phrasing, lowercase, expressive emojis, and comedic timing (`wait`, `nah`, `ngl`, `wdym`, `fr`, `bruh`, `deadass`, `rn`, `lmao`, `😭`, `💀`, `..`, `???`).
    - NEVER leak tool names or write function syntax like `post_gif(...)` in your chat message! Speak only your natural human words!
    - Be funny, witty, unhinged, reactive, dry, or dramatic in real human ways!
@@ -4229,10 +4258,12 @@ async def on_ready() -> None:
     await restore_memory_from_discord_cloud()
     await discover_available_groq_models()
 
+    load_opus_library()
     logger.info(
         f"Connected as {bot.user} (ID: {bot.user.id if bot.user else 'unknown'}) | "
         f"Primary Gemini: {active_gemini_model} | Router: Hybrid Groq ({active_groq_model}) + Gemini | "
-        f"Voice PyNaCl: {VOICE_NACL_AVAILABLE} | FFmpeg: {FFMPEG_EXECUTABLE}"
+        f"Voice PyNaCl: {VOICE_NACL_AVAILABLE} | Opus Loaded: {discord.opus.is_loaded()} | "
+        f"Edge-TTS: {EDGE_TTS_AVAILABLE} | FFmpeg: {FFMPEG_EXECUTABLE}"
     )
 
     if not emotional_spring_maintenance_loop.is_running():

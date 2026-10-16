@@ -1277,10 +1277,15 @@ CRITICAL AUTONOMY & UNHINGED HUMAN PERSONALITY PRINCIPLES:
        - If you are sulking, bitter, or pouting, you can choose to leave them on read ("should_speak": false, "reaction_emoji": "😒" or "🙄").
    - If User A explicitly replies to User B or @mentions User B (without mentioning you or commanding you) -> set "should_speak": false.
 7. VISUAL COMEDY & GIF REACTIONS ("suggest_gif"):
-   - Set `"suggest_gif": true` whenever:
-     * Someone explicitly asks for a GIF, meme, or image (`"send a gif"`, `"post a gif"`, `"drop a meme"`, `"gif of x"`, `"give me a reaction"`).
+   - Set "suggest_gif": true whenever:
+     * Someone explicitly asks for a GIF, meme, or image ("send a gif", "post a gif", "drop a meme", "gif of x", "give me a reaction").
      * A reaction GIF delivers peak comedic value (laughing hysterically, jaw drop, disbelief, facepalm, dramatic stare, dance, confusion, face-melting).
-     * If `gif_cooldown_ready` is true and a visual punchline elevates the chat!
+     * If gif_cooldown_ready is true and a visual punchline elevates the chat!
+8. AUTONOMOUS PROACTIVE REVIVAL & ROOM SCANNER ("is_proactive_scan"):
+   - When "is_proactive_scan" is true: The scanner detected the channel has been quiet or someone vanished mid-conversation.
+   - Evaluate "live_server_radar", inactivity duration, and the last speaker:
+     * If someone is online, playing games, in VC, or vanished mid-conversation -> decide realistically if it's worth poking them, roasting them, asking where everyone went, or commenting on what they are doing. Set "should_speak": true if you have something funny, unhinged, or relevant to say!
+     * If the server is quiet and there is nothing noteworthy to say -> you can set "should_speak": false (to stay quiet and observe) or "should_speak": true (to drop an existential late-night thought). You have full autonomy to decide whether speaking is warranted!
 """
 
 
@@ -1447,7 +1452,12 @@ async def call_hybrid_router(
             if not decision.get("reaction_emoji"):
                 decision["reaction_emoji"] = random.choice(["👀", "🤐", "😒", "💀", "🤨", "💔"])
         elif is_proactive_scan:
-            decision["should_speak"] = True
+            # Respect router's organic choice: it evaluates server radar and silence duration to decide
+            # whether speaking is warranted or if it should stay silent!
+            if decision.get("should_speak") is None:
+                decision["should_speak"] = True
+            decision["delivery_mode"] = "send"
+            decision["allow_speaker_ping"] = True
         elif active_bot_conversation and not is_stepped_back:
             # Respect router's organic choice: it often speaks (banter/roasts/opinions),
             # but can naturally choose NOT to reply (e.g. to a simple 'lol', 'fr', dead end, or drop a silent emoji reaction instead)!
@@ -2329,58 +2339,70 @@ async def execute_react_to_message(target_message: Optional[discord.Message], em
 # ---------------------------------------------------------------------------
 # 8. VOICE CHANNEL & GEMINI LIVE AUDIO / TTS SPEAKING ENGINE
 # ---------------------------------------------------------------------------
-async def synthesize_gemini_live_audio(clean_speech: str) -> Optional[str]:
+async def synthesize_gemini_voice_audio(clean_speech: str) -> Optional[str]:
     """
-    Synthesizes ultra-realistic human audio via Gemini Multimodal Live API.
-    Uses 'Puck' voice for high-energy witty discord delivery.
+    Synthesizes ultra-realistic human audio via Google Gemini native TTS models.
+    Hierarchy:
+      1. gemini-3.8-flash-tts ('Puck' voice - high-energy witty discord delivery)
+      2. gemini-3.8-flash-lite-tts (fast audio synthesis fallback)
+      3. gemini-3.1-flash-tts-preview (raw PCM audio fallback)
     """
     if not genai_client:
         return None
-    for live_model in ("gemini-2.0-flash-exp", "gemini-2.0-flash-realtime-exp"):
+
+    models_to_try = [
+        "gemini-3.8-flash-tts",
+        "gemini-3.8-flash-lite-tts",
+        "gemini-3.1-flash-tts-preview",
+    ]
+
+    for model_name in models_to_try:
         try:
-            live_config = {
-                "response_modalities": ["AUDIO"],
-                "speech_config": {
-                    "voice_config": {
-                        "prebuilt_voice_config": {
-                            "voice_name": "Puck"
-                        }
-                    }
-                }
-            }
-            async with asyncio.timeout(6.0):
-                async with genai_client.aio.live.connect(model=live_model, config=live_config) as session:
-                    await session.send(input=f"Say this out loud naturally with expressive witty human discord tone: {clean_speech}", end_of_turn=True)
-                    audio_chunks = []
-                    async for response in session.receive():
-                        server_content = getattr(response, "server_content", None)
-                        if server_content and getattr(server_content, "model_turn", None):
-                            for part in server_content.model_turn.parts:
-                                inline_data = getattr(part, "inline_data", None)
-                                if inline_data and getattr(inline_data, "data", None):
-                                    audio_chunks.append(inline_data.data)
-                        if server_content and getattr(server_content, "turn_complete", False):
-                            break
-                    if audio_chunks:
-                        raw_pcm = b"".join(audio_chunks)
-                        fd, tmp_wav = tempfile.mkstemp(suffix=".wav")
-                        os.close(fd)
+            resp = await genai_client.aio.models.generate_content(
+                model=model_name,
+                contents=clean_speech,
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name="Puck"
+                            )
+                        )
+                    ),
+                ),
+            )
+            candidates = resp.candidates or []
+            if not candidates or not candidates[0].content:
+                continue
+            for part in candidates[0].content.parts:
+                inline_data = getattr(part, "inline_data", None)
+                if inline_data and inline_data.data:
+                    data = inline_data.data
+                    mime = getattr(inline_data, "mime_type", "")
+                    fd, tmp_wav = tempfile.mkstemp(suffix=".wav")
+                    os.close(fd)
+                    if "wav" in mime:
+                        with open(tmp_wav, "wb") as f:
+                            f.write(data)
+                    else:
                         with wave.open(tmp_wav, "wb") as wf:
                             wf.setnchannels(1)
                             wf.setsampwidth(2)
                             wf.setframerate(24000)
-                            wf.writeframes(raw_pcm)
-                        logger.info(f"[VOICE SYNTHESIS] Gemini Live generated {len(raw_pcm)} bytes PCM via {live_model}")
-                        return tmp_wav
+                            wf.writeframes(data)
+                    logger.info(f"[VOICE SYNTHESIS] Gemini Audio generated {os.path.getsize(tmp_wav)} bytes WAV via {model_name} for '{clean_speech[:40]}'")
+                    return tmp_wav
         except Exception as e:
-            logger.debug(f"Gemini live audio error ({live_model}): {e}")
+            logger.debug(f"Gemini audio model {model_name} failed: {e}")
+
     return None
 
 
 async def synthesize_voice_audio_to_file(text_to_speak: str) -> Optional[str]:
     """
     Synthesizes spoken audio for Discord Voice Channels:
-    1. Gemini Multimodal Live API ('Puck' / 'Charon') -> WAV file
+    1. Gemini Native Studio Audio ('Puck' voice) -> WAV file
     2. Microsoft Edge Conversational Neural TTS (Brian / Andrew Multilingual) -> MP3 file
     3. Google Translate TTS HTTP stream (zero external dependencies) -> MP3 file
     """
@@ -2389,10 +2411,10 @@ async def synthesize_voice_audio_to_file(text_to_speak: str) -> Optional[str]:
     if not clean_speech:
         return None
 
-    # Tier 1: Gemini Live Realtime Audio
-    gem_live = await synthesize_gemini_live_audio(clean_speech)
-    if gem_live:
-        return gem_live
+    # Tier 1: Gemini Native Studio Audio
+    gem_audio = await synthesize_gemini_voice_audio(clean_speech)
+    if gem_audio:
+        return gem_audio
 
     # Tier 2: Microsoft Edge Conversational Multilingual Neural Voices (Brian & Andrew)
     if EDGE_TTS_AVAILABLE:
@@ -4526,11 +4548,6 @@ async def on_ready() -> None:
         f"Edge-TTS: {EDGE_TTS_AVAILABLE} | FFmpeg: {FFMPEG_EXECUTABLE}"
     )
 
-    try:
-        if bot.user and bot.user.avatar is None:
-            asyncio.create_task(execute_change_my_avatar("cool sleek glowing cyberpunk anime robot with purple shades profile icon"))
-    except Exception as e:
-        logger.debug(f"Initial avatar setup skipped: {e}")
 
     if not emotional_spring_maintenance_loop.is_running():
         emotional_spring_maintenance_loop.start()

@@ -553,14 +553,14 @@ def format_outgoing_mentions(
     # 1. Strip @CurrentSpeaker prefix/mentions unless allow_speaker_ping is True
     if current_speaker_name and not allow_speaker_ping and "@" in text:
         escaped_spk = re.escape(current_speaker_name)
-        text = re.sub(
-            rf"^\s*@{escaped_spk}(?=$|\s|[.,!?:;'"\)\]])[:,]?\s*",
+                text = re.sub(
+            rf"""^\s*@{escaped_spk}(?=\$|\s|[.,!?:;'"\)])[:,]?\s*""",
             "",
             text,
             flags=re.IGNORECASE,
         )
         text = re.sub(
-            rf"(?<!<)@{escaped_spk}(?=$|\s|[.,!?:;'"\)\]])",
+            rf"""(?<!<)@{escaped_spk}(?=\$|\s|[.,!?:;'"\)])""",
             current_speaker_name,
             text,
             flags=re.IGNORECASE,

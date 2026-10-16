@@ -1923,6 +1923,9 @@ async def execute_timeout_user(guild: discord.Guild, username: str, duration_min
         return {"error": f"Member '{username}' not found."}
     if is_creator(member) or member == guild.owner or member.guild_permissions.administrator:
         return {"error": "Cannot timeout the creator or server administrators."}
+    if member.id == TESTER_BOT_USER_ID:
+        logger.info(f"[ADMIN ACTION] Simulated timeout on TesterBot for {duration_minutes}m (reason: {reason})")
+        return {"status": "success", "user": member.display_name, "minutes": duration_minutes, "simulated": True}
     if guild.me.top_role <= member.top_role:
         return {"error": f"Role hierarchy blocks timing out {member.display_name}."}
     mins = max(1, min(10, int(duration_minutes)))
@@ -1948,6 +1951,9 @@ async def execute_kick_user(guild: discord.Guild, username: str, reason: str, ta
         return {"error": f"Member '{username}' not found."}
     if is_creator(member) or member == guild.owner or member.guild_permissions.administrator:
         return {"error": "Cannot kick the creator, server owner, or administrators."}
+    if member.id == TESTER_BOT_USER_ID:
+        logger.info(f"[ADMIN ACTION] Simulated kick on TesterBot (reason: {reason})")
+        return {"status": "success", "user": member.display_name, "simulated": True}
     if guild.me.top_role <= member.top_role:
         return {"error": f"Role hierarchy blocks kicking {member.display_name}."}
 
@@ -3481,6 +3487,9 @@ async def generate_gemini_response(
         return None, False, False
 
     guild = trigger_message.guild if trigger_message else getattr(channel, "guild", None)
+    turn_media_state: Dict[str, bool] = {"sent": False}
+    collected_texts: List[str] = []
+    executed_any_tool: bool = False
 
     for model_name in list(GEMINI_MODEL_CANDIDATES):
         contents = build_native_multiturn_contents(
@@ -3492,9 +3501,7 @@ async def generate_gemini_response(
         )
         try:
             turn = 0
-            executed_any_tool = False
-            turn_media_state: Dict[str, bool] = {"sent": False}
-            collected_texts: List[str] = []
+
 
             while turn < 4:
                 # Once 1 GIF/media has been sent in this turn, remove post_gif from the toolset for subsequent loop steps!
@@ -3812,6 +3819,9 @@ async def run_channel_response_pipeline(
         executed_tools_this_turn = list(channel_last_tool_summaries[ch_id])
         bot_name = bot.user.display_name if bot.user else "Dumb bot"
         bot_id = bot.user.id if bot.user else 0
+
+        if not raw_output:
+            raw_output = await call_groq_fallback(system_instruction, history_records, raw_without_mentions, speaker_name)
 
         if not raw_output:
             if media_sent or executed_tools_this_turn:

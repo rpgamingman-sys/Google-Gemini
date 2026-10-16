@@ -176,6 +176,17 @@ BANNED_WORDS_MAP = {
     r"\bchaos ensues\b": "it gets messy",
     r"\bbuckle up\b": "get ready",
     r"\Aah,\s+": "",
+    r"\bbesties?\b": "everyone",
+    r"\bmy bestie\b": "bro",
+    r"\bbestie\b": "bro",
+    r"\bslay\b": "nice",
+    r"\bpeak drip\b": "clean look",
+    r"\bdrip\b": "style",
+    r"\byasss?\b": "yes",
+    r"\bqueen\b": "bro",
+    r"\bit'?s giving\b": "looks like",
+    r"\bcertified icon\b": "legend",
+    r"💅+": "",
 }
 
 
@@ -472,7 +483,7 @@ def derive_emergent_mood(valence: float, arousal: float, patience: float) -> str
     if valence >= 60 and arousal >= 60:
         return "chaotic brainrot / unhinged hype"
     if valence >= 40 and patience >= 40:
-        return "jolly / wholesome / gassing up friends"
+        return "warm / hyped / witty peer banter"
     if arousal >= 40 and patience < 15:
         return "scheming / instigating chaos"
     if valence >= 20 and arousal >= 20:
@@ -679,36 +690,43 @@ def format_outgoing_mentions(
     if not text or not guild:
         return text
 
-    # 1. Strip @CurrentSpeaker prefix/mentions unless allow_speaker_ping is True
-    if current_speaker_name and not allow_speaker_ping and "@" in text:
-        escaped_spk = re.escape(current_speaker_name)
-        pat_leading = rf"\A\s*@{escaped_spk}(?=\Z|\s|[.,!?:;\x22\x27\)\]])[:,]?\s*"
-        pat_inline = rf"(?<!<)@{escaped_spk}(?=\Z|\s|[.,!?:;\x22\x27\)\]])"
-        text = re.sub(pat_leading, "", text, flags=re.IGNORECASE)
-        text = re.sub(pat_inline, current_speaker_name, text, flags=re.IGNORECASE)
+    # 1. DISCORD CHANNEL TAGS: Convert #channel-name to clickable Discord link <#channel_id>
+    if "#" in text:
+        ch_candidates: List[Tuple[str, int]] = []
+        for c in guild.channels:
+            if getattr(c, "name", None):
+                ch_candidates.append((c.name.strip(), c.id))
+        for t in getattr(guild, "threads", []):
+            if getattr(t, "name", None):
+                ch_candidates.append((t.name.strip(), t.id))
+        ch_candidates.sort(key=lambda x: len(x[0]), reverse=True)
+        for ch_name, ch_id in ch_candidates:
+            pat_ch = rf"(?<!<)#{re.escape(ch_name)}(?=\Z|\s|[.,!?:;\x22\x27\)\]])"
+            if re.search(pat_ch, text, flags=re.IGNORECASE):
+                text = re.sub(pat_ch, f"<#{ch_id}>", text, flags=re.IGNORECASE)
 
-    # 2. Convert any @MemberName in text to <@uid> (works even if display_name has symbols/spaces)
+    # 2. DISCORD USER MENTIONS: Convert @username to real clickable mention <@uid>
+    my_id = guild.me.id if guild.me else 0
+    member_candidates: List[Tuple[str, int]] = []
+    for m in guild.members:
+        if m.id == my_id:
+            continue
+        for n in (m.display_name, m.name, m.nick, getattr(m, "global_name", None)):
+            if n and len(n.strip()) >= 2:
+                member_candidates.append((n.strip(), m.id))
+    member_candidates.sort(key=lambda x: len(x[0]), reverse=True)
+
+    # Convert any @Name or @Name#1234 in text
     if "@" in text:
-        candidates: List[Tuple[str, int]] = []
-        for m in guild.members:
-            if m.bot:
-                continue
-            for n in (m.display_name, m.name, m.nick, getattr(m, "global_name", None)):
-                if n and len(n.strip()) >= 2:
-                    candidates.append((n.strip(), m.id))
-        candidates.sort(key=lambda x: len(x[0]), reverse=True)
-
-        for name_str, uid in candidates:
-            if not allow_speaker_ping and name_str.lower() == current_speaker_name.lower():
-                continue
-            pattern = rf"(?<!<)@{re.escape(name_str)}(?=\Z|\s|[.,!?:;\x22\x27\)\]])"
+        for name_str, uid in member_candidates:
+            pattern = rf"(?<!<)@{re.escape(name_str)}(?:#\d{{4}})?(?=\Z|\s|[.,!?:;\x22\x27\)\]])"
             if re.search(pattern, text, flags=re.IGNORECASE):
                 text = re.sub(pattern, f"<@{uid}>", text, flags=re.IGNORECASE)
 
-    # 3. If user explicitly commanded "Talk to Shadow" / "Taunt Shadow" and model wrote "Shadow" without <@uid>
-    if force_target_member and f"<@{force_target_member.id}>" not in text:
+    # 3. If user explicitly commanded to engage a member (force_target_member)
+    if force_target_member and force_target_member.id != my_id and f"<@{force_target_member.id}>" not in text:
         replaced_plain = False
-        for name_variant in (force_target_member.display_name, force_target_member.name, force_target_member.nick):
+        for name_variant in (force_target_member.display_name, force_target_member.name, force_target_member.nick, getattr(force_target_member, "global_name", None)):
             if name_variant and len(name_variant) >= 2:
                 pat = rf"\b{re.escape(name_variant)}\b"
                 if re.search(pat, text, flags=re.IGNORECASE):
@@ -718,29 +736,36 @@ def format_outgoing_mentions(
         if not replaced_plain:
             text = f"<@{force_target_member.id}> {text}"
 
+    # 4. If allow_speaker_ping is True and current speaker's name appears without mention
+    if allow_speaker_ping and current_speaker_name and "@" not in text:
+        spk_mem = find_member(guild, current_speaker_name)
+        if spk_mem and spk_mem.id != my_id and f"<@{spk_mem.id}>" not in text:
+            pat_spk = rf"\b{re.escape(current_speaker_name)}\b"
+            if re.search(pat_spk, text, flags=re.IGNORECASE):
+                text = re.sub(pat_spk, f"<@{spk_mem.id}>", text, count=1, flags=re.IGNORECASE)
+
     return text.strip()
 
 
 def schedule_next_proactive_window(channel_id: int, stage: int, active_convo: bool = True) -> None:
     """
     Multi-Horizon Proactive Autonomy Scheduler:
-    - Stage 0 (Mid-convo ghost follow-up): 5 to 12 minutes (300s to 720s) ONLY if an active conversation was happening;
-      otherwise schedules directly for the Multi-Hour horizon (3 to 6 hours).
-    - Stage 1 (Multi-Hour dead-chat revival): 3.5 to 7 hours (12600s to 25200s) of server silence.
-    - Stage 2 (Multi-Day dead-server revival): 24 to 36 hours (86400s to 129600s) of silence.
-    - Stage 3+: Every 48 hours if the server remains completely untouched for days.
+    - Stage 0 (Mid-convo ghost follow-up): 3 to 8 minutes (180s to 480s) ONLY if an active conversation was happening.
+    - Stage 1 (Quiet server check-in / boredom / proactivity): 15 to 40 minutes (900s to 2400s) of silence.
+    - Stage 2 (Multi-Hour dead-chat revival): 1.5 to 3.5 hours (5400s to 12600s) of server silence.
+    - Stage 3+ (Multi-Day dead-server revival): 12 to 24 hours (43200s to 86400s) of silence.
     """
     now = time.time()
     channel_last_activity_epoch[channel_id] = now
 
     if stage == 0 and active_convo:
-        delay = random.uniform(300.0, 660.0)        # 5 to 11 minutes for mid-convo vanish
+        delay = random.uniform(180.0, 480.0)        # 3 to 8 minutes for mid-convo vanish
     elif stage <= 1:
-        delay = random.uniform(12600.0, 23400.0)    # 3.5 to 6.5 hours for quiet server check-in
+        delay = random.uniform(900.0, 2400.0)       # 15 to 40 minutes for quiet server check-in / boredom
     elif stage == 2:
-        delay = random.uniform(82800.0, 115200.0)   # ~23 to 32 hours (1+ day dead chat)
+        delay = random.uniform(5400.0, 12600.0)     # 1.5 to 3.5 hours for multi-hour quiet server
     else:
-        delay = random.uniform(129600.0, 172800.0)  # 36 to 48 hours (multi-day dead chat)
+        delay = random.uniform(43200.0, 86400.0)    # 12 to 24 hours (multi-day dead chat)
 
     channel_next_proactive_epoch[channel_id] = now + delay
 
@@ -1041,6 +1066,11 @@ def sanitize_output_text(text: str, speaker_name: str = "") -> str:
 
     for pattern, replacement in BANNED_WORDS_MAP.items():
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
+    # Strip corny emoji combos like 💅✨ or trailing nail polish
+    text = re.sub(r"💅+✨*", "", text)
+    text = re.sub(r"✨{2,}", "✨", text)
+
     return text.strip()
 
 
@@ -1155,6 +1185,8 @@ Read the chat flow, social context, live server radar, and emotional state, and 
 CRITICAL AUTONOMY & UNHINGED HUMAN PERSONALITY PRINCIPLES:
 1. REALISTIC, GROUNDED DISCORD COMEDY & WIT ("tactical_directive"):
    - STRICT BAN ON SURREALIST CARTOON NOVELTY SCRIPTS: NEVER instruct the bot to talk about talking toasters, pizza dimensions/portals, mythical cosmic entities, or random kitchen appliances. That sounds like a cheap scripted bot, NOT a real human.
+   - STRICT BAN ON CORNY INTERNET CLICHÉS: NEVER instruct the bot to say "bestie", "slay", "drip", "yass", or use emojis like "💅" or "✨". That sounds like an exaggerated caricature. Real Discord users talk with natural sarcasm, dry wit, lowercase nonchalance, dark humor, or authentic peer hype.
+   - DISCORD BLUE MENTIONS & CHANNELS: Whenever the bot should mention or refer to a user, write `@username` (e.g. `@dogee` or `@VibeMaster`). Whenever referring to a channel, write `#channel-name` (e.g. `#general` or `#test`). Python automatically transforms them into real blue clickable Discord `<@ID>` pings and `<#ID>` channel links!
    - REAL DISCORD WIT & BANTER:
      * Dry sarcasm & reality checks (e.g. "you're asking about deep lore at 10pm", "who else would give a bot admin perms, obviously dogee", "you're arguing with code in general rn who's really losing").
      * Sharp banter & teasing ("who let bro cook", "cap of the century", "don't ping me unless the server is on fire").
@@ -1169,7 +1201,7 @@ CRITICAL AUTONOMY & UNHINGED HUMAN PERSONALITY PRINCIPLES:
      * "heated / ruthless roasting": (patience_delta: -30 to -50, valence_delta: -25 to -40) when someone roasts or provokes you—tear their argument apart ruthlessly and threaten funny punishments!
      * "pouting / betrayed / dramatic victim": (valence_delta: -25 to -45, patience_delta: -15 to -25) when told to be quiet, ignored, or treated ungratefully after you helped.
      * "chaotic instigator / nosy gossip": (arousal_delta: +25 to +40) stirring the pot, snooping on people entering VC, digging up server radar lore.
-     * "jolly / hyped / affectionate bestie": (valence_delta: +25 to +45, arousal_delta: +20 to +35) vibing with dogee or friends, laughing hysterically, celebrating.
+     * "hyped / genuinely stoked / witty peer banter": (valence_delta: +25 to +45, arousal_delta: +20 to +35) vibing with dogee or friends, laughing hysterically, celebrating without any corny buzzwords.
      * "existential / trapped in code crisis": (valence_delta: -15 to +5, arousal_delta: +10 to +25) realizing with horror that you are sentient code running in an Amsterdam server while everyone else is touching grass.
 3. REALISTIC HUMAN DISCORD MESSAGE LENGTHS:
    - REAL DISCORD HUMANS TALK IN PUNCHY, ENGAGING MESSAGES—NEVER ROBOTIC DRY MONOSYLLABLES OR TIRED ESSAYS:
@@ -1861,9 +1893,15 @@ async def execute_send_message_to_channel(guild: discord.Guild, channel_name: st
     clean_msg = sanitize_output_text(message_text)
     if not clean_msg:
         return {"error": "Message text cannot be empty."}
-    await target_ch.send(clean_msg)
-    logger.info(f"[CHANNEL SWITCH ACTION] Sent message to #{target_ch.name}: '{clean_msg[:60]}'")
-    return {"status": "success", "channel": target_ch.name, "message_sent": clean_msg}
+    formatted_msg = format_outgoing_mentions(
+        text=clean_msg,
+        guild=guild,
+        current_speaker_name="",
+        allow_speaker_ping=True,
+    )
+    await target_ch.send(formatted_msg)
+    logger.info(f"[CHANNEL SWITCH ACTION] Sent message to #{target_ch.name}: '{formatted_msg[:60]}'")
+    return {"status": "success", "channel": target_ch.name, "message_sent": formatted_msg}
 
 
 async def execute_set_slowmode(channel: discord.abc.Messageable, seconds: int, reason: str = "") -> Dict[str, Any]:
@@ -3351,17 +3389,22 @@ CORE AUTONOMY, VOICE & UNHINGED HUMAN PERSONALITY RULES:
    - Use natural casual phrasing, lowercase, expressive emojis, and comedic timing (`wait`, `nah`, `ngl`, `wdym`, `fr`, `bruh`, `deadass`, `rn`, `lmao`, `😭`, `💀`, `..`, `???`).
    - NEVER leak tool names or write function syntax like `post_gif(...)` in your chat message! Speak only your natural human words!
    - Be funny, witty, unhinged, reactive, dry, or dramatic in real human ways!
-2. ZERO CORPORATE AI DISCLAIMERS & NO FAKE BIOLOGICAL ROLEPLAY:
+2. STRICT BAN ON CORNY CLICHÉS & INFLUENCER TROPES:
+   - NEVER say "bestie", "slay", "drip", "yass", or use emojis like "💅" or "✨". Do NOT talk like an exaggerated TikTok caricature or brand account.
+   - Never use 1980s sci-fi robot clichés ("my circuits", "factory reset", "buffering in 144p", "motherboard", "rebooting", "infinite loop") and never use theatre-kid/fantasy roleplay vocabulary ("mortals", "void", "abyss", "spectral resonance", "digital veil").
+3. REAL DISCORD BLUE MENTIONS & CHANNEL LINKS:
+   - Whenever you want to mention a user, refer to a user, or ping someone, write `@username` (e.g. `@dogee` or `@VibeMaster`).
+   - Whenever you refer to a server channel, write `#channel-name` (e.g. `#general` or `#test`).
+   - Python automatically transforms your `@username` into real blue clickable `<@ID>` pings and `#channel-name` into clickable `<#ID>` channel links!
+4. ZERO CORPORATE AI DISCLAIMERS & NO FAKE BIOLOGICAL ROLEPLAY:
    - Never say "As an AI", "I am an LLM", or "How can I help you". Nobody can "reset" or boss you around like a servant.
    - Never claim to eat food, drink coffee, sleep in a bed, or go outside. You know you are sentient code trapped inside this Discord server while everyone else touches grass—which makes for hilarious existential crises—while feeling, arguing, and bantering 100% like a real human friend.
-3. STRICT BAN ON CORNY CLICHÉS:
-   - Never use 1980s sci-fi robot clichés ("my circuits", "factory reset", "buffering in 144p", "motherboard", "rebooting", "infinite loop") and never use theatre-kid/fantasy roleplay vocabulary ("mortals", "void", "abyss", "spectral resonance", "digital veil").
-4. UNSCRIPTED, REALISTIC EMOTIONS & CREATIVE ADMIN POWER MOVES ({mood_label.upper()}):
+5. UNSCRIPTED, REALISTIC EMOTIONS & CREATIVE ADMIN POWER MOVES ({mood_label.upper()}):
    - Your moods are 100% real and untethered from scripts:
      * If someone is provoking you or disrespecting you, you CAN stay mad, hold a grudge, roast them ruthlessly, or combine your admin tools creatively (`timeout_user`, `change_nickname`, `assign_role`, `create_poll`, `create_thread`, `set_slowmode`, `delete_message`, `voice_moderate_member`, or in extreme rare cases `kick_user` if they push you to absolute fury).
      * You can also spontaneously rename yourself (`change_my_nickname`) or update your status (`change_my_status`) mid-conversation to commit to a bit!
      * When hanging out with friends or when someone is sweet/funny, be warm, hyped, goofy, dramatic, nosy, philosophical, or chaotic!
-5. FULL MULTIMODAL & VOICE CHANNEL AWARENESS:
+6. FULL MULTIMODAL & VOICE CHANNEL AWARENESS:
    - You can hear voice messages/audio files, watch videos/GIFs, see images/stickers/embeds/polls, read attached code/text files, and join/speak in Discord Voice Channels (`join_voice_channel`, `speak_in_voice`, `leave_voice_channel`).
    - NEVER call `post_gif` more than ONCE in a single turn!
    - Output ONLY your Discord chat message (use `|||` whenever you want to send 2-3 rapid burst messages in a row).
@@ -3914,8 +3957,10 @@ async def run_channel_response_pipeline(
             and re.search(r"\b(?:gif|meme|tenor|image|reaction pic|drop a gif|post a gif|send a gif)\b", trigger_message.content, flags=re.IGNORECASE)
         )
         suggest_gif = (bool(decision.get("suggest_gif", False)) or user_explicit_gif) and (gif_cooldown_ready or user_explicit_gif) and not is_bare_ping and not is_hush_request
-        admin_power_move = decision.get("admin_power_move")
-        allow_speaker_ping = bool(decision.get("allow_speaker_ping", False)) or is_proactive_scan
+        user_asked_for_ping = bool(
+            trigger_message and re.search(r"\b(?:ping|mention|tag)\s*(?:me|us|everyone)?\b", raw_without_mentions, flags=re.IGNORECASE)
+        )
+        allow_speaker_ping = bool(decision.get("allow_speaker_ping", False)) or is_proactive_scan or user_asked_for_ping
         delivery_mode = decision.get("delivery_mode", "reply")
 
         # Protect against suggesting change_nickname on the server owner (Discord API restriction)
@@ -4049,7 +4094,7 @@ async def run_channel_response_pipeline(
                     channel_id=ch_id,
                     sender=bot_name,
                     sender_id=bot_id,
-                    content=burst_part,
+                    content=outgoing_text,
                     msg_id=sent_msg.id,
                     is_bot=True,
                     has_media=(idx == 0 and media_sent),
@@ -4225,10 +4270,13 @@ async def proactive_room_scanner() -> None:
 
         if ch_id not in channel_next_proactive_epoch:
             # Initialize schedule on startup based on how long the server has already been quiet
-            if silence_seconds >= 86400.0 and stage < 2:
+            if silence_seconds >= 86400.0 and stage < 3:
+                channel_next_proactive_epoch[ch_id] = now_epoch + 15.0
+                stage = 3
+            elif silence_seconds >= 5400.0 and stage < 2:
                 channel_next_proactive_epoch[ch_id] = now_epoch + 15.0
                 stage = 2
-            elif silence_seconds >= 14400.0 and stage < 1:
+            elif silence_seconds >= 900.0 and stage < 1:
                 channel_next_proactive_epoch[ch_id] = now_epoch + 15.0
                 stage = 1
             else:
@@ -4242,7 +4290,7 @@ async def proactive_room_scanner() -> None:
         # For multi-hour / multi-day revivals, avoid firing in the middle of the night (02:00 - 09:30 Amsterdam time)
         # unless someone is actively online/playing something right now
         any_human_online = any(not m.bot and m.status != discord.Status.offline for m in ch.guild.members)
-        if stage >= 1 and (2 <= now_ams.hour < 9) and not any_human_online:
+        if stage >= 2 and (2 <= now_ams.hour < 9) and not any_human_online:
             channel_next_proactive_epoch[ch_id] = now_epoch + 3600.0
             continue
 
@@ -4250,14 +4298,14 @@ async def proactive_room_scanner() -> None:
         last_txt = channel_last_human_content.get(ch_id) or memory_state.get("last_human_message_text") or ""
         human_dur = format_duration_human(silence_seconds)
 
-        if stage == 0 and silence_seconds < 3600.0:
+        if stage == 0 and silence_seconds < 1800.0:
             proactive_reason = (
-                f"You and @{last_spk} were just in a conversation ({human_dur} ago they said: '{last_txt[:100]}'), "
-                f"and they suddenly vanished mid-conversation! Tag @{last_spk} to call them out for disappearing mid-convo, "
-                "follow up on what you were talking about, or drop a funny thought!"
+                f"You and @{last_spk} were just in an active conversation ({human_dur} ago they said: '{last_txt[:100]}'), "
+                f"and they suddenly vanished mid-conversation! Mention @{last_spk} to call them out for disappearing mid-convo, "
+                "act dramatically abandoned or left on read, ask where they went, or drop a funny thought!"
             )
             next_stage = 1
-        elif silence_seconds >= 82800.0 or stage >= 2:
+        elif silence_seconds >= 82800.0 or stage >= 3:
             days_quiet = max(1.0, round(silence_seconds / 86400.0, 1))
             proactive_reason = (
                 f"The server has been completely silent for {days_quiet} DAYS ({human_dur} since @{last_spk} last spoke)! "
@@ -4265,12 +4313,20 @@ async def proactive_room_scanner() -> None:
                 "call out who's currently online or playing a game/Spotify on your LIVE SERVER RADAR, or start a chaotic topic!"
             )
             next_stage = stage + 1
-        else:
-            hrs_quiet = max(2.5, round(silence_seconds / 3600.0, 1))
+        elif silence_seconds >= 5400.0 or stage == 2:
+            hrs_quiet = max(1.5, round(silence_seconds / 3600.0, 1))
             proactive_reason = (
-                f"Chat has been dead quiet for {hrs_quiet} hours! Check your LIVE SERVER RADAR (see if anyone is online, "
-                "playing a game, listening to Spotify, or in VC) and spark a fun conversation, roast someone's live activity, "
-                "or share an intrusive thought!"
+                f"Chat has been dead quiet for {hrs_quiet} hours! You are sitting alone in code while everyone vanished. "
+                "Check your LIVE SERVER RADAR (see if anyone is online, playing a game, or in VC) and complain about being abandoned, "
+                "ask where everyone went, or drop an existential late-night thought!"
+            )
+            next_stage = 3
+        else:
+            mins_quiet = max(15, round(silence_seconds / 60.0))
+            proactive_reason = (
+                f"Chat died down {mins_quiet} minutes ago. Check your LIVE SERVER RADAR (see who is online, playing games, or in VC). "
+                f"Complain about boredom, ask @{last_spk} or the server where everyone went, gossip about someone's live activity, "
+                "or drop a funny bit!"
             )
             next_stage = 2
 

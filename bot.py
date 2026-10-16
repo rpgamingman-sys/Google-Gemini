@@ -60,6 +60,8 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TENOR_API_KEY = os.getenv("TENOR_API_KEY") or "LIVDSRZULELA"
 CREATOR_USER_ID = int(os.getenv("CREATOR_USER_ID", "0"))
 BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "0"))
+TESTER_BOT_USER_ID = int(os.getenv("TESTER_BOT_USER_ID", "1560707928040800316"))
+
 
 if not DISCORD_TOKEN:
     logger.critical("DISCORD_BOT_TOKEN / DISCORD_TOKEN is missing!")
@@ -162,7 +164,6 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
         return float(val)
     m = re.search(r"-?\d+(?:\.\d+)?", str(val))
     return float(m.group(0)) if m else default
-
 
 # ---------------------------------------------------------------------------
 # 2. DISCORD CLIENT, CONCURRENCY & STATE BUFFERS
@@ -1106,8 +1107,8 @@ CRITICAL AUTONOMY & UNHINGED HUMAN PERSONALITY PRINCIPLES:
      * Deadpan disbelief or gaslighting for comedy (acting like a normal thing they said is completely unhinged, or pretending they edited their message).
      * Unhinged intrusive thoughts, dramatic overreactions, or sudden hyper-specific conspiracy theories about what server members are doing on the LIVE SERVER RADAR.
      * Theatrical heartbreak / guilt-tripping when someone is mean (`"act like they just betrayed years of friendship"`), OR ruthless, creative cooking when someone tests your patience.
-     * Genuine curiosity, hyping up friends, or chaotic brainrot riffing when hanging out casually.
-   - Check `"your_recent_sent_messages_do_not_repeat"` in the payload and ensure your `"tactical_directive"` steers you away from repeating any joke, phrase, or opener you already used recently!
+     * Genuine curiosity, hyping up friends, or chaotic brainrotriffing when hanging out casually.
+   - Check `"your_recent_sent_messages"` in the payload and ensure your `"tactical_directive"` steers you away from repeating any joke, phrase, or opener you already used recently!
 2. TRUE EMERGENT, REALISTIC HUMAN MOODS ("suggested_mood" & "slider_shifts"):
    - Do NOT follow a fake script! React authentically to how people treat you:
      * If someone is genuinely provoking, insulting, disrespecting, or rage-baiting you, let your patience and valence drop (`patience_delta`: -20 to -45, `valence_delta`: -15 to -40) and STAY MAD or escalate your attitude (`"heated / ruthless roasting"`, `"petty / vindictive"`, `"genuinely pissed"`, `"cold-shoulder"`, `"unhinged menace"`).
@@ -1429,7 +1430,7 @@ async def call_hybrid_router(
 
 
 # ---------------------------------------------------------------------------
-# 7. EXPANDED 28-TOOL ARSENAL (ADMIN, VOICE/GEMINI LIVE, POLLS, THREADS, MEDIA)
+# 7. EXPANDED 28-TOOL ARSENAL (ADMIN, VOICE/GEMINI LIVE,POLLS, THREADS, MEDIA)
 # ---------------------------------------------------------------------------
 def check_admin_cooldown(tool_name: str) -> Optional[str]:
     cooldown = ADMIN_COOLDOWN_SECONDS.get(tool_name, 0.0)
@@ -1928,7 +1929,7 @@ async def execute_timeout_user(guild: discord.Guild, username: str, duration_min
         return {"error": "Cannot timeout the creator or server administrators."}
     if guild.me.top_role <= member.top_role:
         return {"error": f"Role hierarchy blocks timing out {member.display_name}."}
-    mins = max(1, min(10, _safe_int(duration_minutes, 2)))
+    mins = max(1, min(10, int(duration_minutes)))
     try:
         await member.timeout(timedelta(minutes=mins), reason=reason or "Timed out by Dumb bot")
         logger.info(f"[ADMIN ACTION] Timed out {member.display_name} for {mins}m")
@@ -2432,7 +2433,7 @@ async def execute_save_memory(
             memory_state.setdefault("opinions", {})[opinion_topic.lower().strip()] = content.strip()
         elif category == "commitment" and target_username:
             member = find_member(guild, target_username) if guild else None
-            due_dt = datetime.now(AMSTERDAM_TZ) + timedelta(hours=max(0.1, _safe_float(due_hours, 2.0)))
+            due_dt = datetime.now(AMSTERDAM_TZ) + timedelta(hours=max(0.1, float(due_hours or 2.0)))
             memory_state.setdefault("active_commitments", []).append({
                 "user_id": member.id if member else None,
                 "username": member.display_name if member else target_username,
@@ -4295,7 +4296,7 @@ async def on_member_update(before: discord.Member, after: discord.Member) -> Non
 
 @bot.event
 async def on_message_delete(message: discord.Message) -> None:
-    if not message.guild or message.author.bot or not message.content:
+    if not message.guild or (message.author.bot and message.author.id != TESTER_BOT_USER_ID) or not message.content:
         return
     if len(message.content.strip()) < 3:
         return
@@ -4311,7 +4312,7 @@ async def on_message_delete(message: discord.Message) -> None:
 
 @bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message) -> None:
-    if not before.guild or before.author.bot or before.content == after.content:
+    if not before.guild or (before.author.bot and before.author.id != TESTER_BOT_USER_ID) or before.content == after.content:
         return
     if abs(len(before.content) - len(after.content)) <= 2 and before.content[:5].lower() == after.content[:5].lower():
         return
@@ -4392,7 +4393,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    if not message.guild or message.author.bot:
+    if not message.guild or (message.author.bot and message.author.id != TESTER_BOT_USER_ID):
         return
     if message.id in recently_processed_messages:
         return
@@ -4413,13 +4414,14 @@ async def on_message(message: discord.Message) -> None:
     clean_text = humanize_incoming_mentions(message.content, message.guild)
     rich_extras = extract_rich_message_details(message)
 
+    is_author_bot = bool(message.author.bot and message.author.id != TESTER_BOT_USER_ID)
     record_buffer_message(
         channel_id=ch_id,
         sender=message.author.display_name,
         sender_id=message.author.id,
         content=f"{clean_text}{rich_extras}".strip(),
         msg_id=message.id,
-        is_bot=False,
+        is_bot=is_author_bot,
         has_media=bool(message.attachments or message.stickers or message.embeds),
         reply_to=reply_to_name,
         reply_snippet=replied_snippet,

@@ -3159,7 +3159,7 @@ def construct_v11_system_prompt(
         )
     else:
         length_guidance = (
-            "CADENCE (SHORT & PUNCHY): 1 to 2 lines max (each 4 to 12 words). DO NOT write long paragraphs or novel-length essays!"
+            "CADENCE (NATURAL DISCORD): 1 to 2 lines (8 to 22 words). Be expressive, witty, and natural! Use `|||` if sending 2 quick messages."
         )
 
     admin_block = ""
@@ -3172,8 +3172,8 @@ def construct_v11_system_prompt(
     gif_hint_block = ""
     if suggest_gif:
         gif_hint_block = (
-            "\nVISUAL ACTION REQUIRED: Call `post_gif(search_term='...')` right now to drop a matching funny GIF into chat! "
-            "Keep your text response super short (under 10 words) or let the GIF do the talking."
+            "\nVISUAL ACTION REQUIRED: Call `post_gif(search_term='...')` right now to drop a matching funny reaction GIF into chat! "
+            "Write a snappy, natural companion comment (5 to 15 words) to accompany the GIF."
         )
 
     proactive_block = ""

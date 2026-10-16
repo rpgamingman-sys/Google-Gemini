@@ -971,6 +971,7 @@ def sanitize_output_text(text: str, speaker_name: str = "") -> str:
     text = re.sub(r"\[(?:Sent GIF|Posted Image|Posted Flux Art|Action taken|Executed tool):[^\]]*\]", "", text, flags=re.IGNORECASE)
     text = re.sub(r"https?://(?:media\d*\.|c\.|www\.)?tenor\.com/\S+", "", text, flags=re.IGNORECASE)
     text = re.sub(r"[\(\[](?:post_gif|post_flux_art|search_web|search_web_images|speak_in_voice|change_my_nickname|change_nickname|admin_power_move|tool)[^\)\]]*[\)\]]", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"`?(?:post_gif|post_flux_art|search_web|search_web_images|speak_in_voice|join_voice_channel|leave_voice_channel|change_my_nickname|change_nickname|timeout_user|kick_user|create_role|assign_role|set_slowmode|rename_channel|create_poll)\([^`\n]*\)`?", "", text, flags=re.IGNORECASE)
 
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]

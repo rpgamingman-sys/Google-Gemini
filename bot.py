@@ -3957,6 +3957,7 @@ async def run_channel_response_pipeline(
             and re.search(r"\b(?:gif|meme|tenor|image|reaction pic|drop a gif|post a gif|send a gif)\b", trigger_message.content, flags=re.IGNORECASE)
         )
         suggest_gif = (bool(decision.get("suggest_gif", False)) or user_explicit_gif) and (gif_cooldown_ready or user_explicit_gif) and not is_bare_ping and not is_hush_request
+        admin_power_move = decision.get("admin_power_move")
         user_asked_for_ping = bool(
             trigger_message and re.search(r"\b(?:ping|mention|tag)\s*(?:me|us|everyone)?\b", raw_without_mentions, flags=re.IGNORECASE)
         )

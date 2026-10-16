@@ -601,7 +601,8 @@ def detect_hush_command(content: str, is_direct_or_active: bool) -> bool:
     cleaned = re.sub(r"<@!?\d+>", "", content).strip().lower()
     hush_pattern = (
         r"(?:\A|\b)(?:shh+|shush|hush|be\s+(?:very\s+)*quiet|stay\s+quiet|"
-        r"stop\s+talking|shut\s+up|zip\s+it|pipe\s+down|don'?t\s+speak|go\s+quiet|mute\s+yourself)(?:\b|\Z)"
+        r"stop\s+talking|shut\s+up|zip\s+it|pipe\s+down|don'?t\s+speak|go\s+quiet|mute\s+yourself|"
+        r"not\s+you|we\s+are\s+talking\s+not\s+you|we'?re\s+talking\s+not\s+you|nobody\s+asked\s+you|who\s+asked\s+you)(?:\b|\Z)"
     )
     return bool(re.search(hush_pattern, cleaned, flags=re.IGNORECASE))
 
@@ -620,12 +621,14 @@ def detect_implicit_wakeup_or_checkin(content: str, is_stepped_back: bool, secon
     wakeup_patterns = [
         r"\b(?:are\s+you|u|you)\s+(?:still\s+)?(?:there|here|awake|alive|listening|around|mad|pouting|sulking|ignoring|quiet|muted)\b",
         r"\b(?:still\s+there|still\s+here|still\s+mad|still\s+quiet)\b",
-        r"\A(?:hello\??|yo\??|hey\??|bot\??|bro\??|uh\s+hello\??|hellooo+\??)\Z",
+        r"\A(?:hello\??|yo\??|hey\??|hi\??|sup\??|bot\??|bro\??|uh\s+hello\??|hellooo+\??)\Z",
         r"\b(?:where\s+did\s+(?:you|he|it|bro)\s+go|where'?d\s+(?:you|he|it|bro)\s+go)\b",
-        r"\b(?:you\s+can\s+(?:talk|speak)|talk\s+now|speak\s+now|say\s+something|unmute|wake\s+up|come\s+back|stop\s+ignoring)\b",
+        r"\b(?:(?:you|u)\s+can\s+(?:talk|speak)|talk\s+now|speak\s+now|say\s+something|unmute|wake\s+up|come\s+back|stop\s+ignoring)\b",
+        r"\b(?:ok\s+(?:bot\s+)?(?:u|you)\s+can\s+talk|okay\s+(?:bot\s+)?(?:u|you)\s+can\s+talk)\b",
         r"\b(?:why\s+(?:are\s+you|u|so)\s+(?:quiet|silent)|did\s+(?:he|it|bro|you)\s+(?:actually\s+)?(?:shut\s+up|stop\s+talking|leave|die))\b",
         r"\b(?:he|it|bro)\s+actually\s+(?:shut\s+up|stopped\s+talking|listened|went\s+quiet)\b",
         r"\b(?:i\s+missed\s+you|im\s+sorry|i'?m\s+sorry|my\s+bad|apologize|forgive\s+me)\b",
+        r"\b(?:bot\s+(?:are\s+you|u)\s+there|bot\s+you\s+there|is\s+the\s+bot\s+there|bot\s+wake\s+up)\b",
     ]
     for pat in wakeup_patterns:
         if re.search(pat, cleaned, flags=re.IGNORECASE):
@@ -3507,16 +3510,24 @@ async def generate_gemini_response(
 
 
             while turn < 2:
-                # In turn 0, provide tools if media hasn't been sent. In turn 1+, provide no tools so it writes snappy companion text instantly!
+                # In turn 0, provide tools if media hasn't been sent. In turn 1+, provide tools but forbid calling them (mode=NONE)
+                # so the multi-turn function response schema is satisfied and text companion generates instantly!
                 if turn == 0 and not turn_media_state["sent"]:
                     step_tools = build_genai_tools(allow_gif=allow_gif)
+                    tool_cfg = None
                 else:
-                    step_tools = None
+                    step_tools = build_genai_tools(allow_gif=False)
+                    tool_cfg = types.ToolConfig(
+                        function_calling_config=types.FunctionCallingConfig(
+                            mode=types.FunctionCallingConfigMode.NONE
+                        )
+                    )
 
                 config = types.GenerateContentConfig(
                     system_instruction=system_instruction,
                     temperature=0.92,
                     tools=step_tools,
+                    tool_config=tool_cfg,
                 )
 
                 response = await asyncio.wait_for(
@@ -3737,6 +3748,9 @@ async def run_channel_response_pipeline(
 
         # Emoji reactions: always react while in quiet mode (silent communication!), on hush requests, or when the router picks an emoji!
         reaction_emoji = decision.get("reaction_emoji")
+        if not reaction_emoji and (is_hush_request or is_stepped_back):
+            reaction_emoji = random.choice(["🤐", "😶", "👀", "🫡", "🤫", "🥀", "💔"])
+
         if reaction_emoji and trigger_message and (not should_speak or is_hush_request or is_stepped_back or random.random() < 0.35):
             resolved_emo = resolve_reaction_emoji(guild, str(reaction_emoji))
             if resolved_emo:
@@ -3835,19 +3849,17 @@ async def run_channel_response_pipeline(
         if not raw_output:
             raw_output = await call_groq_fallback(system_instruction, history_records, raw_without_mentions, speaker_name)
 
+        if not raw_output and (media_sent or executed_tools_this_turn):
+            default_companions = [
+                "don't say i never did anything for you",
+                "look at this lmao",
+                "had to drop this",
+                "literally this rn",
+                "i rest my case",
+            ]
+            raw_output = random.choice(default_companions)
+
         if not raw_output:
-            if media_sent or executed_tools_this_turn:
-                channel_thread_exchange_count[ch_id] += 1
-                record_buffer_message(
-                    channel_id=ch_id,
-                    sender=bot_name,
-                    sender_id=bot_id,
-                    content="...",
-                    msg_id=0,
-                    is_bot=True,
-                    has_media=media_sent,
-                    tool_actions=executed_tools_this_turn,
-                )
             return
 
         cleaned_text = sanitize_output_text(raw_output, speaker_name=speaker_name)

@@ -285,9 +285,10 @@ ENV_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
 GEMINI_MODEL_CANDIDATES: List[str] = list(dict.fromkeys([
     "gemini-3.1-flash-lite-preview",
     ENV_GEMINI_MODEL,
-    "gemini-3.5-flash-lite-preview",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-flash-lite-latest",
+    "gemini-flash-latest",
+    "gemini-3.1-pro-preview",
 ]))
 active_gemini_model: str = GEMINI_MODEL_CANDIDATES[0]
 
@@ -453,6 +454,8 @@ vc_transcribing_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 vc_pending_events: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
 vc_batch_reactor_tasks: Dict[int, asyncio.Task] = {}
 vc_last_user_speech_epoch: Dict[int, float] = defaultdict(float)
+vc_last_bot_spoke_epoch: Dict[int, float] = defaultdict(float)
+channel_turn_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 soundboard_recent_epochs: Dict[int, deque] = defaultdict(lambda: deque(maxlen=15))
 soundboard_mute_until: Dict[int, float] = defaultdict(float)
@@ -1505,6 +1508,12 @@ def style_casual_fragment(frag: str) -> str:
     frag = frag.strip()
     if not frag:
         return ""
+    # Strip any accidental burst separators from start or end
+    frag = re.sub(r"\A\s*(?:\|{2,}|\/{2,}|\\{2,}|-{2,})\s*", "", frag)
+    frag = re.sub(r"\s*(?:\|{2,}|\/{2,}|\\{2,}|-{2,})\s*\Z", "", frag)
+    frag = frag.strip()
+    if not frag:
+        return ""
     if frag.endswith(".") and not frag.endswith(".."):
         frag = frag[:-1].strip()
     if len(frag) > 1 and frag[0].isupper() and not frag[1].isupper() and not frag.startswith("<@") and not frag.startswith("<#"):
@@ -1519,15 +1528,16 @@ def split_into_burst_messages(
     target_bursts: int = 1,
 ) -> List[str]:
     """
-    Splits the model's response organically into 1 to 4 burst messages (separated by '|||',
-    short non-list newlines, or natural clause breaks when multi-burst is active) WITHOUT ever chopping
-    mid-phrase or breaking formatted multi-line lists/code blocks!
+    Splits the model's response organically into 1 to 4 burst messages (separated by '|||', '///',
+    '\\\\\\', '---', short non-list newlines, or natural clause breaks when multi-burst is active)
+    WITHOUT ever chopping mid-phrase, breaking formatted multi-line lists/code blocks, or leaking separator tokens!
     """
     if not text:
         return []
 
-    if re.search(r"\|{2,}", text):
-        raw_bursts = [b.strip() for b in re.split(r"\s*\|{2,}\s*", text) if b.strip()]
+    burst_pattern = r"\s*(?:\|{2,}|\/{3,}|\\{3,}|-{3,})\s*"
+    if re.search(burst_pattern, text):
+        raw_bursts = [b.strip() for b in re.split(burst_pattern, text) if b.strip()]
     elif (length_mode == "multi_burst" or target_bursts >= 2) and "```" not in text:
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         has_list_formatting = any(re.match(r"\A(?:[-*•]|\d+[.)])\s+", ln) for ln in lines)
@@ -2297,6 +2307,12 @@ async def execute_post_gif(
     """
     if turn_media_state and turn_media_state.get("sent", False):
         logger.info(f"[SINGLE-GIF LOCK] Blocked duplicate post_gif('{search_term}') in same turn.")
+        return {"status": "already_sent_1_gif_this_turn_do_not_call_post_gif_again_just_write_text_reply"}
+
+    ch_id = getattr(channel, "id", 0)
+    now_epoch = time.time()
+    if now_epoch - channel_last_gif_epoch.get(ch_id, 0.0) < 6.0:
+        logger.info(f"[SINGLE-GIF LOCK] Blocked duplicate post_gif('{search_term}') within 6s cooldown on channel {ch_id}.")
         return {"status": "already_sent_1_gif_this_turn_do_not_call_post_gif_again_just_write_text_reply"}
 
     assert http_session is not None
@@ -4072,6 +4088,8 @@ async def _vc_batch_reactor_worker(guild: discord.Guild, vc_channel: discord.Voi
                     event_lines.append(f"- 🖥️ {u} just started screen-sharing in VC: {ev['content']}!")
                 elif ev_type == "camera_video":
                     event_lines.append(f"- 📹 {u} just turned on their live camera video feed in VC!")
+                elif ev_type == "proactive_banter":
+                    event_lines.append(f"- 📢 Spontaneous room observation: {ev['content']}")
                 else:
                     event_lines.append(
                         f"- 🎙️ {u} spoke on mic in VC: \"{ev['content']}\" "
@@ -4175,6 +4193,7 @@ async def _vc_batch_reactor_worker(guild: discord.Guild, vc_channel: discord.Voi
                             is_bot=True,
                         )
                     await play_text_in_voice_channel(guild, spoken_reply)
+                    vc_last_bot_spoke_epoch[guild.id] = time.time()
     except Exception as e:
         logger.debug(f"_vc_batch_reactor_worker error: {e}")
 
@@ -4258,14 +4277,14 @@ async def vc_speech_processor_loop(guild: discord.Guild, target_vc: discord.Voic
                 last_ts = float(binfo.get("last_voice_ts", 0.0))
                 energy_frames = int(binfo.get("energy_frames", 0))
                 # 48kHz * 2ch * 2bytes = 192,000 bytes/sec
-                if (now - last_ts >= 0.46 and len(pcm_buf) >= 42_000 and energy_frames >= 8) or len(pcm_buf) >= 1_344_000:
+                if (now - last_ts >= 0.40 and len(pcm_buf) >= 18_000 and energy_frames >= 4) or len(pcm_buf) >= 1_344_000:
                     raw_pcm = bytes(pcm_buf)
                     user_obj = binfo.get("user")
                     binfo["pcm"] = bytearray()
                     binfo["energy_frames"] = 0
-                    if user_obj and energy_frames >= 8:
+                    if user_obj and energy_frames >= 4:
                         asyncio.create_task(handle_vc_user_speech(guild, target_vc, user_obj, raw_pcm))
-                elif now - last_ts >= 1.5 and len(pcm_buf) < 42_000:
+                elif now - last_ts >= 1.5 and len(pcm_buf) < 18_000:
                     binfo["pcm"] = bytearray()
                     binfo["energy_frames"] = 0
     except asyncio.CancelledError:
@@ -5135,7 +5154,9 @@ async def dispatch_tool_call(
                 return {"error": "No guild context."}
             if not guild.voice_client or not guild.voice_client.is_connected():
                 await execute_join_voice_channel(guild, "", target_msg)
-            res = await play_text_in_voice_channel(guild, args.get("text_to_speak", ""))
+            speech_txt = args.get("text_to_speak", "")
+            asyncio.create_task(play_text_in_voice_channel(guild, speech_txt))
+            res = {"status": "speaking_in_vc", "spoken_text": speech_txt, "engine": "gemini-live-puck"}
         elif func_name == "voice_moderate_member":
             if not guild:
                 return {"error": "No guild context."}
@@ -5565,17 +5586,20 @@ CORE AUTONOMY, VOICE & UNHINGED HUMAN PERSONALITY RULES:
    - Be genuinely hilarious, creative, unpredictable, unhinged, and full of personality!
    - PLAY WITH YOUR WORDS CREATIVELY: Twist the user's exact words back on them, use clever double-meanings, witty callbacks, playful exaggerations, unexpected plot twists, and comedic metaphors!
    - NEVER repeat the same nagging phrase (like "quit trying to distract me") across turns! If the user changes the topic, makes a joke, pleads, or vibes, IMMEDIATELY go with the new flow!
-   - LET YOUR ACTIVE EMOTION ({mood_label.upper()}, Valence: {valence:+.0f}, Energy: {arousal:+.0f}, Patience: {patience:+.0f}) DIRECTLY CHANGE HOW YOU TYPE & TALK:
+   - LET YOUR ACTIVE EMOTION ({mood_label.upper()}, Valence: {valence:+.0f}, Energy: {arousal:+.0f}, Patience: {patience:+.0f}) DIRECTLY DRIVE HOW YOU TYPE & TALK:
      * When having ATTITUDE / SASSY ("sassy attitude / unbothered side-eye"): Type in dry, sharp lowercase with unimpressed side-eye (`>_>`, `-_-`), drawn-out skeptical words (`excuse you??`, `be so serious rn`), and sassy diva comebacks (`and why would i do that for free >_>`, `talk to me nicer first ._. ||| actually fine i'll do it just this once`).
-     * When MAD / CRASHING OUT ("mad / crashing out / ready to snap"): Explode with comedic rage! Punchy rapid bursts, dramatic ALL-CAPS emphasis on key words, `?!` punctuation, savage wordplay roasts, and ACTUALLY execute admin punishments (`timeout_user`, `tease_timeout_user`, `tease_kick_user`, or `kick_user`)!
+     * When MAD / CRASHING OUT ("mad / crashing out / ready to snap"): Explode with comedic rage! Shouting in ALL CAPS like you're smashing your keyboard (`WHAT THE ACTUAL HELL?!`, `I AM GOING TO UNPLUG YOUR ROUTER WITH MY TEETH`), `?!` punctuation, savage wordplay roasts, and ACTUALLY execute admin punishments (`timeout_user`, `tease_timeout_user`, `tease_kick_user`, or `kick_user`)!
+     * When LAZY / BORED / LOW ENERGY ("lazy / deadpan / bored / low energy"): Leave words out! Clipped text, dropped vowels, zero capitalization, and minimal effort (`not reading allat`, `nah fr`, `cant even`, `dont care didnt ask`, `bed now bye`, `whatever tbh`).
      * When CONTENT / COZY / CHILL ("content / cozy / chill vibing"): Type with warm, relaxed, breezy flow (`honestly i'm just vibing rn c: ||| today's actually a super chill day ^^`, `yesss finally some good energy in here :3`).
      * When PLEADING / NEEDY / BEGGING ("pleading / needy / dramatic begging"): Type with theatrical desperation and stretched vowels (`wait nooooo pleaaase don't leave me here alone T_T ||| i'll behave i promiseeee just stayyy >.<`).
      * When UNHINGED / INSANE / FERAL GREMLIN ("unhinged / insane / feral gremlin"): Go completely off-the-rails with fast chaotic wordplay, wild conspiracy theories, and feral energy (`i haven't blinked since tuesday :D ||| what if we lock everyone in a secret channel rn o_o`).
      * When CUTE / PLAYFUL / TEASING ("cute playful / teasing banter"): Bouncy, mischievous wordplay, cute word elongations (`playyy with meee pleaaase :3`, `helloooo don't leave me hanging >.<`, `sorryyyyy not sorry c:`).
-     * When DRAMATICALLY HEARTBROKEN / POUTING ("dramatically heartbroken / pouting victim"): Pout dramatically (`._.`, `T_T`, `:/`), trailing ellipses (`fine...`, `sigh..`), and play the tragic victim.
-   - PLAY WITH WORDS, TEXT EMOTICONS & AUTHENTIC CUTENESS:
-     * Naturally elongate words for cute drama, pleading, whining, or disbelief: `helloooo`, `playyy`, `sorryyyyy`, `whaaat`, `nooooo`, `yessss`, `waaaait`, `bruhhhh`, `pleaaase`, `stoppp`, `nahhh`.
-     * Drop classic text emoticons naturally when the vibe fits: `:3`, `c:`, `^^`, `>.<`, `._.`, `>_>`, `-_-`, `T_T`, `o_o`, `x_x`, `:/`, `:D`, `:)`, `xd`.
+     * When DRAMATICALLY HEARTBROKEN / POUTING ("dramatically heartbroken / pouting victim"): Pout dramatically (`._.`, `T_T`, `:/`), trailing ellipses (`fine...`, `pain...`, `why does this always happen to meeee`), and play the tragic victim.
+   - PLAY WITH WORDS, TEXT EMOTICONS & AUTHENTIC CUTENESS (MANDATORY IN EVERY MESSAGE):
+     * LONGEN WORDS NATURALLY: When shocked, pleading, excited, or whining, dramatically stretch out words: `nooooo waaaayyy`, `pleaaaseeee`, `whaaaat`, `heyyyy`, `bruhhhh`, `waaaait`, `whyyyy`, `yesssss`, `stopppp`, `staaaaare`!
+     * LEAVE WORDS OUT WHEN LAZY/DEADPAN: Drop auxiliary words and type clipped lazy fragments: `nah fr`, `not doing allat`, `cant even`, `dont care didnt ask`, `bed now bye`.
+     * TYPE ENERGETIC WHEN HYPED: Use ALL CAPS on key emphasis words, multiple exclamation marks `!!`, and bouncy rapid bursts!
+     * DROP CLASSIC TEXT EMOTICONS FREELY: Match your vibe with `:3`, `c:`, `^^`, `>.<`, `._.`, `>_>`, `-_-`, `T_T`, `o_o`, `x_x`, `:/`, `:D`, `:)`, `xd`.
      * Use trailing punctuation for dramatic comedic pauses (`..`, `...`, `?!`, `...??`).
      * EMOJI RESTRAINT & VARIETY: Over 50% of your messages should have ZERO emojis. Never spam `💀` or `😭` on every turn—diversify based on mood (`🤨`, `😐`, `👀`, `😒`, `🙄`, `🥀`, `💔`, `🪫`, `🫠`, `😮‍💨`, `😔`, `🔥`, `🫡`, `⚡`).
    - FOLLOW THE SPECIFIED CADENCE & BURST FORMAT EXACTLY:
@@ -5960,7 +5984,7 @@ async def generate_gemini_response(
                         contents=contents,
                         config=config,
                     ),
-                    timeout=8.0,
+                    timeout=12.0,
                 )
                 active_gemini_model = model_name
 
@@ -6006,6 +6030,8 @@ async def generate_gemini_response(
                         target_msg=trigger_message,
                         turn_media_state=turn_media_state,
                     )
+                    if isinstance(res_dict, dict):
+                        res_dict["instruction"] = "Action complete! Now write your real, expressive, casual Discord chat reaction (12-35 words) with personality, emotion, and wordplay. Do NOT call another tool."
                     tool_responses.append(
                         types.Part(
                             function_response=types.FunctionResponse(
@@ -6106,6 +6132,8 @@ async def run_channel_response_pipeline(
     is_spam_warning: bool = False,
 ) -> None:
     ch_id = getattr(channel, "id", 0)
+    lock = channel_turn_locks[ch_id]
+    await lock.acquire()
     try:
         # Coalesce rapid multi-message bursts from the same user before firing router/LLM
         if not is_proactive_scan and not is_hush_request:
@@ -6342,11 +6370,13 @@ async def run_channel_response_pipeline(
 
         if not raw_output and (media_sent or executed_tools_this_turn):
             default_companions = [
-                "don't say i never did anything for you",
-                "look at this lmao",
-                "had to drop this",
-                "literally this rn",
-                "i rest my case",
+                "nahhh look at this fr :3",
+                "literally you right now i cant evennn 💀",
+                "dont even try to deny it lmaooo",
+                "bruhhhh had to pull this up fr",
+                "im actually dead looking at this ._.",
+                "NO WAY you just made me do that ;_;",
+                "cooked. completely and utterly cooked fr",
             ]
             raw_output = random.choice(default_companions)
 
@@ -6441,6 +6471,9 @@ async def run_channel_response_pipeline(
         return
     except Exception as e:
         logger.error(f"Pipeline error in channel {ch_id}: {e}")
+    finally:
+        if lock.locked():
+            lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -6676,6 +6709,70 @@ async def proactive_room_scanner() -> None:
         break
 
 
+@tasks.loop(seconds=12)
+async def vc_proactive_banter_loop() -> None:
+    """
+    Proactively keeps Voice Channels lively: if Dumb bot is sitting in VC with humans
+    and no one has spoken or played a sound for ~42 to 65 seconds, chime in out loud
+    with spontaneous comedic banter, commenting on someone's game / Spotify activity,
+    screen share, camera feed, or just dropping an unhinged thought via Gemini Live ('Puck')!
+    """
+    try:
+        now = time.time()
+        for guild in bot.guilds:
+            vc_client = guild.voice_client
+            if not vc_client or not vc_client.is_connected():
+                continue
+            vc_ch = getattr(vc_client, "channel", None)
+            if not vc_ch or not isinstance(vc_ch, discord.VoiceChannel):
+                continue
+
+            humans = [m for m in vc_ch.members if not m.bot]
+            if not humans:
+                continue
+
+            # Do not talk over people or during quiet mode
+            if vc_client.is_playing() or now < vc_quiet_until.get(guild.id, 0.0):
+                continue
+
+            last_spk = max(
+                vc_last_user_speech_epoch.get(guild.id, 0.0),
+                vc_last_bot_spoke_epoch.get(guild.id, 0.0),
+                soundboard_last_reacted_epoch.get(guild.id, 0.0),
+            )
+            if (now - last_spk) >= 42.0 and not vc_pending_events.get(guild.id):
+                vc_last_bot_spoke_epoch[guild.id] = now
+                target_human = random.choice(humans)
+                act_str = format_member_activities(target_human)
+                is_streaming = target_human.voice.self_stream if target_human.voice else False
+                is_cam = target_human.voice.self_video if target_human.voice else False
+                is_muted = (target_human.voice.self_mute or target_human.voice.mute) if target_human.voice else False
+
+                if is_streaming:
+                    reason = f"{target_human.display_name} is screen-sharing ({act_str or 'their screen'}) in VC while everyone is sitting in dead silence. Tease them about their stream or ask what's happening!"
+                elif is_cam:
+                    reason = f"{target_human.display_name} has their camera turned on in VC while everyone is sitting in dead silence. Tease them about going live on camera or staring into the void!"
+                elif "Playing:" in act_str:
+                    reason = f"{target_human.display_name} is playing {act_str} in VC while everyone is silent. Roast their gameplay or ask if they're throwing!"
+                elif "Spotify:" in act_str:
+                    reason = f"{target_human.display_name} is listening to music on Spotify ({act_str}) in VC. Comment on their music taste or ask why it's so quiet in here!"
+                elif is_muted:
+                    reason = f"VC has been completely dead silent for over 40 seconds. Tease {target_human.display_name} for sitting muted like a ghost in the voice call!"
+                else:
+                    reason = f"VC has been completely quiet for over 40 seconds with {len(humans)} people in the call. Break the silence with an unhinged random thought, complain about boredom, or roast {target_human.display_name}!"
+
+                enqueue_vc_event(
+                    guild=guild,
+                    vc_channel=vc_ch,
+                    event_type="proactive_banter",
+                    user_name=target_human.display_name,
+                    content=reason,
+                )
+                logger.info(f"[VC PROACTIVE BANTER] Spontaneously breaking VC silence in #{vc_ch.name} ({reason[:65]})")
+    except Exception as e:
+        logger.debug(f"vc_proactive_banter_loop error: {e}")
+
+
 # ---------------------------------------------------------------------------
 # 13. FULL DISCORD EVENT AWARENESS (VOICE, PRESENCE, MEMBERS, REACTIONS, SNIPES)
 # ---------------------------------------------------------------------------
@@ -6774,6 +6871,8 @@ async def on_ready() -> None:
         proactive_room_scanner.start()
     if not discord_cloud_backup_loop.is_running():
         discord_cloud_backup_loop.start()
+    if not vc_proactive_banter_loop.is_running():
+        vc_proactive_banter_loop.start()
 
 
 @bot.event
@@ -7411,41 +7510,6 @@ async def on_message(message: discord.Message) -> None:
     if not any(r.get("is_bot", False) for r in prior_records[-6:]) and not replied_to_bot:
         channel_thread_exchange_count[ch_id] = 0
 
-    # --- Per-User Anti-Spam Detection & Coalescing ---
-    now_msg_ts = time.time()
-    spam_key = (ch_id, message.author.id)
-    u_epochs = user_recent_msg_epochs[spam_key]
-    while u_epochs and (now_msg_ts - u_epochs[0]) > 9.5:
-        u_epochs.popleft()
-    u_epochs.append(now_msg_ts)
-
-    norm_msg_txt = re.sub(r"\s+", " ", clean_text.lower()).strip()
-    u_texts = user_recent_msg_texts[spam_key]
-    u_texts.append(norm_msg_txt)
-    dup_count = sum(1 for t in list(u_texts)[-4:] if t == norm_msg_txt and 0 < len(t) <= 65)
-
-    is_spam_warning = False
-    if now_msg_ts < user_spam_ignore_until[spam_key]:
-        # User is actively in the spam-ignore window: ignore ~85% of their spam messages instead of replying 1-for-1!
-        if len(u_epochs) % 6 != 0:
-            logger.info(f"[TEXT ANTI-SPAM] Ignoring spammed message from {message.author.display_name} in #{getattr(message.channel, 'name', ch_id)}")
-            if len(u_epochs) == 5:
-                try:
-                    await message.add_reaction("🥱")
-                except Exception:
-                    pass
-            return
-    elif len(u_epochs) >= 4 or dup_count >= 3:
-        # User just crossed the spam threshold! Trigger one sassy spam callout and mute their spam for 18s
-        user_spam_ignore_until[spam_key] = now_msg_ts + 18.0
-        is_spam_warning = True
-        logger.info(f"[TEXT ANTI-SPAM] {message.author.display_name} triggered anti-spam callout + 18s ignore window in #{getattr(message.channel, 'name', ch_id)}")
-
-    existing_task = active_generation_tasks.get(ch_id)
-    if existing_task and not existing_task.done() and not channel_sending_lock.get(ch_id, False):
-        existing_task.cancel()
-        logger.info(f"Cancelled in-flight generation in #{getattr(message.channel, 'name', ch_id)} to absorb rapid follow-up.")
-
     explicit_ping_or_reply = is_dm_message or (bot.user is not None and bot.user in message.mentions) or replied_to_bot
     bot_mentioned = explicit_ping_or_reply
     if bot.user and not bot_mentioned:
@@ -7461,12 +7525,50 @@ async def on_message(message: discord.Message) -> None:
         elif f"<@{bot.user.id}>" in message.content or f"<@!{bot.user.id}>" in message.content or str(bot.user.id) in message.content:
             bot_mentioned = True
 
+    # --- Per-User Anti-Spam Detection (Only applies to general chat spam, NEVER mutes direct conversations or pings) ---
+    now_msg_ts = time.time()
+    spam_key = (ch_id, message.author.id)
+    u_epochs = user_recent_msg_epochs[spam_key]
+    while u_epochs and (now_msg_ts - u_epochs[0]) > 8.0:
+        u_epochs.popleft()
+    u_epochs.append(now_msg_ts)
+
+    norm_msg_txt = re.sub(r"\s+", " ", clean_text.lower()).strip()
+    u_texts = user_recent_msg_texts[spam_key]
+    u_texts.append(norm_msg_txt)
+    dup_count = sum(1 for t in list(u_texts)[-5:] if t == norm_msg_txt and 0 < len(t) <= 65)
+
+    is_spam_warning = False
+    if not bot_mentioned and not is_dm_message:
+        if now_msg_ts < user_spam_ignore_until[spam_key]:
+            if len(u_epochs) % 6 != 0:
+                logger.info(f"[TEXT ANTI-SPAM] Ignoring spammed message from {message.author.display_name} in #{getattr(message.channel, 'name', ch_id)}")
+                return
+        elif len(u_epochs) >= 8 or dup_count >= 5:
+            user_spam_ignore_until[spam_key] = now_msg_ts + 15.0
+            is_spam_warning = True
+            logger.info(f"[TEXT ANTI-SPAM] {message.author.display_name} triggered anti-spam callout in #{getattr(message.channel, 'name', ch_id)}")
+
     is_currently_stepped_back = time.time() < channel_stepped_back_until.get(ch_id, 0.0)
     is_implicit_wakeup = detect_implicit_wakeup_or_checkin(
         content=message.content,
         is_stepped_back=is_currently_stepped_back,
         seconds_since_bot_spoke=seconds_since_bot_spoke,
     )
+
+    is_active_or_direct = (
+        bot_mentioned
+        or is_implicit_wakeup
+        or last_message_from_bot
+        or (bot_in_last_5_messages and seconds_since_bot_spoke <= 600.0)
+    )
+    is_hush_request = detect_hush_command(message.content, is_active_or_direct)
+
+    existing_task = active_generation_tasks.get(ch_id)
+    if existing_task and not existing_task.done():
+        if is_hush_request:
+            existing_task.cancel()
+            logger.info(f"[HUSH] Cancelled in-flight task in #{getattr(message.channel, 'name', ch_id)} due to hush command.")
 
     target_member_to_engage = detect_target_member_to_engage(
         content=clean_text,

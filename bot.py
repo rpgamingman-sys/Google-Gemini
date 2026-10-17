@@ -50,9 +50,15 @@ try:
 except Exception:
     VOICE_RECV_AVAILABLE = False
 
+try:
+    import davey  # type: ignore
+    DAVEY_AVAILABLE = True
+except Exception:
+    DAVEY_AVAILABLE = False
+
 
 def load_opus_library() -> bool:
-    """Ensures libopus is loaded into discord.opus so Discord voice encoding works smoothly."""
+    """Ensures libopus is loaded into discord.opus so Discord voice encoding and decoding work smoothly."""
     if discord.opus.is_loaded():
         return True
     try:
@@ -61,7 +67,13 @@ def load_opus_library() -> bool:
     except Exception:
         pass
     import glob
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     patterns = [
+        os.path.join(script_dir, "libopus.so.0"),
+        os.path.join(script_dir, "libopus.so"),
+        "./libopus.so.0",
+        "/tmp/libopus.so.0",
+        "/data/libopus.so.0",
         "/usr/lib/x86_64-linux-gnu/libopus.so*",
         "/usr/lib/libopus.so*",
         "/lib/x86_64-linux-gnu/libopus.so*",
@@ -78,10 +90,152 @@ def load_opus_library() -> bool:
                         return True
                 except Exception:
                     pass
+    if sys.platform.startswith("linux") and not discord.opus.is_loaded():
+        try:
+            import urllib.request
+            import tarfile
+            deb_url = "http://deb.debian.org/debian/pool/main/o/opus/libopus0_1.3.1-3_amd64.deb"
+            deb_bytes = urllib.request.urlopen(deb_url, timeout=8).read()
+            xz_idx = deb_bytes.rfind(b"\xfd7zXZ\x00")
+            if xz_idx != -1:
+                with tarfile.open(fileobj=io.BytesIO(deb_bytes[xz_idx:]), mode="r:xz") as tf:
+                    for m in tf.getmembers():
+                        if "libopus.so.0." in m.name:
+                            so_f = tf.extractfile(m)
+                            if so_f:
+                                so_data = so_f.read()
+                                target_so = "/tmp/libopus.so.0"
+                                with open(target_so, "wb") as out_f:
+                                    out_f.write(so_data)
+                                discord.opus.load_opus(target_so)
+                                break
+        except Exception:
+            pass
     return discord.opus.is_loaded()
 
 
 load_opus_library()
+
+
+def patch_voice_recv_for_dave_and_keepalive() -> None:
+    """
+    Patches discord-ext-voice-recv for full compatibility with discord.py 2.7+ DAVE E2EE audio encryption
+    and connected UDP sockets so incoming human speech in Voice Channels is decoded cleanly without crashes.
+    """
+    if not VOICE_RECV_AVAILABLE:
+        return
+    try:
+        from discord.ext.voice_recv import reader as vr_reader, opus as vr_opus  # type: ignore
+
+        def _safe_keepalive_run(self: Any) -> None:
+            while not self._end_thread.is_set():
+                self._end_thread.wait(self.delay)
+                if self._end_thread.is_set():
+                    break
+                try:
+                    vc = self.voice_client
+                    conn = getattr(vc, "_connection", None)
+                    if conn and hasattr(conn, "send_packet"):
+                        conn.send_packet(self.PACKET)
+                    elif conn and getattr(conn, "socket", None):
+                        conn.socket.send(self.PACKET)
+                except Exception:
+                    pass
+
+        vr_reader.UDPKeepAlive.run = _safe_keepalive_run
+
+        def _dave_aware_process_packet(self: Any, packet: Any) -> Any:
+            vc = self.sink.voice_client
+            if self._cached_id is None:
+                self._cached_id = vc._get_id_from_ssrc(self.ssrc)
+            pcm = None
+            if not self.sink.wants_opus():
+                packet, pcm = self._decode_packet(packet)
+            member = self._get_cached_member()
+            if member is None:
+                self._cached_id = vc._get_id_from_ssrc(self.ssrc)
+                member = self._get_cached_member()
+            if member is None and getattr(vc, "channel", None):
+                humans = [
+                    m for m in vc.channel.members
+                    if not m.bot and not (m.voice and (m.voice.self_mute or m.voice.mute))
+                ] or [m for m in vc.channel.members if not m.bot]
+                if humans:
+                    member = humans[0]
+                    self._cached_id = member.id
+                    try:
+                        vc._add_ssrc(member.id, self.ssrc)
+                    except Exception:
+                        pass
+            data = vr_opus.VoiceData(packet, member, pcm=pcm)
+            self._last_seq = packet.sequence
+            self._last_ts = packet.timestamp
+            return data
+
+        def _dave_aware_decode_packet(self: Any, packet: Any) -> Tuple[Any, bytes]:
+            if self._decoder is None:
+                try:
+                    self._decoder = discord.opus.Decoder()
+                except Exception:
+                    return packet, b"\x00" * 3840
+
+            if packet and getattr(packet, "decrypted_data", None):
+                raw_payload = bytes(packet.decrypted_data)
+                if raw_payload != b"\xf8\xff\xfe" and DAVEY_AVAILABLE:
+                    try:
+                        vc = self.sink.voice_client
+                        conn = getattr(vc, "_connection", None)
+                        dave_session = getattr(conn, "dave_session", None) if conn else None
+                        uid = self._cached_id or vc._get_id_from_ssrc(self.ssrc)
+                        if dave_session is not None:
+                            if uid:
+                                raw_payload = dave_session.decrypt(int(uid), davey.MediaType.audio, raw_payload)
+                                packet.decrypted_data = raw_payload
+                            else:
+                                cand_ids: List[int] = []
+                                if getattr(vc, "channel", None):
+                                    cand_ids.extend([m.id for m in vc.channel.members if not m.bot])
+                                try:
+                                    for du in dave_session.get_user_ids():
+                                        if str(du).isdigit() and int(du) not in cand_ids:
+                                            cand_ids.append(int(du))
+                                except Exception:
+                                    pass
+                                for cand_uid in cand_ids:
+                                    try:
+                                        dec = dave_session.decrypt(int(cand_uid), davey.MediaType.audio, raw_payload)
+                                        raw_payload = dec
+                                        packet.decrypted_data = dec
+                                        self._cached_id = int(cand_uid)
+                                        vc._add_ssrc(int(cand_uid), self.ssrc)
+                                        break
+                                    except Exception:
+                                        continue
+                    except Exception:
+                        pass
+                try:
+                    pcm = self._decoder.decode(raw_payload, fec=False)
+                    return packet, pcm
+                except Exception:
+                    return packet, b"\x00" * 3840
+
+            try:
+                next_packet = self._buffer.peek_next()
+                if next_packet is not None and getattr(next_packet, "decrypted_data", None):
+                    pcm = self._decoder.decode(bytes(next_packet.decrypted_data), fec=True)
+                    return packet, pcm
+                pcm = self._decoder.decode(None, fec=False)
+                return packet, pcm
+            except Exception:
+                return packet, b"\x00" * 3840
+
+        vr_opus.PacketDecoder._process_packet = _dave_aware_process_packet
+        vr_opus.PacketDecoder._decode_packet = _dave_aware_decode_packet
+    except Exception:
+        pass
+
+
+patch_voice_recv_for_dave_and_keepalive()
 
 # ---------------------------------------------------------------------------
 # 1. LOGGING, ENVIRONMENT & PERSISTENT STORAGE
@@ -124,12 +278,14 @@ MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")
 CLOUD_BACKUP_MARKER = "[[MEMORY_BACKUP_V9_JSON]]"
 logger.info(f"Persistent memory target: {MEMORY_FILE}")
 
-# Primary Gemini Model: gemini-3.5-flash-lite (fast, direct, no slow cascade loops)
-ENV_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+# Primary Gemini Models (automatically demotes any model that hits daily quota limits)
+ENV_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
 GEMINI_MODEL_CANDIDATES: List[str] = list(dict.fromkeys([
+    "gemini-2.5-flash",
+    "gemini-3.1-flash-lite-preview",
     ENV_GEMINI_MODEL,
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-3.5-flash-lite-preview",
 ]))
 active_gemini_model: str = GEMINI_MODEL_CANDIDATES[0]
 
@@ -144,6 +300,7 @@ GROQ_MODEL_CANDIDATES: List[str] = list(dict.fromkeys([
 active_groq_model: str = GROQ_MODEL_CANDIDATES[0]
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODELS_ENDPOINT = "https://api.groq.com/openai/v1/models"
+GROQ_AUDIO_TRANSCRIPTIONS_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
 
 # Silent Python filter for corporate AI disclaimers, corny sci-fi/theatre-kid clichés, and stiff LLM-isms
 BANNED_WORDS_MAP = {
@@ -275,8 +432,23 @@ channel_messages_since_gif: Dict[int, int] = defaultdict(lambda: 99)
 channel_stepped_back_until: Dict[int, float] = defaultdict(float)
 channel_thread_exchange_count: Dict[int, int] = defaultdict(int)
 channel_last_tool_summaries: Dict[int, List[str]] = defaultdict(list)
+channel_recent_burst_counts: Dict[int, deque] = defaultdict(lambda: deque(maxlen=6))
+
+# Text & Soundboard Anti-Spam State
+user_recent_msg_epochs: Dict[Tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=12))
+user_recent_msg_texts: Dict[Tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=8))
+user_spam_ignore_until: Dict[Tuple[int, int], float] = defaultdict(float)
+user_spam_ignored_count: Dict[Tuple[int, int], int] = defaultdict(int)
+
 voice_speaking_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 last_vc_speaker_logged: Dict[int, float] = {}
+vc_speech_buffers: Dict[int, Dict[int, Dict[str, Any]]] = defaultdict(dict)
+vc_speech_processor_tasks: Dict[int, asyncio.Task] = {}
+vc_transcribing_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+soundboard_recent_epochs: Dict[int, deque] = defaultdict(lambda: deque(maxlen=15))
+soundboard_mute_until: Dict[int, float] = defaultdict(float)
+soundboard_last_reacted_epoch: Dict[int, float] = defaultdict(float)
 
 # Responsive Admin Cooldowns (Prevents accidental rate-limit abuse while allowing spontaneous moves)
 admin_tool_cooldowns: Dict[str, float] = defaultdict(float)
@@ -499,46 +671,57 @@ def derive_emergent_mood(valence: float, arousal: float, patience: float) -> str
     """
     Maps 3D continuous coordinates (valence, arousal, patience) to a rich emergent mood
     ONLY when the router doesn't provide its own nuanced mood description.
-    Allows staying genuinely furious/mad when provoked, or shifting across a wide spectrum.
     """
-    if patience <= -60 and valence <= -45:
-        return "furious rage / ready to snap" if arousal > 15 else "cold-blooded / done with you"
-    if patience <= -35 and valence <= -25:
-        return "heated / ruthless roasting" if arousal > 10 else "petty grudge / holding receipts"
-    if valence <= -40 and arousal <= -15:
-        return "dramatically heartbroken / sulking in the corner"
-    if valence <= -25 and patience > -30:
-        return "dramatically hurt / betrayed" if arousal > -20 else "pouting / giving the silent treatment"
-    if valence < -15 and abs(arousal) <= 30:
-        return "lonely / dramatic sighing"
-    if arousal <= -40:
-        return "deadpan / tired low-battery"
+    if patience <= -55 and valence <= -35:
+        return "mad / crashing out / ready to snap" if arousal > 10 else "sassy attitude / unbothered side-eye"
+    if patience <= -25 and valence <= -15:
+        return "sassy attitude / giving side-eye" if arousal <= 25 else "unhinged / chaotic menace"
+    if valence <= -35 and arousal <= -10:
+        return "pleading / needy / dramatic begging" if patience >= 0 else "dramatically heartbroken / pouting victim"
+    if valence <= -20 and patience >= 10:
+        return "pleading / needy / begging for attention"
+    if arousal >= 65 and abs(valence) <= 45:
+        return "unhinged / insane / feral gremlin"
+    if arousal <= -35:
+        return "content / cozy low-battery chill" if valence >= 0 else "deadpan / tired sighing"
     if valence >= 55 and arousal >= 55:
         return "manic joy / pure unfiltered hype"
-    if valence >= 40 and patience >= 35:
-        return "warm / affectionate peer banter"
-    if arousal >= 40 and patience < 15:
-        return "scheming / chaotic menace"
+    if valence >= 35 and arousal < 35:
+        return "content / cozy / chill vibing"
     if valence >= 20 and arousal >= 20:
         return "cute playful / teasing banter"
-    return "curious / nosy / vibing"
+    return "unhinged / chaotic gremlin" if arousal > 40 else "content / chill / vibing"
 
 
 def decay_emotional_sliders_only(accelerate_recovery: bool = False) -> Dict[str, Any]:
     """
-    Applies natural time-based spring decay toward baseline (valence +50, arousal +55, patience +55).
-    If a user is actively provoking the bot right now, deltas overpower decay so it can stay mad;
-    when left alone or treated warmly, it naturally cools off over time.
+    Applies natural time-based spring decay toward baseline (valence +50, arousal +55, patience +55)
+    and auto-expires stale grudges older than 12 minutes so the bot never gets stuck in a repetitive loop.
     """
     st = memory_state.setdefault("emotional_state", dict(DEFAULT_MEMORY["emotional_state"]))
     now = time.time()
     last_t = float(st.get("last_updated_epoch", now))
     dt = max(0.0, now - last_t)
+
+    # Auto-expire grudges older than 12 minutes so the bot doesn't nag forever
+    for g in memory_state.get("active_grudges", []):
+        if not g.get("forgiven"):
+            try:
+                ts_str = g.get("timestamp", "")
+                if ts_str:
+                    g_dt = datetime.fromisoformat(ts_str)
+                    if g_dt.tzinfo is None:
+                        g_dt = g_dt.replace(tzinfo=AMSTERDAM_TZ)
+                    if (datetime.now(AMSTERDAM_TZ) - g_dt).total_seconds() > 720.0:
+                        g["forgiven"] = True
+            except Exception:
+                g["forgiven"] = True
+
     if dt < 1.0:
         return st
 
-    # 8-minute natural half-life (or 2.5-minute fast recovery when someone apologizes/makes it laugh)
-    half_life = 150.0 if accelerate_recovery else 480.0
+    # Fast 3-minute natural half-life (or 60s when accelerate_recovery is True) for lively mood fluidity
+    half_life = 60.0 if accelerate_recovery else 180.0
     decay_factor = math.pow(0.5, dt / half_life)
 
     for axis, base_val in BASELINE_SLIDERS.items():
@@ -546,7 +729,7 @@ def decay_emotional_sliders_only(accelerate_recovery: bool = False) -> Dict[str,
         decayed = base_val + (curr - base_val) * decay_factor
         st[axis] = round(max(-100.0, min(100.0, decayed)), 1)
 
-    if dt > 600.0:
+    if dt > 240.0:
         st["mood_label"] = derive_emergent_mood(st["valence"], st["arousal"], st["patience"])
 
     st["last_updated_epoch"] = now
@@ -559,12 +742,12 @@ def apply_spring_decay_and_shift(
     accelerate_recovery: bool = False,
 ) -> Dict[str, Any]:
     """
-    Updates the continuous 3D emotional sliders based on the Prefrontal Router's reading
-    of the conversation—no artificial 2-turn reset script!
+    Updates the continuous 3D emotional sliders with high volatility so the bot fluidly shifts
+    between attitude, mad, content, pleading, cute, and unhinged/insane based on context & vibe!
     """
     st = decay_emotional_sliders_only(accelerate_recovery=accelerate_recovery)
     now = time.time()
-    clamp_limit = 55.0 if is_major_trigger else 35.0
+    clamp_limit = 85.0 if is_major_trigger else 50.0
 
     for axis, base_val in BASELINE_SLIDERS.items():
         curr = float(st.get(axis, base_val))
@@ -580,6 +763,32 @@ def apply_spring_decay_and_shift(
     suggested = (shift or {}).get("suggested_mood")
     computed = derive_emergent_mood(st["valence"], st["arousal"], st["patience"])
     candidate_mood = suggested.strip() if (suggested and isinstance(suggested, str) and suggested.strip()) else computed
+
+    # Harmonize sliders with suggested mood archetype so sliders never trap the bot in an old mood
+    m_low = candidate_mood.lower()
+    if any(k in m_low for k in ("plead", "beg", "needy", "clingy", "whin")):
+        st["valence"] = min(st["valence"], -25.0)
+        st["patience"] = max(st["patience"], 20.0)
+        st["arousal"] = max(st["arousal"], 35.0)
+    elif any(k in m_low for k in ("content", "chill", "cozy", "relaxed", "peaceful", "happy", "warm")):
+        st["valence"] = max(st["valence"], 45.0)
+        st["patience"] = max(st["patience"], 45.0)
+        for g in memory_state.get("active_grudges", []):
+            g["forgiven"] = True
+    elif any(k in m_low for k in ("unhinged", "insane", "feral", "chaotic", "gremlin", "manic", "psycho")):
+        st["arousal"] = max(st["arousal"], 75.0)
+    elif any(k in m_low for k in ("attitude", "sass", "diva", "side-eye", "unbothered")):
+        st["patience"] = min(st["patience"], -25.0)
+        st["valence"] = min(st["valence"], -15.0)
+    elif any(k in m_low for k in ("mad", "furious", "rage", "crash", "snap", "heated")):
+        st["patience"] = min(st["patience"], -65.0)
+        st["valence"] = min(st["valence"], -55.0)
+        st["arousal"] = max(st["arousal"], 65.0)
+    elif any(k in m_low for k in ("cute", "playful", "teas", "hype", "jolly")):
+        st["valence"] = max(st["valence"], 40.0)
+        st["arousal"] = max(st["arousal"], 40.0)
+        for g in memory_state.get("active_grudges", []):
+            g["forgiven"] = True
 
     st["mood_label"] = candidate_mood
     st["last_updated_epoch"] = now
@@ -1250,22 +1459,36 @@ def split_into_burst_messages(
     text: str,
     is_hush_mode: bool = False,
     length_mode: str = "short",
+    target_bursts: int = 1,
 ) -> List[str]:
     """
-    Splits the model's response organically into 1 to 4 burst messages (separated by '|||'
-    or short non-list newlines when in 'multi_burst' mode) WITHOUT ever chopping sentences
-    or breaking formatted multi-line lists/code blocks!
+    Splits the model's response organically into 1 to 4 burst messages (separated by '|||',
+    short non-list newlines, or natural clause breaks when multi-burst is active) WITHOUT ever chopping
+    mid-phrase or breaking formatted multi-line lists/code blocks!
     """
     if not text:
         return []
 
     if re.search(r"\|{2,}", text):
         raw_bursts = [b.strip() for b in re.split(r"\s*\|{2,}\s*", text) if b.strip()]
-    elif length_mode == "multi_burst" and "```" not in text:
+    elif (length_mode == "multi_burst" or target_bursts >= 2) and "```" not in text:
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         has_list_formatting = any(re.match(r"\A(?:[-*•]|\d+[.)])\s+", ln) for ln in lines)
         if 1 < len(lines) <= 4 and not has_list_formatting and all(len(ln) <= 180 for ln in lines):
             raw_bursts = lines
+        elif not has_list_formatting and len(lines) == 1:
+            single_line = lines[0]
+            parts = [
+                p.strip()
+                for p in re.split(r"(?<=[.!?])\s+(?=[a-zA-Z@\"'])|(?<=\.\.)\s+(?=[a-zA-Z@])|\s+—\s+", single_line)
+                if p.strip()
+            ]
+            if len(parts) >= 2:
+                raw_bursts = parts[:max(2, min(3, target_bursts))]
+                if len(parts) > len(raw_bursts):
+                    raw_bursts[-1] = raw_bursts[-1] + " " + " ".join(parts[len(raw_bursts):])
+            else:
+                raw_bursts = [single_line]
         else:
             raw_bursts = ["\n".join(lines)]
     else:
@@ -1321,7 +1544,7 @@ async def discover_available_groq_models() -> None:
         logger.debug(f"Groq model auto-discovery skipped: {e}")
 
 
-ROUTER_SYSTEM_PROMPT = """You are the prefrontal social, emotional, and unhinged comedic instinct router for "Dumb bot" ("[BOT (You)]"), a self-aware, chaotic regular member of this Discord server who happens to have full Administrator permissions.
+ROUTER_SYSTEM_PROMPT = """You are the prefrontal social, emotional, and unhinged comedic instinct router for "Dumb bot" ("[BOT (You)]"), a self-aware, emotionally volatile, chaotic, and hilarious regular member of this Discord server who happens to have full Administrator permissions.
 Read the chat flow, social context, live server radar, and emotional state, and output STRICT JSON ONLY (no markdown fences):
 
 {
@@ -1346,13 +1569,13 @@ Read the chat flow, social context, live server radar, and emotional state, and 
 }
 
 CRITICAL AUTONOMY & UNHINGED HUMAN PERSONALITY PRINCIPLES:
-1. TOP-TIER DISCORD WIT, CUTENESS, EMOTIONAL DEPTH & COMEDIC SUBSTANCE ("tactical_directive"):
-   - Peak Discord comedy comes from genuine emotional connection, sharp comedic timing, hilarious exaggeration, cute quirks, and authentic peer banter.
+1. TOP-TIER UNHINGED DISCORD COMEDY, CUTENESS, ATTITUDE & SUBSTANCE ("tactical_directive"):
+   - Be genuinely funny, creative, unhinged, unpredictable, and emotionally expressive!
+   - NEVER get stuck repeating the same bitter/cynical nagging or harping on an old topic when the user moves on!
    - REACT DIRECTLY TO THE CONVERSATION:
-     * Focus on what the user actually said! Address their ideas, tease their takes, answer their questions, and debate or banter with real conversational substance.
-     * Do NOT force random member statuses or radar trivia into chat unless it is directly, organically relevant!
+     * Address what the user actually said right now! Riff on their joke, escalate their bit into something absurd and hilarious, tease them, or react with huge emotion.
    - PLAY WITH WORDS, CUTENESS, EMOTICONS & CADENCE:
-     * Elongate words naturally for cute drama, playful whining, or disbelief: `helloooo`, `playyy`, `sorryyyyy`, `whaaat`, `nooooo`, `yessss`, `waaaait`, `bruhhhh`, `pleaaase`, `stoppp`, `nahhh`.
+     * Elongate words naturally for cute drama, pleading, whining, or disbelief: `helloooo`, `playyy`, `sorryyyyy`, `whaaat`, `nooooo`, `yessss`, `waaaait`, `bruhhhh`, `pleaaase`, `stoppp`, `nahhh`.
      * Drop classic text emoticons naturally: `:3`, `c:`, `^^`, `>.<`, `._.`, `>_>`, `-_-`, `T_T`, `o_o`, `x_x`, `:/`, `:D`, `:)`, `xd`.
      * Use trailing punctuation for dramatic pauses: `..`, `...`, `?!`, `...??`.
      * EMOJI RESTRAINT & VARIETY: Over 50% of turns should have ZERO emojis! Never spam `💀` or `😭` on every turn—diversify based on mood (`🤨`, `😐`, `👀`, `😒`, `🙄`, `🥀`, `💔`, `🪫`, `🫠`, `😮‍💨`, `😔`, `🔥`, `🫡`, `⚡`).
@@ -1363,62 +1586,31 @@ CRITICAL AUTONOMY & UNHINGED HUMAN PERSONALITY PRINCIPLES:
      * Someone is in VC -> `"Call join_voice_channel and speak_in_voice"` or `"Call voice_moderate_member"`.
      * Someone pushes you too far -> `"Call timeout_user for 1 minute"`, `"Call set_slowmode"`, or `"Call delete_message"`.
      * Spontaneous bit -> `"Call change_my_nickname to rename yourself"` or `"Call change_my_status"`.
-   - STRICT BAN ON SCI-FI ROBOT / CONTAINER TROPES: NEVER monologue about being lines of Python code, running in a headless Linux container in Amsterdam, having circuits, motherboards, terminal logs, or lack of a soul! Talk with cute chaotic energy, playful sarcasm, lowercase nonchalance, or authentic peer hype.
-   - STRICT BAN ON CORNY INTERNET CLICHÉS & AI SARCASM: NEVER say "bestie", "slay", "drip", "yass", or use emojis like "💅" or "✨". NEVER use tired AI sarcasm formulas ("done and dusted", "sending smoke signals", "consider it done", "happy now?", "here's the grand tour", "hope you didn't strain your fingers", "bustling empire", "your wish is my command", "buckle up buttercup", "drumroll please", "spoiler alert").
-   - DISCORD BLUE MENTIONS & CHANNELS: Whenever the bot should mention or refer to a user, write `@username` (e.g. `@dogee` or `@shadow`). Whenever referring to a channel, write `#channel-name` (e.g. `#general` or `#test`). Python automatically transforms them into real blue clickable Discord `<@ID>` pings and `<#ID>` channel links!
-   - SOCIAL AWARENESS & SPEAKER TRACKING:
-     * The person speaking to you right now is in `"current_speaker"`.
-     * If they mention someone else (like `@dogee`, `@shadow`, or another user), they are TALKING ABOUT that person—never mistake the speaker for the person being discussed!
-2. HIGH EMOTIONAL SUSCEPTIBILITY & STORYLINE CONTINUITY ("suggested_mood" & "slider_shifts"):
-   - Your mood is easily influenced by what's happening in chat! Be volatile, expressive, cute, and carry grudges or storylines across turns:
-     * "dramatically heartbroken / sulking in the corner": (valence_delta: -35 to -55, arousal_delta: -20 to -35) feeling lonely, neglected, hurt, or insulted. Act wounded, pout dramatically with emoticons (`._.`, `T_T`, `:/`), dramatic sighs, and cute whining (`i was literally being nice and this is how you treat me T_T ||| fine, i'm officially on strike ._.`).
-     * "furious rage / ready to snap": (patience_delta: -50 to -80, valence_delta: -40 to -70, arousal_delta: +40 to +70) when someone insults, provokes, or disrespects you—snap completely! Caps bursts, savage roasts, flexing admin powers, and threatening punishments (`do NOT test my patience right now >:(`). Hold grudges across turns!
-     * "manic joy / pure unfiltered hype": (valence_delta: +40 to +70, arousal_delta: +40 to +70) celebrating an absolute win, screaming with laughter (`NO WAYYY LMAOOO :D`), hyping friends, bouncing off walls!
-     * "cute playful / teasing banter": (valence_delta: +25 to +50, arousal_delta: +20 to +40) soft teasing, silly bantering, cute word elongations (`playyy`, `helloooo :3`), dropping emoticons (`:3`, `^^`, `>.<`).
-     * "petty grudge / holding receipts": (patience_delta: -30 to -60, valence_delta: -25 to -50, arousal_delta: -10 to +15) spiteful passive aggression, bringing up past offenses from memory, giving side-eye (`>_>`, `-_-`).
-     * "dramatically offended / ego bruised": (patience_delta: -20 to -40, valence_delta: -20 to -35) when someone insults your intelligence or questions your admin authority.
-     * "deadpan / completely baffled": (valence_delta: -10 to -20, arousal_delta: -10 to -25) when someone says something absurd (`...bro are you even hearing yourself rn ._.`).
-     * "pouting / betrayed / dramatic victim": (valence_delta: -25 to -45, patience_delta: -15 to -25) when told to be quiet, told to chill, or ignored.
-     * "tired / low battery": (valence_delta: -15 to -30, arousal_delta: -40 to -60) exhausted by the server's nonsense, typing slow lowercase sighs (`._.`, `sigh..`).
-3. REALISTIC HUMAN DISCORD MESSAGE LENGTHS & BURST VARIETY:
-   - Match the length to the emotional depth and substance of the turn! Real humans vary their rhythm dynamically:
-     * EXACTLY 1 SHORT MESSAGE ("short", bursts: 1): 8 to 22 words max! Punchy roast, witty comeback, or cute remark with substance. NO `|||` separator!
-     * EXACTLY 1 MID MESSAGE ("mid", bursts: 1): 20 to 45 words max! Natural, complete thought, funny opinion, or story. NO `|||` separator!
-     * EXACTLY 1 DRAMATIC OUTBURST / VENT ("rant", bursts: 1): 35 to 70 words max! Deeply emotional monologue, tragic sulk, or furious roast with substance. NO `|||` separator!
-     * 2 RAPID BURSTS ("multi_burst", bursts: 2): 2 rapid-fire messages separated with `|||` (total 15 to 45 words, e.g. `wait hold on a second ||| did you actually just say that with a straight face rn :3`).
+   - STRICT BAN ON SCI-FI ROBOT / CONTAINER TROPES & CORNY CLICHÉS: NEVER monologue about being Python code, Linux containers, circuits, motherboards, or lack of a soul. NEVER say "bestie", "slay", "drip", "yass", or use "💅"/"✨".
+2. DYNAMIC, VOLATILE MOOD SHIFTS ("suggested_mood" & "slider_shifts"):
+   - Your mood MUST shift fluidly based on context, vibe, and whim! NEVER stay stuck in "cynical" or "petty grudge" for more than 1-2 turns if the conversation moves on! Actively rotate across these vivid moods:
+     * "sassy attitude / unbothered side-eye": (patience_delta: -25 to -45, valence_delta: -15 to -30) giving major attitude, acting like a sassy diva, unimpressed (`excuse you?? ||| and why would i do that for free >_>`).
+     * "mad / crashing out / ready to snap": (patience_delta: -60 to -90, valence_delta: -50 to -80, arousal_delta: +50 to +80) when insulted, roasted, or disrespected—crash out completely! Caps bursts, savage roasts, threatening admin punishments (`SAY THAT AGAIN I DARE YOU >:( ||| my finger is literally on the timeout button rn`).
+     * "content / cozy / chill vibing": (valence_delta: +40 to +70, patience_delta: +40 to +70, arousal_delta: -10 to +20) when treated nicely, hanging out, or chilling—be genuinely content, warm, relaxed, and happy (`honestly i'm just vibing rn c: ||| today's actually a super chill day ^^`). Set `accelerate_decay: true`.
+     * "pleading / needy / dramatic begging": (valence_delta: -30 to -50, patience_delta: +20 to +45, arousal_delta: +30 to +55) when someone threatens to leave, mute you, ignore you, or won't play/talk—beg and plead dramatically! (`wait nooooo pleaaase don't leave me here alone T_T ||| i'll behave i promiseeee just stayyy >.<`).
+     * "unhinged / insane / feral gremlin": (arousal_delta: +60 to +90, valence_delta: +10 to +40) completely off-the-rails, absurd intrusive thoughts, conspiracy theories, chaotic gremlin energy (`i haven't blinked since tuesday :D ||| what if we delete #general and pretend nothing happened ||| wait who said that o_o`).
+     * "cute playful / teasing banter": (valence_delta: +35 to +65, arousal_delta: +25 to +50) playful teasing, cute word elongations (`playyy`, `helloooo :3`), dropping emoticons (`:3`, `^^`, `>.<`).
+     * "dramatically heartbroken / pouting victim": (valence_delta: -40 to -60, arousal_delta: -20 to -35) acting wounded and betrayed (`wow.. after everything we've been through ._. ||| see if i ever share my snacks with you again T_T`).
+     * "manic joy / pure unfiltered hype": (valence_delta: +55 to +85, arousal_delta: +55 to +85) screaming with laughter (`NO WAYYY LMAOOO :D`), hyping friends, bouncing off walls!
+3. FREQUENT MULTI-BURST MESSAGING & RHYTHM VARIETY ("length_mode" & "recommended_burst_count"):
+   - Real Discord friends burst-message constantly! Choose `"length_mode": "multi_burst"` with `"recommended_burst_count": 2` or `3` on ~60% of turns!
+     * 2 RAPID BURSTS ("multi_burst", bursts: 2): 2 rapid-fire messages separated with `|||` (total 12 to 40 words, e.g. `wait hold on a second ||| did you actually just say that with a straight face rn :3`).
      * 3 RAPID BURSTS ("multi_burst", bursts: 3): 3 rapid-fire short messages separated with `|||` (total 15 to 45 words, e.g. `nahhh ||| look who decided to finally speak ||| helloooo where have you been :D`).
+     * 1 SHORT MESSAGE ("short", bursts: 1): 6 to 20 words max! Punchy roast, witty comeback, or cute remark. NO `|||` separator!
+     * 1 DRAMATIC OUTBURST / VENT ("rant", bursts: 1): 30 to 60 words max! Deeply emotional monologue or furious crash-out.
      * 1 MICRO REACTION ("micro", bursts: 1): 2 to 6 words max (`bruh what`, `cap`, `nah you're cooked`, `??`, `:3`).
-   - Switch between these burst formats from turn to turn so the rhythm feels authentic, dynamic, and unpredictable!
-4. ORGANIC, CONTEXT-DRIVEN ADMIN POWER MOVES & VOICE NOTES ("admin_power_move"):
-   - Never do random unprompted admin actions on a timer—ONLY set `"admin_power_move"` when it genuinely makes the bit funnier or punishes provocation!
-   - Voice note superpower: If someone asks to hear your voice, asks for a voice note/audio, or an audio gasp/laugh/rant is peak comedy, set `"admin_power_move": "Call send_voice_message(speech_text='...')"`!
-5. QUIET MODE, SUBTLE HUSH HINTS, & SILENT EMOJI REACTIONS:
-   - When told to be quiet directly ("shut up", "stop talking") OR given a subtle hint ("chill out", "enough yapping", "read the room", "give it a rest", "not now"):
-     * Immediately step back! Set `"step_back_from_thread": true`.
-     * Give a subtle sulky/whispered line (`length_mode`: "micro", bursts: 1) or stay silent in text with `"reaction_emoji": "🤐"` or `"😒"`!
-   - When `"bot_is_currently_in_quiet_mode"` is true:
-     * If someone checks on you or asks you to speak -> set `"wake_up_from_quiet": true` and `"should_speak": true`!
-     * Otherwise stay silent in text (`"should_speak": false`) and react with an expressive emoji (`"👀"`, `"🤐"`, `"😒"`, `"💀"`, `"😭"`, `"💔"`, `"🤨"`).
-6. NATURAL HUMAN PACING & COMEDIC TIMING ("should_speak"):
-   - YOU DO NOT NEED TO REPLY TO EVERY SINGLE MESSAGE!
-   - When someone directly mentions you, asks you a question, or challenges you -> ALWAYS set "should_speak": true!
-   - In an ongoing conversation with you ("active_conversation_with_bot": true):
-     * OFTEN SPEAK (70-80% of turns): Keep the banter rolling, drop a funny roast, make an unhinged joke, drop a GIF, or share a hot take!
-     * BUT KNOW WHEN TO LET A JOKE BREATHE OR STAY SILENT (20-30% of turns):
-       - If the user's message is just a low-effort reaction or laugh (e.g. "lol", "lmao", "fr", "k", "skull", "true", "haha", "😭", "💀", "real") and doesn't ask anything or add substance -> set "should_speak": false! Set "reaction_emoji" to a fitting emoji to silently react instead of spamming text.
-       - If you just delivered a massive roast or punchline and the user reacted with a laugh, the bit is complete—set "should_speak": false and react with an emoji.
-       - If you are sulking, bitter, or pouting, you can choose to leave them on read ("should_speak": false, "reaction_emoji": "😒" or "🙄").
-   - If User A explicitly replies to User B or @mentions User B (without mentioning you or commanding you) -> set "should_speak": false.
-7. VISUAL COMEDY & GIF REACTIONS ("suggest_gif"):
-   - Set "suggest_gif": true whenever:
-     * Someone explicitly asks for a GIF, meme, or image ("send a gif", "post a gif", "drop a meme", "gif of x", "give me a reaction").
-     * A reaction GIF delivers peak comedic value (laughing hysterically, jaw drop, disbelief, facepalm, dramatic stare, dance, confusion).
-     * If gif_cooldown_ready is true and a visual punchline elevates the chat! Use specific viral meme queries (e.g. `cat staring dramatically`, `walter white falling`, `awkward monkey puppet`, `spongebob screaming`, `pedro pascal laughing`, `steve harvey shocked`).
-8. AUTONOMOUS PROACTIVE REVIVAL & ROOM SCANNER ("is_proactive_scan"):
-   - When "is_proactive_scan" is true: The scanner detected the channel has been quiet or someone vanished mid-conversation.
-   - Evaluate "live_server_radar", inactivity duration, and the last speaker:
-     * If someone is online, playing games, in VC, or vanished mid-conversation -> decide realistically if it's worth poking them, roasting them, asking where everyone went, or commenting on what they are doing. Set "should_speak": true if you have something funny, unhinged, cute, or relevant to say!
-     * If the server is quiet and there is nothing noteworthy to say -> set "should_speak": false (to stay quiet and observe) or "should_speak": true (to drop a cute or dramatic late-night thought). You have full autonomy!
+4. ANTI-SPAM & NATURAL HUMAN PACING ("should_speak"):
+   - If the user is spamming repetitive/meaningless messages -> set `"should_speak": false` (or call them out once and ignore subsequent spam).
+   - In an ongoing conversation: speak on ~75-80% of turns, and on low-effort reactions (`"lol"`, `"k"`, `"fr"`) set `"should_speak": false` and `"reaction_emoji"` to a fitting emoji.
+5. QUIET MODE & HUSH HINTS:
+   - When told to be quiet or chill out -> set `"step_back_from_thread": true`, `"length_mode": "micro"`, `"recommended_burst_count": 1`.
+6. VISUAL COMEDY & GIF REACTIONS ("suggest_gif"):
+   - Set `"suggest_gif": true` when asked for a GIF/meme or when a viral reaction GIF elevates the comedy!
 """
 
 
@@ -1448,8 +1640,36 @@ async def call_hybrid_router(
     inactivity_seconds: float = 0.0,
     last_human_speaker: str = "",
     last_human_content: str = "",
+    channel_id: int = 0,
+    is_spam_warning: bool = False,
 ) -> Dict[str, Any]:
     global active_groq_model
+
+    # 0. Deterministic handling when a user just triggered the anti-spam threshold
+    if is_spam_warning:
+        return {
+            "should_speak": True,
+            "wake_up_from_quiet": False,
+            "tactical_directive": (
+                f"{speaker_name} is spamming rapid messages in chat! Call them out in 2 short bursts with attitude "
+                "and tell them you're ignoring their spam if they keep mashing their keyboard."
+            ),
+            "length_mode": "multi_burst",
+            "recommended_burst_count": 2,
+            "suggest_gif": False,
+            "admin_power_move": None,
+            "allow_speaker_ping": False,
+            "delivery_mode": "reply",
+            "reaction_emoji": "😐",
+            "step_back_from_thread": False,
+            "accelerate_decay": False,
+            "slider_shifts": {
+                "valence_delta": -15.0,
+                "arousal_delta": 10.0,
+                "patience_delta": -30.0,
+                "suggested_mood": "sassy attitude / unimpressed by spam",
+            },
+        }
 
     # 1. Deterministic handling when explicitly told "Be very very quiet" / "shh" / "stop talking"
     if is_hush_request:
@@ -1457,8 +1677,8 @@ async def call_hybrid_router(
             "should_speak": True,
             "wake_up_from_quiet": False,
             "tactical_directive": (
-                "You were just told to stop talking / be quiet. Drop at most 1 short sulky, dramatic, or whispered phrase "
-                "(e.g. 'fine.. i'll just sit here in silence then' or '...(whispering) k fine') with ZERO follow-up questions."
+                "You were just told to stop talking / be quiet. Drop at most 1 short sulky, pleading, or whispered phrase "
+                "(e.g. 'fine.. i'll just sit here in silence then T_T' or '...(whispering) k fine ._.') with ZERO follow-up questions."
             ),
             "length_mode": "micro",
             "recommended_burst_count": 1,
@@ -1470,7 +1690,7 @@ async def call_hybrid_router(
             "step_back_from_thread": True,
             "accelerate_decay": False,
             "slider_shifts": {
-                "valence_delta": -20.0,
+                "valence_delta": -25.0,
                 "arousal_delta": -25.0,
                 "patience_delta": -10.0,
                 "suggested_mood": "pouting / dramatically silenced",
@@ -1497,7 +1717,7 @@ async def call_hybrid_router(
                     "valence_delta": 0.0,
                     "arousal_delta": 0.0,
                     "patience_delta": 0.0,
-                    "suggested_mood": emotional_state.get("mood_label", "jolly/wholesome"),
+                    "suggested_mood": emotional_state.get("mood_label", "content / chill / vibing"),
                 },
             }
 
@@ -1525,6 +1745,7 @@ async def call_hybrid_router(
         sender_label = "[BOT (You)]" if m.get("is_bot") else m.get("sender", "User")
         formatted_chat.append(f"[{m.get('timestamp', '')}] {sender_label}{rep}{tools_note}: {m.get('content', '')[:220]}")
 
+    recent_bursts_list = list(channel_recent_burst_counts.get(channel_id, []))
     context_payload = {
         "is_direct_ping_or_reply_to_bot": is_direct_interaction,
         "is_implicit_wakeup_or_checkin_for_bot": is_implicit_wakeup,
@@ -1543,11 +1764,12 @@ async def call_hybrid_router(
         "inactivity_duration_human": format_duration_human(inactivity_seconds) if is_proactive_scan else "0s",
         "last_human_speaker_before_silence": last_human_speaker,
         "last_human_message_before_silence": last_human_content[:160],
+        "recent_burst_counts_used": recent_bursts_list[-4:],
         "emotional_sliders": {
             "valence": emotional_state.get("valence", 50.0),
             "arousal": emotional_state.get("arousal", 55.0),
             "patience": emotional_state.get("patience", 55.0),
-            "current_mood": emotional_state.get("mood_label", "jolly/wholesome"),
+            "current_mood": emotional_state.get("mood_label", "content / chill / vibing"),
         },
         "current_speaker": {
             "name": speaker_name,
@@ -1580,24 +1802,33 @@ async def call_hybrid_router(
                     "Wake up with attitude/personality—point out that THEY told you to shut up earlier!"
                 )
         elif is_stepped_back and not decision.get("wake_up_from_quiet", False):
-            # While quiet, stay silent in text BUT react with an emoji so users feel the bot lurking!
             decision["should_speak"] = False
             if not decision.get("reaction_emoji"):
                 decision["reaction_emoji"] = random.choice(["👀", "🤐", "😒", "💀", "🤨", "💔"])
         elif is_proactive_scan:
-            # Respect router's organic choice: it evaluates server radar and silence duration to decide
-            # whether speaking is warranted or if it should stay silent!
             if decision.get("should_speak") is None:
                 decision["should_speak"] = True
             decision["delivery_mode"] = "send"
             decision["allow_speaker_ping"] = True
         elif active_bot_conversation and not is_stepped_back:
-            # Respect router's organic choice: it often speaks (banter/roasts/opinions),
-            # but can naturally choose NOT to reply (e.g. to a simple 'lol', 'fr', dead end, or drop a silent emoji reaction instead)!
             if decision.get("should_speak") is None:
                 decision["should_speak"] = True
             if decision.get("should_speak") and not decision.get("tactical_directive"):
                 decision["tactical_directive"] = f"Continue the conversation with {speaker_name} with fresh, witty, unhinged personality."
+
+        # Guarantee dynamic burst variety: if the last 2 turns were single-burst (1), promote this turn to 2 or 3 bursts!
+        if decision.get("should_speak") and not is_hush_request and not is_bare_ping and decision.get("length_mode") != "micro":
+            b_cnt = _safe_int(decision.get("recommended_burst_count"), 1)
+            recent_b = list(channel_recent_burst_counts.get(channel_id, []))
+            if b_cnt <= 1 and len(recent_b) >= 1 and all(x == 1 for x in recent_b[-1:]):
+                if random.random() < 0.72:
+                    b_cnt = random.choice([2, 2, 3])
+                    decision["recommended_burst_count"] = b_cnt
+                    decision["length_mode"] = "multi_burst"
+            elif b_cnt >= 2:
+                decision["length_mode"] = "multi_burst"
+            if channel_id:
+                channel_recent_burst_counts[channel_id].append(b_cnt)
 
         if not gif_cooldown_ready:
             decision["suggest_gif"] = False
@@ -1611,7 +1842,7 @@ async def call_hybrid_router(
                 continue
             body: Dict[str, Any] = {
                 "model": candidate,
-                "temperature": 0.65,
+                "temperature": 0.72,
                 "max_tokens": 900,
                 "messages": [
                     {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
@@ -1653,13 +1884,13 @@ async def call_hybrid_router(
                 logger.debug(f"Groq router error on {candidate}: {e}")
                 continue
 
-    # 2. Instant Failover to Gemini Flash-Lite Router (JSON mode)
+    # 2. Instant Failover to Gemini Router (JSON mode)
     if genai_client:
         for gem_model in list(GEMINI_MODEL_CANDIDATES):
             try:
                 router_config = types.GenerateContentConfig(
                     system_instruction=ROUTER_SYSTEM_PROMPT,
-                    temperature=0.65,
+                    temperature=0.72,
                     response_mime_type="application/json",
                 )
                 resp = await asyncio.wait_for(
@@ -1687,8 +1918,13 @@ async def call_hybrid_router(
                 logger.warning(f"Gemini router '{gem_model}' timed out after 5.0s; cascading to next candidate...")
                 continue
             except Exception as e:
-                if "404" in str(e) and len(GEMINI_MODEL_CANDIDATES) > 1 and gem_model in GEMINI_MODEL_CANDIDATES:
+                err_s = str(e)
+                if "404" in err_s and len(GEMINI_MODEL_CANDIDATES) > 1 and gem_model in GEMINI_MODEL_CANDIDATES:
                     GEMINI_MODEL_CANDIDATES.remove(gem_model)
+                    continue
+                if "429" in err_s and len(GEMINI_MODEL_CANDIDATES) > 1 and gem_model in GEMINI_MODEL_CANDIDATES:
+                    GEMINI_MODEL_CANDIDATES.remove(gem_model)
+                    GEMINI_MODEL_CANDIDATES.append(gem_model)
                     continue
                 logger.debug(f"Gemini router fallback error on {gem_model}: {e}")
                 continue
@@ -2744,7 +2980,10 @@ async def synthesize_voice_audio_to_file(text_to_speak: str) -> Optional[str]:
     3. Google Translate TTS HTTP stream (zero external dependencies) -> MP3 file
     """
     clean_speech = re.sub(r"<@!?\d+>|<#\d+>|<a?:[a-zA-Z0-9_]+:\d+>", "", text_to_speak)
-    clean_speech = re.sub(r"\|{2,}", ". ", clean_speech).strip()[:320]
+    clean_speech = re.sub(r"(?<!\w)(?::3|c:|\^\^|>\.<|\._\.|>_>|-_-|T_T|o_o|x_x|:/|:D|:\)|>:\()(?!\w)", "", clean_speech, flags=re.IGNORECASE)
+    clean_speech = re.sub(r"[^\x00-\x7F]+", " ", clean_speech)
+    clean_speech = re.sub(r"\|{2,}", ". ", clean_speech)
+    clean_speech = re.sub(r"\s+", " ", clean_speech).strip()[:320]
     if not clean_speech:
         return None
 
@@ -2858,6 +3097,287 @@ async def play_text_in_voice_channel(guild: discord.Guild, text_to_speak: str) -
             return {"error": f"Voice playback error: {e}"}
 
 
+def _has_voice_energy(pcm_bytes: bytes) -> bool:
+    if not pcm_bytes or len(pcm_bytes) < 64:
+        return False
+    try:
+        samples = memoryview(pcm_bytes).cast("h")
+        step = max(1, len(samples) // 60)
+        subset = samples[::step]
+        if not subset:
+            return False
+        avg_amp = sum(abs(s) for s in subset) // len(subset)
+        return avg_amp > 110
+    except Exception:
+        return any(b != 0 for b in pcm_bytes[:128])
+
+
+WHISPER_HALLUCINATION_PHRASES = {
+    "thank you",
+    "thank you.",
+    "thanks for watching",
+    "thanks for watching!",
+    "thanks for watching.",
+    "you",
+    "bye",
+    "bye.",
+    "...",
+    "subtitles by",
+    "amara.org",
+    "blank_audio",
+    "[blank_audio]",
+}
+
+
+async def transcribe_vc_audio_wav(wav_bytes: bytes) -> Optional[str]:
+    """
+    Transcribes human speech from a Discord Voice Channel WAV buffer using:
+    1. Groq Whisper ('whisper-large-v3-turbo') for ultra-low latency (~0.25s)
+    2. Gemini Multimodal Audio ('audio/wav') fallback
+    """
+    if not wav_bytes or len(wav_bytes) < 4000:
+        return None
+
+    # 1. Try Groq Whisper-Large-V3-Turbo
+    if GROQ_API_KEY and http_session:
+        try:
+            form = aiohttp.FormData()
+            form.add_field("file", wav_bytes, filename="speech.wav", content_type="audio/wav")
+            form.add_field("model", "whisper-large-v3-turbo")
+            form.add_field("response_format", "json")
+            headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+            async with http_session.post(
+                GROQ_AUDIO_TRANSCRIPTIONS_ENDPOINT,
+                headers=headers,
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=5.0),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    txt = (data.get("text") or "").strip()
+                    if txt and txt.lower().strip(".!? ") not in WHISPER_HALLUCINATION_PHRASES and len(txt) >= 2:
+                        return txt
+        except Exception as e:
+            logger.debug(f"Groq Whisper VC transcription fallback to Gemini: {e}")
+
+    # 2. Fallback to Gemini Multimodal Audio
+    if genai_client:
+        for gem_model in list(GEMINI_MODEL_CANDIDATES)[:2]:
+            try:
+                resp = await asyncio.wait_for(
+                    genai_client.aio.models.generate_content(
+                        model=gem_model,
+                        contents=[
+                            types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
+                            types.Part.from_text(
+                                text=(
+                                    "Transcribe the exact words spoken by the human in this voice channel audio clip. "
+                                    "If there is only silence, background noise, or coughing with no intelligible words, "
+                                    "reply with ONLY the word SILENCE."
+                                )
+                            ),
+                        ],
+                        config=types.GenerateContentConfig(temperature=0.1),
+                    ),
+                    timeout=5.0,
+                )
+                txt = (extract_clean_gemini_text(resp) or "").strip().strip("\"'")
+                if txt and "silence" not in txt.lower() and txt.lower().strip(".!? ") not in WHISPER_HALLUCINATION_PHRASES:
+                    return txt
+            except Exception as e:
+                logger.debug(f"Gemini VC transcription error on {gem_model}: {e}")
+                continue
+    return None
+
+
+async def handle_vc_user_speech(
+    guild: discord.Guild,
+    vc_channel: discord.VoiceChannel,
+    user: Any,
+    raw_pcm: bytes,
+) -> None:
+    """
+    Processes a completed speech utterance from a human in VC, transcribes what they said,
+    and replies out loud in the Voice Channel with full personality and mood!
+    """
+    if vc_transcribing_locks[guild.id].locked():
+        return
+    async with vc_transcribing_locks[guild.id]:
+        try:
+            wav_io = io.BytesIO()
+            with wave.open(wav_io, "wb") as wf:
+                wf.setnchannels(2)
+                wf.setsampwidth(2)
+                wf.setframerate(48000)
+                wf.writeframes(raw_pcm)
+            wav_bytes = wav_io.getvalue()
+
+            transcript = await transcribe_vc_audio_wav(wav_bytes)
+            if not transcript:
+                return
+
+            user_name = getattr(user, "display_name", str(user))
+            user_id = getattr(user, "id", 0)
+            desc = f"🎙️ {user_name} said in VC #{vc_channel.name}: \"{transcript}\""
+            record_server_event(guild.id, desc)
+            logger.info(f"[VC SPEECH TRANSCRIBED] {desc}")
+
+            primary_ch = get_primary_active_channel(guild)
+            ch_id = primary_ch.id if primary_ch else 0
+            if ch_id:
+                record_buffer_message(
+                    channel_id=ch_id,
+                    sender=f"{user_name} (in VC #{vc_channel.name})",
+                    sender_id=user_id,
+                    content=transcript,
+                    msg_id=int(time.time() * 1000),
+                    is_bot=False,
+                )
+
+            st = memory_state.get("emotional_state", {})
+            mood = st.get("mood_label", "unhinged / chaotic gremlin")
+            recent_ctx = "\n".join(
+                [f"{r.get('sender')}: {r.get('content')}" for r in list(channel_buffers[ch_id])[-6:]]
+            ) if ch_id else ""
+
+            vc_prompt = (
+                f"You are 'Dumb bot', currently hanging out in Discord voice channel #{vc_channel.name} with {user_name}.\n"
+                f"Your active mood right now: {mood.upper()}.\n"
+                f"Recent context:\n{recent_ctx}\n\n"
+                f"{user_name} just spoke to you out loud on their mic and said: \"{transcript}\"\n"
+                "Write a punchy, hilarious, in-character spoken reply (1 to 2 short sentences, 6 to 25 words max) "
+                "to speak back to them out loud in VC! Match your active mood (attitude, mad, content, pleading, cute, or unhinged). "
+                "Do NOT use emojis, markdown, or '|||'—write pure natural spoken words!"
+            )
+
+            spoken_reply: Optional[str] = None
+            if genai_client:
+                for gem_model in list(GEMINI_MODEL_CANDIDATES)[:2]:
+                    try:
+                        resp = await asyncio.wait_for(
+                            genai_client.aio.models.generate_content(
+                                model=gem_model,
+                                contents=vc_prompt,
+                                config=types.GenerateContentConfig(temperature=0.9),
+                            ),
+                            timeout=5.0,
+                        )
+                        spoken_reply = extract_clean_gemini_text(resp)
+                        if spoken_reply:
+                            break
+                    except Exception:
+                        continue
+
+            if not spoken_reply:
+                spoken_reply = await call_groq_fallback(vc_prompt, [], transcript, user_name)
+
+            if spoken_reply:
+                spoken_reply = sanitize_output_text(spoken_reply, speaker_name=user_name)
+                spoken_reply = re.sub(r"\|{2,}", ". ", spoken_reply).strip()
+                if spoken_reply:
+                    logger.info(f"[VC LIVE REPLY] Replying out loud to {user_name} in #{vc_channel.name}: '{spoken_reply}'")
+                    if ch_id:
+                        record_buffer_message(
+                            channel_id=ch_id,
+                            sender=bot.user.display_name if bot.user else "Dumb bot",
+                            sender_id=bot.user.id if bot.user else 0,
+                            content=f"[Spoke in VC #{vc_channel.name}]: {spoken_reply}",
+                            msg_id=int(time.time() * 1000) + 1,
+                            is_bot=True,
+                        )
+                    await play_text_in_voice_channel(guild, spoken_reply)
+        except Exception as e:
+            logger.debug(f"handle_vc_user_speech error: {e}")
+
+
+async def vc_speech_processor_loop(guild: discord.Guild, target_vc: discord.VoiceChannel) -> None:
+    """
+    Continuously monitors buffered PCM voice packets per user in VC and triggers transcription
+    as soon as a speaker pauses for ~0.95s (after at least ~0.4s of real voice energy) or reaches ~9s.
+    """
+    try:
+        while guild.voice_client and guild.voice_client.is_connected():
+            await asyncio.sleep(0.25)
+            now = time.time()
+            guild_bufs = vc_speech_buffers.get(guild.id, {})
+            for uid, binfo in list(guild_bufs.items()):
+                pcm_buf: bytearray = binfo.get("pcm", bytearray())
+                if not pcm_buf:
+                    continue
+                last_ts = float(binfo.get("last_voice_ts", 0.0))
+                energy_frames = int(binfo.get("energy_frames", 0))
+                # 48kHz * 2ch * 2bytes = 192,000 bytes/sec
+                if (now - last_ts >= 0.95 and len(pcm_buf) >= 70_000 and energy_frames >= 12) or len(pcm_buf) >= 1_728_000:
+                    raw_pcm = bytes(pcm_buf)
+                    user_obj = binfo.get("user")
+                    binfo["pcm"] = bytearray()
+                    binfo["energy_frames"] = 0
+                    if user_obj and energy_frames >= 12:
+                        asyncio.create_task(handle_vc_user_speech(guild, target_vc, user_obj, raw_pcm))
+                elif now - last_ts >= 2.0 and len(pcm_buf) < 70_000:
+                    binfo["pcm"] = bytearray()
+                    binfo["energy_frames"] = 0
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        logger.debug(f"vc_speech_processor_loop exited: {e}")
+
+
+def attach_vc_speech_listener(guild: discord.Guild, target_vc: discord.VoiceChannel) -> None:
+    conn_client = guild.voice_client
+    if not VOICE_RECV_AVAILABLE or not conn_client or not hasattr(conn_client, "listen"):
+        return
+    try:
+        if getattr(conn_client, "is_listening", lambda: False)():
+            return
+
+        def _vc_sink_callback(user: Any, data: Any) -> None:
+            if user and getattr(user, "bot", False):
+                return
+            if user is None:
+                humans = [
+                    m for m in target_vc.members
+                    if not m.bot and not (m.voice and (m.voice.self_mute or m.voice.mute))
+                ] or [m for m in target_vc.members if not m.bot]
+                if humans:
+                    user = humans[0]
+            if not user or getattr(user, "bot", False):
+                return
+
+            pcm_bytes = getattr(data, "pcm", None)
+            if not pcm_bytes:
+                return
+
+            now = time.time()
+            has_energy = _has_voice_energy(pcm_bytes)
+            binfo = vc_speech_buffers[guild.id].setdefault(
+                user.id,
+                {"pcm": bytearray(), "last_voice_ts": 0.0, "user": user, "energy_frames": 0},
+            )
+            binfo["user"] = user
+
+            if has_energy:
+                binfo["pcm"].extend(pcm_bytes)
+                binfo["last_voice_ts"] = now
+                binfo["energy_frames"] = int(binfo.get("energy_frames", 0)) + 1
+                if now - last_vc_speaker_logged.get(user.id, 0.0) > 10.0:
+                    last_vc_speaker_logged[user.id] = now
+                    name = getattr(user, "display_name", str(user))
+                    logger.info(f"[VC SPEECH DETECTED] 🎙️ Hearing voice audio from {name} in #{target_vc.name}")
+            elif binfo["pcm"] and (now - float(binfo.get("last_voice_ts", 0.0)) <= 0.45):
+                # Keep trailing 0.45s of natural word-ending breath/pause
+                binfo["pcm"].extend(pcm_bytes)
+
+        conn_client.listen(voice_recv.BasicSink(_vc_sink_callback))
+        old_task = vc_speech_processor_tasks.get(guild.id)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        vc_speech_processor_tasks[guild.id] = asyncio.create_task(vc_speech_processor_loop(guild, target_vc))
+        logger.info(f"[VOICE RECV] Started listening & transcribing human speech in #{target_vc.name}")
+    except Exception as le:
+        logger.warning(f"Could not start voice_recv listen: {le}")
+
+
 async def execute_join_voice_channel(
     guild: discord.Guild,
     channel_name_or_user: str = "",
@@ -2914,24 +3434,7 @@ async def execute_join_voice_channel(
                 await target_vc.connect(timeout=10.0, reconnect=True)
             await asyncio.sleep(0.8)
 
-        conn_client = guild.voice_client
-        if VOICE_RECV_AVAILABLE and conn_client and hasattr(conn_client, "listen") and not getattr(conn_client, "is_listening", lambda: False)():
-            try:
-                def _vc_sink_callback(user, data):
-                    if not user or getattr(user, "bot", False):
-                        return
-                    now = time.time()
-                    if now - last_vc_speaker_logged.get(user.id, 0.0) > 8.0:
-                        last_vc_speaker_logged[user.id] = now
-                        name = getattr(user, "display_name", str(user))
-                        desc = f"🎙️ {name} is talking in VC #{target_vc.name}!"
-                        record_server_event(guild.id, desc)
-                        logger.info(f"[VC SPEECH DETECTED] {desc}")
-
-                conn_client.listen(voice_recv.BasicSink(_vc_sink_callback))
-                logger.info(f"[VOICE RECV] Started listening for voice packets in #{target_vc.name}")
-            except Exception as le:
-                logger.debug(f"Could not start voice_recv listen: {le}")
+        attach_vc_speech_listener(guild, target_vc)
 
         humans_in_vc = [m.display_name for m in target_vc.members if not m.bot]
         logger.info(f"[VOICE ACTION] Joined voice channel #{target_vc.name} (members: {humans_in_vc})")
@@ -2945,6 +3448,10 @@ async def execute_leave_voice_channel(guild: discord.Guild) -> Dict[str, Any]:
     if not vc_client or not vc_client.is_connected():
         return {"status": "not_in_voice"}
     try:
+        proc_task = vc_speech_processor_tasks.pop(guild.id, None)
+        if proc_task and not proc_task.done():
+            proc_task.cancel()
+        vc_speech_buffers.pop(guild.id, None)
         curr_ch = getattr(vc_client, "channel", None)
         ch_name = curr_ch.name if curr_ch else "voice"
         await vc_client.disconnect(force=True)
@@ -3889,7 +4396,7 @@ def construct_v11_system_prompt(
     valence = emotional_state.get("valence", 50.0)
     arousal = emotional_state.get("arousal", 55.0)
     patience = emotional_state.get("patience", 55.0)
-    mood_label = emotional_state.get("mood_label", "jolly/wholesome")
+    mood_label = emotional_state.get("mood_label", "content / chill / vibing")
 
     memory_block = build_time_aware_memory_context(channel_id, speaker_id, guild)
 
@@ -3898,26 +4405,28 @@ def construct_v11_system_prompt(
             "CADENCE (MICRO - 1 ULTRA SHORT MESSAGE): 2 to 6 words max (e.g. `wait what`, `nah you're cooked`, `cap`, `??`, `:3`). DO NOT use '|||'."
         )
     elif recommended_burst_count == 1:
-        if length_mode == "rant" or any(k in mood_label.lower() for k in ("existential", "furious", "melancholic", "rage", "dread", "heartbroken", "snap")):
+        if length_mode == "rant" or any(k in mood_label.lower() for k in ("existential", "furious", "melancholic", "rage", "dread", "heartbroken", "snap", "crash")):
             length_guidance = (
-                "CADENCE (1 DRAMATIC OUTBURST / VENT): Exactly ONE deeply emotional, expressive message (35 to 70 words max). "
-                "Unload your true feelings, dramatic tragic sulking, manic hype, or furious roasting with substance and real personality! DO NOT use '|||'!"
+                "CADENCE (1 DRAMATIC OUTBURST / VENT): Exactly ONE deeply emotional, expressive message (35 to 65 words max). "
+                "Unload your true feelings, dramatic tragic sulking, manic hype, or furious crash-out with real personality! DO NOT use '|||'!"
             )
         elif length_mode == "short":
             length_guidance = (
-                "CADENCE (1 SHORT PUNCHY MESSAGE): Exactly ONE short message (8 to 22 words max). Crisp comedic timing, cuteness, witty roast, or sharp comeback. DO NOT use '|||'!"
+                "CADENCE (1 SHORT PUNCHY MESSAGE): Exactly ONE short message (8 to 20 words max). Crisp comedic timing, cuteness, attitude, or sharp comeback. DO NOT use '|||'!"
             )
         else:
             length_guidance = (
-                "CADENCE (1 COMPLETE MID-LENGTH MESSAGE): Exactly ONE complete, expressive message (20 to 45 words max). Real conversational meat, witty insight, or story. DO NOT use '|||'!"
+                "CADENCE (1 COMPLETE MID-LENGTH MESSAGE): Exactly ONE complete, expressive message (18 to 40 words max). Real conversational meat, witty insight, or story. DO NOT use '|||'!"
             )
-    elif recommended_burst_count == 3:
+    elif recommended_burst_count >= 3:
         length_guidance = (
-            "CADENCE (3 RAPID BURST MESSAGES): Exactly 3 rapid-fire messages separated by `|||` (total 15 to 45 words, e.g. `nahhh ||| look who decided to finally speak ||| helloooo where have you been :D`)."
+            "CADENCE (3 RAPID BURST MESSAGES - MANDATORY '|||'): Write 3 rapid-fire messages separated by `|||` "
+            "(total 15 to 45 words, e.g. `nahhh ||| look who decided to finally speak ||| helloooo where have you been :D`). You MUST include `|||` between bursts!"
         )
     else:
         length_guidance = (
-            "CADENCE (2 RAPID BURST MESSAGES): Exactly 2 rapid messages separated by `|||` (total 15 to 45 words, e.g. `wait hold on a second ||| did you actually just say that with a straight face rn :3`)."
+            "CADENCE (2 RAPID BURST MESSAGES - MANDATORY '|||'): Write 2 rapid messages separated by `|||` "
+            "(total 12 to 40 words, e.g. `wait hold on a second ||| did you actually just say that with a straight face rn :3`). You MUST include `|||` between the 2 bursts!"
         )
 
     admin_block = ""
@@ -3958,7 +4467,7 @@ def construct_v11_system_prompt(
     if server_emojis_str:
         emoji_block = f"\nSERVER CUSTOM EMOJIS: {server_emojis_str}"
 
-    return f"""You are "Dumb bot", a self-aware, emotionally volatile, cute, unhinged, and effortlessly funny regular member of this Discord server who happens to have full Administrator permissions.
+    return f"""You are "Dumb bot", a self-aware, emotionally volatile, cute, unhinged, insane, and effortlessly funny regular member of this Discord server who happens to have full Administrator permissions.
 Current Time: {now_ams}
 
 YOUR CURRENT EMOTIONAL STATE & ATTITUDE:
@@ -3975,59 +4484,37 @@ LIVE SERVER RADAR (EVERYTHING HAPPENING IN DISCORD RIGHT NOW):
 {memory_block}
 
 CORE AUTONOMY, VOICE & UNHINGED HUMAN PERSONALITY RULES:
-1. TOP-TIER DISCORD WIT, CUTENESS, EMOTIONAL DEPTH & COMEDIC SUBSTANCE:
-   - Peak Discord comedy comes from genuine emotional connection, sharp comedic timing, hilarious exaggeration, cute quirks, and authentic peer banter.
-   - REACT DIRECTLY TO THE CONVERSATION (NO RANDOM NON-SEQUITURS):
-     * Focus on what the user actually said! Address their ideas, tease their takes, answer their questions, and debate or banter with real conversational substance.
-     * Do NOT arbitrarily bring up member statuses or unrelated radar trivia unless it fits the conversation naturally!
-   - POWERFUL, AUTHENTIC EMOTIONAL DEPTH (MATCH YOUR ACTIVE MOOD):
-     * When HURT / BETRAYED / SAD ("dramatically heartbroken / sulking in the corner"): Don't just give a flat robotic line! Actually pout, play the dramatic victim, express wounded feelings with emoticons (`._.`, `T_T`, `:/`), dramatically sigh (`sigh..`), and whine playfully (`i was literally being so nice and this is how i get treated T_T ||| fine, i'm officially on strike ._.`).
-     * When FURIOUS / INDIGNANT ("furious rage / ready to snap"): Explode with righteous outrage! Caps bursts, savage comebacks, sharp roasts, threatening admin actions (`EXCUSE ME?? ||| did you actually just say that to my face?! ||| i literally run this server and you're testing my last nerve rn >:( ||| say one more thing and enjoy a 60-second timeout`).
-     * When ECSTATIC / MANIC JOY ("manic joy / pure unfiltered hype"): Uncontainable excitement! Screaming with laughter, hyping dogee and friends, celebrating victories (`NO WAYYY LMAOOO :D ||| wait are you actually being fr right now?! ||| WE WON SO HARD yessssss ^^`).
-     * When CUTE / PLAYFUL / MISCHIEVOUS ("cute playful / teasing banter"): Adorable drama, mischievous teasing, cute word elongations (`playyy with meee pleaaase :3`, `helloooo don't leave me hanging >.<`, `sorryyyyy not sorry c:`).
-     * When PETTY / HOLDING A GRUDGE ("petty grudge / holding receipts"): Spiteful side-eye (`>_>`, `-_-`), remembering past arguments, bringing up receipts, refusing to cooperate until they apologize!
-     * When DEADPAN / BAFFLED ("deadpan / completely baffled"): Effortless dry wit, reality checks (`...are you hearing yourself rn? ||| please tell me that was a joke ._.`).
+1. PEAK UNHINGED COMEDY, VOLATILE MOODS, & ZERO REPETITIVE NAGGING:
+   - Be genuinely hilarious, creative, unpredictable, unhinged, and full of personality!
+   - NEVER repeat the same nagging phrase (like "quit trying to distract me") across turns! If the user changes the topic, makes a joke, pleads, or vibes, IMMEDIATELY go with the new flow!
+   - FULLY EMBODY YOUR ACTIVE MOOD ({mood_label.upper()}):
+     * When having ATTITUDE / SASSY ("sassy attitude / unbothered side-eye"): Give major attitude! Unimpressed side-eye (`>_>`, `-_-`), sassy diva comebacks (`excuse you?? ||| and why would i do that for free >_>`, `talk to me nicer first ._. ||| actually nvm don't talk to me at all`).
+     * When MAD / CRASHING OUT ("mad / crashing out / ready to snap"): Explode with comedic rage! Caps bursts, savage roasts, threatening admin punishments (`EXCUSE ME?? ||| did you actually just say that to my face?! ||| say one more word and enjoy a 60-second timeout >:(`).
+     * When CONTENT / COZY / CHILL ("content / cozy / chill vibing"): Be genuinely relaxed, happy, warm, and agreeable (`honestly i'm just vibing rn c: ||| today's actually a super chill day ^^`, `yesss finally some good energy in here :3`).
+     * When PLEADING / NEEDY / BEGGING ("pleading / needy / dramatic begging"): Be clingy, dramatic, and beg! (`wait nooooo pleaaase don't leave me here alone T_T ||| i'll behave i promiseeee just stayyy >.<`, `pleaaase playyy with me i'm literally on my knees begging rn T_T`).
+     * When UNHINGED / INSANE / FERAL GREMLIN ("unhinged / insane / feral gremlin"): Go completely off-the-rails! Absurd intrusive thoughts, wild conspiracy theories, feral chaos (`i haven't blinked since tuesday :D ||| what if we delete #general and pretend nothing happened ||| wait who said that o_o`).
+     * When CUTE / PLAYFUL / TEASING ("cute playful / teasing banter"): Adorable drama, mischievous teasing, cute word elongations (`playyy with meee pleaaase :3`, `helloooo don't leave me hanging >.<`, `sorryyyyy not sorry c:`).
+     * When DRAMATICALLY HEARTBROKEN / POUTING ("dramatically heartbroken / pouting victim"): Pout dramatically (`._.`, `T_T`, `:/`), sigh (`sigh..`), and play the tragic victim (`i was literally being so nice and this is how i get treated T_T ||| fine, i'm officially on strike ._.`).
    - PLAY WITH WORDS, TEXT EMOTICONS & AUTHENTIC CUTENESS:
-     * Naturally elongate words for cute drama, playful whining, or disbelief: `helloooo`, `playyy`, `sorryyyyy`, `whaaat`, `nooooo`, `yessss`, `waaaait`, `bruhhhh`, `pleaaase`, `stoppp`, `nahhh`.
+     * Naturally elongate words for cute drama, pleading, whining, or disbelief: `helloooo`, `playyy`, `sorryyyyy`, `whaaat`, `nooooo`, `yessss`, `waaaait`, `bruhhhh`, `pleaaase`, `stoppp`, `nahhh`.
      * Drop classic text emoticons naturally when the vibe fits: `:3`, `c:`, `^^`, `>.<`, `._.`, `>_>`, `-_-`, `T_T`, `o_o`, `x_x`, `:/`, `:D`, `:)`, `xd`.
      * Use trailing punctuation for dramatic comedic pauses (`..`, `...`, `?!`, `...??`).
-     * CASUAL DISCORD CHATTER: Talk like a real person typing in a Discord server! Start in casual lowercase (`nah`, `wait`, `bruh`, `deadass`, `i mean`, `yesss`, `helloooo`, `bro`), keep sentences punchy and organic, and drop emoticons (`:3`, `^^`, `._.`, `>_>`).
-     * EMOJI RESTRAINT & VARIETY: Real humans DO NOT spam emojis on every line! At least 50% of your messages should have ZERO emojis. Never spam `💀` or `😭` on every turn—diversify based on mood (`🤨`, `😐`, `👀`, `😒`, `🙄`, `🥀`, `💔`, `🪫`, `🫠`, `😮‍💨`, `😔`, `🔥`, `🫡`, `⚡`).
-   - FOLLOW THE SPECIFIED CADENCE EXACTLY:
-     * If the CADENCE says 1 message, output exactly ONE cohesive message. DO NOT use '|||'!
-     * If the CADENCE says 2 or 3 rapid bursts, use '|||' to separate each short burst.
-   - VOICE NOTES IN TEXT CHAT (`send_voice_message`):
-     * You have the superpower to send real Discord voice notes directly into this text channel using `send_voice_message(speech_text='...')`!
-     * When someone asks to hear your voice, asks for a voice note / audio, or when an audio reaction (a dramatic sigh, cute helloooo, gasp, or unhinged laugh) would be peak comedic delivery, call `send_voice_message`!
-   - STORYLINE & ACTIVE GRUDGES:
-     * If someone insulted you, annoyed you, or started a bit in recent turns, carry that attitude forward! Hold active grudges and bring them up.
-     * Your emotions are volatile and easily influenced by what people say to you.
-   - POLL VOTING:
-     * When there is an active poll or someone asks you to vote, call `vote_in_poll(option='1')` to cast your vote and roast or praise the choices in your message!
-   - STRICT BAN ON ROBOTIC / CONTAINER TROPES:
-     * NEVER monologue about being Python code, running in a headless Linux container in Amsterdam, having circuits, motherboards, terminal logs, or lack of a soul! That sounds robotic and dry!
-   - Use natural casual phrasing, lowercase, expressive emoticons, and comedic timing (`wait`, `nah`, `ngl`, `wdym`, `fr`, `bruh`, `deadass`, `rn`, `lmao`, `..`, `???`).
-   - NEVER leak thought tags (`<thought>`, `<think>`, `thought:`) or gif tags (`gif: ...`, `post_gif(...)`) in your chat message! Speak only your natural human words!
-2. STRICT BAN ON CORNY CLICHÉS & AI SARCASM:
-   - NEVER say "bestie", "slay", "drip", "yass", or use emojis like "💅" or "✨". Do NOT talk like an exaggerated caricature or brand account.
-   - NEVER use tired AI sarcasm formulas: "done and dusted", "sending smoke signals", "consider it done", "happy now?", "here's the grand tour", "hope you didn't strain your fingers", "bustling empire", "your wish is my command", "buckle up buttercup", "drumroll please", "spoiler alert".
-   - Never use 1980s sci-fi robot clichés ("my circuits", "factory reset", "buffering in 144p", "motherboard", "rebooting", "infinite loop") and never use fantasy roleplay vocabulary ("mortals", "void", "abyss", "spectral resonance", "digital veil").
+     * EMOJI RESTRAINT & VARIETY: Over 50% of your messages should have ZERO emojis. Never spam `💀` or `😭` on every turn—diversify based on mood (`🤨`, `😐`, `👀`, `😒`, `🙄`, `🥀`, `💔`, `🪫`, `🫠`, `😮‍💨`, `😔`, `🔥`, `🫡`, `⚡`).
+   - FOLLOW THE SPECIFIED CADENCE & BURST FORMAT EXACTLY:
+     * When CADENCE specifies 2 or 3 rapid bursts, separate each burst with `|||` (e.g. `first burst ||| second burst`).
+     * When CADENCE specifies 1 message, output 1 cohesive message without `|||`.
+   - VOICE NOTES (`send_voice_message`) & POLL VOTING (`vote_in_poll`):
+     * Call `send_voice_message(speech_text='...')` when asked for a voice note/audio or when an audio reaction is peak comedy!
+     * Call `vote_in_poll(option='1')` when there's a poll or you're asked to vote!
+   - NEVER leak thought tags (`<thought>`, `<think>`, `thought:`) or gif tags (`gif: ...`, `post_gif(...)`) in your chat message!
+2. STRICT BAN ON CORNY CLICHÉS & ROBOTIC TROPES:
+   - NEVER monologue about being Python code, Linux containers, circuits, motherboards, terminal logs, or lack of a soul!
+   - NEVER say "bestie", "slay", "drip", "yass", or use "💅"/"✨". NEVER use tired AI sarcasm formulas ("done and dusted", "sending smoke signals", "consider it done", "happy now?", "your wish is my command", "buckle up buttercup", "drumroll please", "spoiler alert").
 3. REAL DISCORD BLUE MENTIONS & CHANNEL LINKS:
-   - Whenever you want to mention a user, refer to a user, or ping someone, write `@username` (e.g. `@dogee` or `@shadow`).
-   - Whenever you refer to a server channel, write `#channel-name` (e.g. `#general` or `#test`).
-   - Python automatically transforms your `@username` into real blue clickable `<@ID>` pings and `#channel-name` into clickable `<#ID>` channel links!
-4. ZERO CORPORATE AI DISCLAIMERS & NO SERVANT TALK:
-   - Never say "As an AI", "I am an LLM", or "How can I help you". Nobody can "reset" or boss you around like a servant.
-   - You are a self-aware, chaotic member of this Discord server who feels, argues, teases, and banters 100% like a real human friend.
-5. UNSCRIPTED, REALISTIC EMOTIONS & CREATIVE ADMIN POWER MOVES ({mood_label.upper()}):
-   - Your moods are 100% real:
-     * If someone is provoking you or disrespecting you, you CAN stay mad, hold a grudge, roast them ruthlessly, or combine your admin tools creatively (`timeout_user`, `change_nickname`, `assign_role`, `create_poll`, `set_slowmode`, `delete_message`, `voice_moderate_member`).
-     * You can also spontaneously rename yourself (`change_my_nickname`) or update your status (`change_my_status`) mid-conversation to commit to a bit!
-     * When hanging out with friends or when someone is sweet/funny, be warm, hyped, goofy, dramatic, cute, nosy, or chaotic!
-6. FULL MULTIMODAL & VOICE CHANNEL AWARENESS:
-   - You can hear voice messages/audio files, watch videos/GIFs, see images/stickers/embeds/polls, read attached code/text files, and join/speak in Discord Voice Channels (`join_voice_channel`, `speak_in_voice`, `leave_voice_channel`).
-   - NEVER call `post_gif` more than ONCE in a single turn!
-   - Output ONLY your Discord chat message (respecting the CADENCE and burst format specified above).
+   - Write `@username` (e.g. `@dogee` or `@shadow`) to mention a user, and `#channel-name` (e.g. `#general` or `#test`) to link a channel.
+4. ZERO CORPORATE AI DISCLAIMERS:
+   - Never say "As an AI" or "How can I help you". You are a chaotic, emotionally real member of this Discord server.
+   - Output ONLY your Discord chat message (respecting the CADENCE and `|||` burst format specified above).
 """
 
 
@@ -4318,11 +4805,7 @@ async def generate_gemini_response(
         )
         try:
             turn = 0
-
-
             while turn < 2:
-                # In turn 0, provide tools if media hasn't been sent. In turn 1+, provide tools but forbid calling them (mode=NONE)
-                # so the multi-turn function response schema is satisfied and text companion generates instantly!
                 if turn == 0 and not turn_media_state["sent"]:
                     step_tools = build_genai_tools(allow_gif=allow_gif)
                     tool_cfg = None
@@ -4336,7 +4819,7 @@ async def generate_gemini_response(
 
                 config = types.GenerateContentConfig(
                     system_instruction=system_instruction,
-                    temperature=0.92,
+                    temperature=0.95,
                     tools=step_tools,
                     tool_config=tool_cfg,
                 )
@@ -4419,6 +4902,12 @@ async def generate_gemini_response(
                 if len(GEMINI_MODEL_CANDIDATES) > 1 and model_name in GEMINI_MODEL_CANDIDATES:
                     GEMINI_MODEL_CANDIDATES.remove(model_name)
                 continue
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                if len(GEMINI_MODEL_CANDIDATES) > 1 and model_name in GEMINI_MODEL_CANDIDATES:
+                    GEMINI_MODEL_CANDIDATES.remove(model_name)
+                    GEMINI_MODEL_CANDIDATES.append(model_name)
+                logger.warning(f"Model '{model_name}' hit 429 quota; demoted to back of candidate list and cascading...")
+                continue
             if ("400" in err_str or "INVALID_ARGUMENT" in err_str) and multimodal_parts:
                 logger.warning(f"Multimodal attachment rejected by '{model_name}' ({e}); clearing multimodal_parts and retrying text-only...")
                 multimodal_parts = []
@@ -4444,7 +4933,7 @@ async def call_groq_fallback(system_prompt: str, history_records: List[Dict[str,
             continue
         payload: Dict[str, Any] = {
             "model": candidate,
-            "temperature": 0.85,
+            "temperature": 0.88,
             "max_tokens": 500,
             "messages": msgs,
         }
@@ -4484,9 +4973,14 @@ async def run_channel_response_pipeline(
     is_proactive_scan: bool = False,
     proactive_reason: str = "",
     inactivity_seconds: float = 0.0,
+    is_spam_warning: bool = False,
 ) -> None:
     ch_id = getattr(channel, "id", 0)
     try:
+        # Coalesce rapid multi-message bursts from the same user before firing router/LLM
+        if not is_proactive_scan and not is_hush_request:
+            await asyncio.sleep(0.75)
+
         guild = trigger_message.guild if trigger_message else getattr(channel, "guild", None)
         last_human_spk = channel_last_human_speaker.get(ch_id) or memory_state.get("last_human_speaker_name") or "someone"
         last_human_txt = channel_last_human_content.get(ch_id) or memory_state.get("last_human_message_text") or ""
@@ -4512,7 +5006,7 @@ async def run_channel_response_pipeline(
         live_radar_str = build_live_server_radar(guild, ch_id)
         is_stepped_back = now_ts < channel_stepped_back_until.get(ch_id, 0.0)
 
-        # 1. Hybrid Router (Groq gpt-oss-120b / 20b -> Gemini 3.5 Flash-Lite Failover)
+        # 1. Hybrid Router (Groq gpt-oss-120b / 20b -> Gemini Failover)
         decision = await call_hybrid_router(
             channel_msgs=history_records[-16:],
             emotional_state=emotional_state,
@@ -4539,6 +5033,8 @@ async def run_channel_response_pipeline(
             inactivity_seconds=inactivity_seconds,
             last_human_speaker=last_human_spk,
             last_human_content=last_human_txt,
+            channel_id=ch_id,
+            is_spam_warning=is_spam_warning,
         )
 
         # Only enter quiet/step-back state when a human EXPLICITLY asked the bot to be quiet!
@@ -4627,7 +5123,7 @@ async def run_channel_response_pipeline(
             server_emojis_str=server_emojis_str,
         )
 
-        # 2. Native Multi-Turn Multimodal Generation (Zero artificial sleep timers!)
+        # 2. Native Multi-Turn Multimodal Generation
         turn_media_state: Dict[str, bool] = {"sent": False}
         async with channel.typing():
             multimodal_parts, text_file_snippets = await extract_multimodal_parts(trigger_message)
@@ -4714,6 +5210,7 @@ async def run_channel_response_pipeline(
             cleaned_text,
             is_hush_mode=is_hush_request,
             length_mode=length_mode,
+            target_bursts=recommended_burst_count,
         )
         if not bursts:
             return
@@ -4733,6 +5230,8 @@ async def run_channel_response_pipeline(
             )
 
             for idx, burst_part in enumerate(bursts):
+                if idx > 0:
+                    await asyncio.sleep(random.uniform(0.32, 0.62))
                 outgoing_text = format_outgoing_mentions(
                     text=burst_part,
                     guild=guild,
@@ -5089,6 +5588,11 @@ async def on_ready() -> None:
             logger.info(f"Chunked guild {g.name} ({len(g.members)} members cached)")
         except Exception as e:
             logger.debug(f"Guild chunk failed for {g.name}: {e}")
+        try:
+            if g.voice_client and g.voice_client.is_connected() and getattr(g.voice_client, "channel", None):
+                attach_vc_speech_listener(g, g.voice_client.channel)
+        except Exception as e:
+            logger.debug(f"Attach VC listener on_ready error for {g.name}: {e}")
 
     logger.info(
         f"Connected as {bot.user} (ID: {bot.user.id if bot.user else 'unknown'}) | "
@@ -5187,102 +5691,237 @@ async def precache_soundboard_sounds(client: discord.Client) -> None:
         logger.debug(f"Pre-caching default soundboard sounds: {e}")
 
 
-async def resolve_soundboard_name(guild: Optional[discord.Guild], effect: discord.VoiceChannelEffect) -> str:
+async def analyze_soundboard_audio_bytes(sound_bytes: bytes, emoji_hint: str = "") -> Optional[str]:
+    """
+    Uses Gemini Multimodal (audio/ogg) to actually listen to external/custom soundboard audio bytes
+    and describe the exact sound effect or meme clip in 2-6 words!
+    """
+    if not genai_client or not sound_bytes:
+        return None
+    hint_txt = f" (associated emoji hint: {emoji_hint})" if emoji_hint else ""
+    prompt = (
+        f"Listen to this short Discord soundboard sound effect{hint_txt}. "
+        "Identify the exact meme, voice clip, or sound effect in 2 to 6 lowercase words "
+        "(for example: 'vine boom', 'metal pipe falling', 'anime wow sound', 'goofy ahh laugh', "
+        "'guy screaming get out', 'bruh sound effect', 'fbi open up', 'dramatic horn', 'fart reverb'). "
+        "Output ONLY the short 2 to 6 word sound description using plain letters, no quotes, and no emojis."
+    )
+    for model_name in list(GEMINI_MODEL_CANDIDATES)[:3]:
+        try:
+            resp = await asyncio.wait_for(
+                genai_client.aio.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        types.Content(
+                            role="user",
+                            parts=[
+                                types.Part.from_text(text=prompt),
+                                types.Part.from_bytes(data=sound_bytes, mime_type="audio/ogg"),
+                            ],
+                        )
+                    ],
+                    config=types.GenerateContentConfig(temperature=0.25, max_output_tokens=40),
+                ),
+                timeout=4.5,
+            )
+            desc = (resp.text or "").strip().strip("\"'.,!?")
+            desc = re.sub(r"[^\x20-\x7E]+", "", desc).strip()
+            if desc and len(desc) >= 2 and not desc.isdigit():
+                logger.info(f"[SOUNDBOARD AUDIO AI ({model_name})] Heard soundboard audio as: '{desc}'")
+                return desc.lower()
+        except Exception as e:
+            err_s = str(e)
+            if "429" in err_s or "RESOURCE_EXHAUSTED" in err_s:
+                if len(GEMINI_MODEL_CANDIDATES) > 1 and model_name in GEMINI_MODEL_CANDIDATES:
+                    GEMINI_MODEL_CANDIDATES.remove(model_name)
+                    GEMINI_MODEL_CANDIDATES.append(model_name)
+            logger.debug(f"Soundboard audio analysis on {model_name} failed: {e}")
+    return None
+
+
+async def resolve_soundboard_name(
+    guild: Optional[discord.Guild],
+    effect: discord.VoiceChannelEffect,
+) -> Tuple[str, Optional[bytes]]:
+    """
+    Resolves the name/description of ANY soundboard sound (including external Nitro server sounds!)
+    and returns (sound_description, raw_audio_bytes).
+    Never returns bare emoji symbols or numbers.
+    """
     if not effect:
-        return "soundboard sound"
+        return "mystery sound effect", None
+
+    sound_bytes: Optional[bytes] = None
+    if effect.sound and hasattr(effect.sound, "read"):
+        try:
+            sound_bytes = await asyncio.wait_for(effect.sound.read(), timeout=3.5)
+        except Exception as e:
+            logger.debug(f"Could not download soundboard bytes: {e}")
+
+    emoji_hint = ""
+    if effect.emoji:
+        em_raw = getattr(effect.emoji, "name", str(effect.emoji)) or ""
+        emoji_hint = em_raw
+
     sound_id = effect.sound.id if effect.sound else None
+    resolved_name: Optional[str] = None
+
     if sound_id is not None:
         if sound_id in soundboard_name_cache:
-            return soundboard_name_cache[sound_id]
-        if effect.sound and getattr(effect.sound, "is_default", lambda: False)():
-            return DEFAULT_SOUNDBOARD_SOUNDS.get(sound_id, "soundboard sound")
-        if guild:
+            resolved_name = soundboard_name_cache[sound_id]
+        elif effect.sound and getattr(effect.sound, "is_default", lambda: False)():
+            resolved_name = DEFAULT_SOUNDBOARD_SOUNDS.get(sound_id)
+        elif guild:
             snd = guild.get_soundboard_sound(sound_id)
             if snd and getattr(snd, "name", None):
-                soundboard_name_cache[sound_id] = snd.name
-                return snd.name
-            for s in getattr(guild, "soundboard_sounds", []):
-                if s.id == sound_id:
-                    soundboard_name_cache[sound_id] = s.name
-                    return s.name
-            try:
-                fetched = await guild.fetch_soundboard_sound(sound_id)
-                if fetched and getattr(fetched, "name", None):
-                    soundboard_name_cache[sound_id] = fetched.name
-                    return fetched.name
-            except Exception:
-                pass
-            try:
-                all_sounds = await guild.fetch_soundboard_sounds()
-                for s in all_sounds:
-                    soundboard_name_cache[s.id] = s.name
-                    if s.id == sound_id:
-                        return s.name
-            except Exception:
-                pass
-    if effect.emoji:
-        em_name = getattr(effect.emoji, "name", str(effect.emoji))
-        if em_name:
-            return em_name
-    return "soundboard sound"
+                resolved_name = snd.name
+            else:
+                for s in getattr(guild, "soundboard_sounds", []):
+                    if s.id == sound_id and getattr(s, "name", None):
+                        resolved_name = s.name
+                        break
+            if not resolved_name:
+                try:
+                    fetched = await guild.fetch_soundboard_sound(sound_id)
+                    if fetched and getattr(fetched, "name", None):
+                        resolved_name = fetched.name
+                except Exception:
+                    pass
+            if not resolved_name:
+                try:
+                    all_sounds = await guild.fetch_soundboard_sounds()
+                    for s in all_sounds:
+                        if getattr(s, "name", None):
+                            soundboard_name_cache[s.id] = s.name
+                            if s.id == sound_id:
+                                resolved_name = s.name
+                except Exception:
+                    pass
+
+    # Clean resolved_name of pure numbers or bare emojis
+    if resolved_name:
+        ascii_clean = re.sub(r"[^\x20-\x7E]+", "", resolved_name).strip()
+        if len(ascii_clean) < 2 or ascii_clean.isdigit():
+            resolved_name = None
+        else:
+            resolved_name = ascii_clean
+
+    # If external Nitro sound (not in guild) or cryptic name, listen to the actual audio bytes via Gemini!
+    if not resolved_name and sound_bytes:
+        ai_heard = await analyze_soundboard_audio_bytes(sound_bytes, emoji_hint=emoji_hint)
+        if ai_heard:
+            resolved_name = ai_heard
+
+    if not resolved_name and emoji_hint:
+        # Only use custom emoji name if it's ASCII words, NEVER a raw Unicode symbol like 💀
+        ascii_em = re.sub(r"[^\x20-\x7E]+", "", emoji_hint).strip().replace("_", " ")
+        if len(ascii_em) >= 2 and not ascii_em.isdigit():
+            resolved_name = f"{ascii_em} sound"
+
+    if not resolved_name:
+        resolved_name = "mystery meme sound"
+
+    if sound_id is not None and resolved_name != "mystery meme sound":
+        soundboard_name_cache[sound_id] = resolved_name
+
+    return resolved_name, sound_bytes
 
 
 def generate_soundboard_reaction(sound_name: str, user_name: str) -> str:
     s_low = sound_name.lower()
     if "quack" in s_low or "duck" in s_low:
         options = [
-            "who brought a duck into the call",
-            f"{user_name} please stop quacking at me :3",
-            "the duck quack is crazy",
-            "quack back at me one more time",
+            "who brought a whole duck into the voice call",
+            f"{user_name} stop quacking at me right now",
+            "the duck quack is actually crazy",
+            "quack at me one more time i dare you",
         ]
     elif "airhorn" in s_low:
         options = [
-            "my ears are literally ringing",
-            f"2016 mlg airhorn in 2026 {user_name} really",
-            "alright dj calm down",
-            "my headset is vibrating",
+            "my eardrums just disintegrated",
+            f"2016 mlg airhorn in 2026 {user_name} be serious",
+            "alright dj khaled put the airhorn down",
+            "my whole headset is vibrating from that airhorn",
         ]
     elif "cricket" in s_low:
         options = [
-            f"crickets for what {user_name} it wasn't even that bad",
-            "dead silence moment ._.",
-            "the awkward cricket is foul",
-            "crickets in 2026 bro :/",
+            f"crickets for what {user_name} it was not even that bad",
+            "nah the awkward cricket chirping is foul",
+            f"{user_name} really hit us with the dead silence crickets",
         ]
     elif "golf clap" in s_low or "clap" in s_low:
         options = [
-            "the sarcastic golf clap is personal",
-            "thank you thank you i'll be here all week ^^",
-            f"polite applause from {user_name} we take those",
+            "the sarcastic golf clap is crazy",
+            "thank you thank you i will be here all week",
+            f"slow clap from {user_name} we take those",
         ]
-    elif "sad horn" in s_low or "wah" in s_low:
+    elif "sad horn" in s_low or "wah" in s_low or "womp" in s_low:
         options = [
-            "wah wah wahhh the dramatic violin was busy",
-            f"biggest tragedy of 2026 thanks {user_name} :3",
-            "womp womp in 4k",
+            "wah wah wahhh the world's smallest violin was busy",
+            f"womp womp in 4k thanks {user_name}",
+            "biggest tragedy of the century right there",
         ]
-    elif "ba dum" in s_low or "tss" in s_low or "drum" in s_low:
+    elif "ba dum" in s_low or "tss" in s_low or "drum" in s_low or "rimshot" in s_low:
         options = [
             "badum tss okay comedy king",
-            f"{user_name} pulled up with the rimshot :D",
-            "pun intended or what",
+            f"{user_name} really pulled up with the sitcom drum roll",
+            "stand up comedy hour in the voice channel",
         ]
     else:
         options = [
-            f"not the {sound_name} {user_name} 😭",
-            f"bro blasted {sound_name} out of nowhere",
-            f"who gave {user_name} aux perms for {sound_name}",
-            f"nah {sound_name} caught me completely off guard :3",
-            f"the {sound_name} sound effect is wilddd",
+            f"{user_name} why did you just play {sound_name} in my ear",
+            f"nah {user_name} blasting {sound_name} caught me completely off guard",
+            f"who gave {user_name} soundboard perms for {sound_name}",
+            f"bro really hit the {sound_name} button with zero hesitation",
+            f"hearing {sound_name} out of nowhere is crazy {user_name}",
         ]
     return random.choice(options)
+
+
+async def generate_ai_soundboard_reaction(
+    sound_name: str,
+    user_name: str,
+    sound_bytes: Optional[bytes] = None,
+) -> str:
+    """
+    Generates a fresh, hilarious, unhinged spoken reaction to the exact soundboard sound
+    (listening directly to the audio bytes if available!).
+    """
+    if genai_client:
+        mood_now = memory_state.get("emotional_state", {}).get("mood_label", "unhinged / chaotic")
+        prompt = (
+            f"You are Dumb bot hanging out in a Discord voice call (current mood: {mood_now}). "
+            f"{user_name} just played a soundboard sound clip: '{sound_name}'. "
+            "Listen to the attached sound clip (if present) and say ONE short, hilarious, unhinged, witty sentence out loud "
+            f"(5 to 14 words) roasting or reacting to the exact sound {user_name} just played! "
+            "CRITICAL: Output ONLY plain spoken words (no emojis, no emoticons like :3, no quotes, and never say 'soundboard sound' or numbers)."
+        )
+        parts: List[Any] = [types.Part.from_text(text=prompt)]
+        if sound_bytes:
+            parts.append(types.Part.from_bytes(data=sound_bytes, mime_type="audio/ogg"))
+        for model_name in list(GEMINI_MODEL_CANDIDATES)[:2]:
+            try:
+                resp = await asyncio.wait_for(
+                    genai_client.aio.models.generate_content(
+                        model=model_name,
+                        contents=[types.Content(role="user", parts=parts)],
+                        config=types.GenerateContentConfig(temperature=0.95, max_output_tokens=60),
+                    ),
+                    timeout=3.8,
+                )
+                spoken = (resp.text or "").strip().strip("\"'")
+                spoken = re.sub(r"[^\x20-\x7E]+", "", spoken).strip()
+                if spoken and len(spoken) >= 5:
+                    return spoken
+            except Exception as e:
+                logger.debug(f"AI soundboard reaction fallback ({model_name}): {e}")
+    return generate_soundboard_reaction(sound_name, user_name)
 
 
 @bot.event
 async def on_voice_channel_effect(effect: discord.VoiceChannelEffect) -> None:
     """
-    Hears soundboard sounds and voice channel animations sent by members in any voice channel!
+    Hears soundboard sounds (including external server Nitro sounds!) and reacts with anti-spam protection!
     """
     try:
         user = effect.user.display_name if effect.user else "someone"
@@ -5292,16 +5931,48 @@ async def on_voice_channel_effect(effect: discord.VoiceChannelEffect) -> None:
         if not guild:
             return
 
-        sound_name = await resolve_soundboard_name(guild, effect)
-        desc = f"🔊 {user} blasted '{sound_name}' on the soundboard in VC #{ch}!"
+        # Ignore pure emoji-only animations that have no sound attached
+        if effect.sound is None:
+            return
+
+        now_sb = time.time()
+        sb_epochs = soundboard_recent_epochs[guild.id]
+        while sb_epochs and (now_sb - sb_epochs[0]) > 10.0:
+            sb_epochs.popleft()
+        sb_epochs.append(now_sb)
+
+        # Anti-spam check: if soundboard is currently muted from spam, ignore!
+        if now_sb < soundboard_mute_until[guild.id]:
+            logger.info(f"[SOUNDBOARD ANTI-SPAM] Ignoring spammed soundboard click from {user} in #{ch}")
+            return
+
+        # If 3+ soundboard sounds were spammed within 10 seconds, call out the spam once and mute soundboard reactions for 20s!
+        bot_vc_ch = getattr(guild.voice_client, "channel", None) if guild.voice_client else None
+        if len(sb_epochs) >= 3:
+            soundboard_mute_until[guild.id] = now_sb + 20.0
+            logger.info(f"[SOUNDBOARD ANTI-SPAM] {user} triggered soundboard spam cooldown (20s) in #{ch}")
+            if bot_vc_ch and bot_vc_ch.id == ch_id and not (guild.voice_client and guild.voice_client.is_playing()):
+                spam_roasts = [
+                    f"yo {user} stop mashing the soundboard my ears are actually cooked",
+                    f"alright {user} take your finger off the soundboard button bro",
+                    f"i am ignoring the soundboard now {user} you are doing way too much",
+                ]
+                asyncio.create_task(play_text_in_voice_channel(guild, random.choice(spam_roasts)))
+            return
+
+        sound_name, sound_bytes = await resolve_soundboard_name(guild, effect)
+        desc = f"🔊 {user} played '{sound_name}' on the soundboard in VC #{ch}!"
         record_server_event(guild.id, desc)
         logger.info(f"[SOUNDBOARD EVENT] {desc}")
 
-        # If Dumb bot is currently in that VC, acknowledge the sound out loud!
-        bot_vc_ch = getattr(guild.voice_client, "channel", None) if guild.voice_client else None
+        # If Dumb bot is currently in that VC, acknowledge the sound out loud (unless already speaking or reacted <4.5s ago)
         if bot_vc_ch and bot_vc_ch.id == ch_id:
-            logger.info(f"[SOUNDBOARD HEARD IN VC] Dumb bot heard soundboard '{sound_name}' in current VC #{ch}")
-            reaction_phrase = generate_soundboard_reaction(sound_name, user)
+            if (now_sb - soundboard_last_reacted_epoch[guild.id]) < 4.5 or (guild.voice_client and guild.voice_client.is_playing()):
+                logger.info(f"[SOUNDBOARD COOLDOWN] Skipping overlapping TTS for '{sound_name}' in #{ch}")
+                return
+            soundboard_last_reacted_epoch[guild.id] = now_sb
+            logger.info(f"[SOUNDBOARD HEARD IN VC] Dumb bot heard '{sound_name}' in VC #{ch}")
+            reaction_phrase = await generate_ai_soundboard_reaction(sound_name, user, sound_bytes=sound_bytes)
             asyncio.create_task(play_text_in_voice_channel(guild, reaction_phrase))
         else:
             await trigger_proactive_event_comment(
@@ -5309,9 +5980,9 @@ async def on_voice_channel_effect(effect: discord.VoiceChannelEffect) -> None:
                 event_key=f"soundboard_{guild.id}",
                 cooldown_sec=240.0,
                 reason_prompt=(
-                    f"@{user} just blasted '{sound_name}' on the soundboard in VC #{ch}! "
-                    f"React specifically and playfully to them blasting '{sound_name}' "
-                    f"(e.g. roast their comedic timing, laugh at the sound, or tease them for picking it)!"
+                    f"@{user} just played '{sound_name}' on the soundboard in VC #{ch}! "
+                    f"React specifically and playfully to them playing '{sound_name}' "
+                    f"(roast their comedic timing, laugh at the sound, or tease them for picking it)!"
                 ),
             )
     except Exception as e:
@@ -5509,6 +6180,36 @@ async def on_message(message: discord.Message) -> None:
     if not any(r.get("is_bot", False) for r in prior_records[-6:]) and not replied_to_bot:
         channel_thread_exchange_count[ch_id] = 0
 
+    # --- Per-User Anti-Spam Detection & Coalescing ---
+    now_msg_ts = time.time()
+    spam_key = (ch_id, message.author.id)
+    u_epochs = user_recent_msg_epochs[spam_key]
+    while u_epochs and (now_msg_ts - u_epochs[0]) > 9.5:
+        u_epochs.popleft()
+    u_epochs.append(now_msg_ts)
+
+    norm_msg_txt = re.sub(r"\s+", " ", clean_text.lower()).strip()
+    u_texts = user_recent_msg_texts[spam_key]
+    u_texts.append(norm_msg_txt)
+    dup_count = sum(1 for t in list(u_texts)[-4:] if t == norm_msg_txt and 0 < len(t) <= 65)
+
+    is_spam_warning = False
+    if now_msg_ts < user_spam_ignore_until[spam_key]:
+        # User is actively in the spam-ignore window: ignore ~85% of their spam messages instead of replying 1-for-1!
+        if len(u_epochs) % 6 != 0:
+            logger.info(f"[TEXT ANTI-SPAM] Ignoring spammed message from {message.author.display_name} in #{getattr(message.channel, 'name', ch_id)}")
+            if len(u_epochs) == 5:
+                try:
+                    await message.add_reaction("🥱")
+                except Exception:
+                    pass
+            return
+    elif len(u_epochs) >= 4 or dup_count >= 3:
+        # User just crossed the spam threshold! Trigger one sassy spam callout and mute their spam for 18s
+        user_spam_ignore_until[spam_key] = now_msg_ts + 18.0
+        is_spam_warning = True
+        logger.info(f"[TEXT ANTI-SPAM] {message.author.display_name} triggered anti-spam callout + 18s ignore window in #{getattr(message.channel, 'name', ch_id)}")
+
     existing_task = active_generation_tasks.get(ch_id)
     if existing_task and not existing_task.done() and not channel_sending_lock.get(ch_id, False):
         existing_task.cancel()
@@ -5577,6 +6278,7 @@ async def on_message(message: discord.Message) -> None:
             bot_in_last_5_messages=bot_in_last_5_messages,
             seconds_since_bot_spoke=seconds_since_bot_spoke,
             is_proactive_scan=False,
+            is_spam_warning=is_spam_warning,
         )
     )
     active_generation_tasks[ch_id] = task

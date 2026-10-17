@@ -452,6 +452,7 @@ vc_speech_processor_tasks: Dict[int, asyncio.Task] = {}
 vc_transcribing_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 vc_pending_events: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
 vc_batch_reactor_tasks: Dict[int, asyncio.Task] = {}
+vc_last_user_speech_epoch: Dict[int, float] = defaultdict(float)
 
 soundboard_recent_epochs: Dict[int, deque] = defaultdict(lambda: deque(maxlen=15))
 soundboard_mute_until: Dict[int, float] = defaultdict(float)
@@ -4282,51 +4283,54 @@ def attach_vc_speech_listener(guild: discord.Guild, target_vc: discord.VoiceChan
             return
 
         def _vc_sink_callback(user: Any, data: Any) -> None:
-            if user and getattr(user, "bot", False):
-                return
-            if user is None:
-                humans = [
-                    m for m in target_vc.members
-                    if not m.bot and not (m.voice and (m.voice.self_mute or m.voice.mute))
-                ] or [m for m in target_vc.members if not m.bot]
-                if humans:
-                    user = humans[0]
-            if not user or getattr(user, "bot", False):
-                return
+            try:
+                if user and getattr(user, "bot", False):
+                    return
+                if user is None:
+                    humans = [
+                        m for m in target_vc.members
+                        if not m.bot and not (m.voice and (m.voice.self_mute or m.voice.mute))
+                    ] or [m for m in target_vc.members if not m.bot]
+                    if humans:
+                        user = humans[0]
+                if not user or getattr(user, "bot", False):
+                    return
 
-            pcm_bytes = getattr(data, "pcm", None)
-            if not pcm_bytes:
-                return
+                pcm_bytes = getattr(data, "pcm", None)
+                if not pcm_bytes:
+                    return
 
-            now = time.time()
-            has_energy = _has_voice_energy(pcm_bytes)
-            binfo = vc_speech_buffers[guild.id].setdefault(
-                user.id,
-                {"pcm": bytearray(), "last_voice_ts": 0.0, "user": user, "energy_frames": 0},
-            )
-            binfo["user"] = user
+                now = time.time()
+                has_energy = _has_voice_energy(pcm_bytes)
+                binfo = vc_speech_buffers[guild.id].setdefault(
+                    user.id,
+                    {"pcm": bytearray(), "last_voice_ts": 0.0, "user": user, "energy_frames": 0},
+                )
+                binfo["user"] = user
 
-            if has_energy:
-                binfo["pcm"].extend(pcm_bytes)
-                binfo["last_voice_ts"] = now
-                vc_last_user_speech_epoch[guild.id] = now
-                frames = int(binfo.get("energy_frames", 0)) + 1
-                binfo["energy_frames"] = frames
-                # Live Barge-In: if a human speaks continuously for ~0.44s (22 frames) while the bot is talking,
-                # automatically stop current bot playback so the bot listens instead of talking over them!
-                if frames == 22 and conn_client.is_playing():
-                    try:
-                        conn_client.stop()
-                        logger.info(f"[VC BARGE-IN] Stopped bot playback to listen to {getattr(user, 'display_name', user)} in #{target_vc.name}")
-                    except Exception:
-                        pass
-                if now - last_vc_speaker_logged.get(user.id, 0.0) > 10.0:
-                    last_vc_speaker_logged[user.id] = now
-                    name = getattr(user, "display_name", str(user))
-                    logger.info(f"[VC SPEECH DETECTED] 🎙️ Hearing voice audio from {name} in #{target_vc.name}")
-            elif binfo["pcm"] and (now - float(binfo.get("last_voice_ts", 0.0)) <= 0.45):
-                # Keep trailing 0.45s of natural word-ending breath/pause
-                binfo["pcm"].extend(pcm_bytes)
+                if has_energy:
+                    binfo["pcm"].extend(pcm_bytes)
+                    binfo["last_voice_ts"] = now
+                    vc_last_user_speech_epoch[guild.id] = now
+                    frames = int(binfo.get("energy_frames", 0)) + 1
+                    binfo["energy_frames"] = frames
+                    # Live Barge-In: if a human speaks continuously for ~0.44s (22 frames) while the bot is talking,
+                    # automatically stop current bot playback so the bot listens instead of talking over them!
+                    if frames == 22 and conn_client.is_playing():
+                        try:
+                            conn_client.stop()
+                            logger.info(f"[VC BARGE-IN] Stopped bot playback to listen to {getattr(user, 'display_name', user)} in #{target_vc.name}")
+                        except Exception:
+                            pass
+                    if now - last_vc_speaker_logged.get(user.id, 0.0) > 10.0:
+                        last_vc_speaker_logged[user.id] = now
+                        name = getattr(user, "display_name", str(user))
+                        logger.info(f"[VC SPEECH DETECTED] 🎙️ Hearing voice audio from {name} in #{target_vc.name}")
+                elif binfo["pcm"] and (now - float(binfo.get("last_voice_ts", 0.0)) <= 0.45):
+                    # Keep trailing 0.45s of natural word-ending breath/pause
+                    binfo["pcm"].extend(pcm_bytes)
+            except Exception as cb_err:
+                logger.debug(f"_vc_sink_callback error: {cb_err}")
 
         conn_client.listen(voice_recv.BasicSink(_vc_sink_callback))
         old_task = vc_speech_processor_tasks.get(guild.id)
@@ -6744,6 +6748,13 @@ async def on_ready() -> None:
         try:
             if g.voice_client and g.voice_client.is_connected() and getattr(g.voice_client, "channel", None):
                 attach_vc_speech_listener(g, g.voice_client.channel)
+            else:
+                for vc in g.voice_channels:
+                    humans = [m for m in vc.members if not m.bot]
+                    if humans:
+                        logger.info(f"[AUTO-REJOIN VC] Found {len(humans)} human(s) in #{vc.name} on startup; joining automatically!")
+                        await execute_join_voice_channel(g, vc.name)
+                        break
         except Exception as e:
             logger.debug(f"Attach VC listener on_ready error for {g.name}: {e}")
 

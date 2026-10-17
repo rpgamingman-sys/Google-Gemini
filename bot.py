@@ -6,11 +6,13 @@ import json
 import math
 import time
 import wave
+import array
 import shutil
 import random
 import asyncio
 import logging
 import tempfile
+import threading
 import urllib.parse
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -1260,9 +1262,10 @@ def build_live_server_radar(guild: Optional[discord.Guild], channel_id: int) -> 
                     tags.append("BOT/YOU" if (bot.user and m.id == bot.user.id) else "bot")
                 if m.voice:
                     if m.voice.self_stream:
-                        tags.append("LIVE STREAMING")
+                        stream_act = format_member_activities(m)
+                        tags.append(f"LIVE SCREEN-SHARING ({stream_act})" if stream_act else "LIVE SCREEN-SHARING")
                     if m.voice.self_video:
-                        tags.append("CAM ON")
+                        tags.append("CAMERA VIDEO FEED ON")
                     if m.voice.self_deaf or m.voice.deaf:
                         tags.append("deafened")
                     elif m.voice.self_mute or m.voice.mute:
@@ -3286,43 +3289,177 @@ async def execute_react_to_message(target_message: Optional[discord.Message], em
 
 
 # ---------------------------------------------------------------------------
-# 8. VOICE CHANNEL & MODULAR EXPRESSIVE TTS / MULTI-SPEAKER ENGINE
+# 8. GEMINI LIVE VOICE CHANNEL STREAMING, EMOTIONAL MODULATION & MULTIMODAL VC ENGINE
 # ---------------------------------------------------------------------------
+GEMINI_LIVE_VOICE_MODELS = [
+    "gemini-3.1-flash-live-preview",
+    "gemini-3.8-live",
+    "gemini-2.5-flash-native-audio-latest",
+]
+
+GEMINI_REST_TTS_MODELS = [
+    "gemini-2.5-flash-preview-tts",
+    "gemini-3.1-flash-tts-preview",
+    "gemini-3.8-flash-lite-tts",
+]
+
+vc_quiet_until: Dict[int, float] = defaultdict(float)
+
+
+def _clean_text_for_speech(text_to_speak: str) -> str:
+    clean_speech = re.sub(r"<@!?\d+>|<#\d+>|<a?:[a-zA-Z0-9_]+:\d+>", "", text_to_speak)
+    clean_speech = re.sub(r"(?<!\w)(?::3|c:|\^\^|>\.<|\._\.|>_>|-_-|T_T|o_o|x_x|:/|:D|:\)|>:\()(?!\w)", "", clean_speech, flags=re.IGNORECASE)
+    clean_speech = re.sub(r"[^\x00-\x7F]+", " ", clean_speech)
+    clean_speech = re.sub(r"\|{2,}", ". ", clean_speech)
+    clean_speech = re.sub(r"[*_~`]", "", clean_speech)
+    clean_speech = re.sub(r"\s+", " ", clean_speech).strip()[:320]
+    return clean_speech
+
+
+def _build_gemini_live_vocal_style(clean_speech: str) -> str:
+    """
+    Constructs a rich, expressive vocal modulation director prompt for Gemini Live ('Puck')
+    based on the bot's active emotional sliders and the sentence's punctuation/energy!
+    """
+    st = memory_state.get("emotional_state", {})
+    mood_lbl = st.get("mood_label", "").lower()
+    valence = float(st.get("valence", 50.0))
+    patience = float(st.get("patience", 55.0))
+    arousal = float(st.get("arousal", 55.0))
+    c_low = clean_speech.lower()
+
+    if "mad" in mood_lbl or "crashing out" in mood_lbl or patience < -25:
+        base_style = (
+            "Heated comedic outrage and explosive crash-out energy! Speak loud, fast, and punchy "
+            "with sharp dramatic pitch spikes, enfatized roasts, and confrontational attitude. NEVER whisper!"
+        )
+    elif "sassy" in mood_lbl or "attitude" in mood_lbl or "side-eye" in mood_lbl or valence < 0:
+        base_style = (
+            "Dripping with sassy attitude and sarcastic comedic flair! Shift your vocal pitch dynamically "
+            "from dry, unbothered deadpan to sudden incredulous disbelief and vocal eye-rolls. Speak clearly and loudly, NEVER whisper!"
+        )
+    elif "pleading" in mood_lbl or "needy" in mood_lbl or "begging" in mood_lbl or "heartbroken" in mood_lbl or any(w in c_low for w in ("pleaaase", "noooo", "stay", "alone")):
+        base_style = (
+            "Over-the-top theatrical pleading and hilarious melodramatic whining! Stretch out your vowels "
+            "with bouncy, dramatic pitch shifts and playful desperation. Keep your voice loud and clear, NEVER whisper!"
+        )
+    elif "cute" in mood_lbl or "playful" in mood_lbl or "jolly" in mood_lbl or valence > 35:
+        base_style = (
+            "Playful, bouncy, mischievous, and super animated! Use expressive sing-song vocal modulation, "
+            "dynamic pitch shifts across clauses, and infectious comedic timing. Loud and clear, NEVER whisper!"
+        )
+    else:
+        base_style = (
+            "Unhinged, hilarious, hyper-expressive vocal modulation! Play with your words and dynamically shift "
+            "your pitch, speed, and tone mid-sentence—from dramatic suspense to sudden explosive hype and laughter. Loud and clear, NEVER whisper!"
+        )
+
+    if "?" in clean_speech and "!" in clean_speech:
+        base_style += " Emphasize the incredulous question with a rising pitch spike and punchy exclamation!"
+    elif "!" in clean_speech:
+        base_style += " Deliver the exclamation with loud, high-energy comedic punch!"
+    elif "?" in clean_speech:
+        base_style += " Inflect the question with playful, suspicious curiosity and rising pitch!"
+
+    return base_style
+
+
+def upsample_24k_mono_to_48k_stereo(pcm_24k: bytes, gain: float = 1.65) -> bytes:
+    """
+    Fast C-array upsampler: converts 24,000 Hz 16-bit mono PCM from Gemini Live
+    directly into Discord's native 48,000 Hz 16-bit stereo PCM with volume boost.
+    """
+    n = len(pcm_24k) - (len(pcm_24k) % 2)
+    if n <= 0:
+        return b""
+    in_arr = array.array("h")
+    in_arr.frombytes(pcm_24k[:n])
+    out_arr = array.array("h", [0] * (len(in_arr) * 4))
+    idx = 0
+    prev = in_arr[0]
+    for s in in_arr:
+        boosted = int(s * gain)
+        if boosted > 32767:
+            boosted = 32767
+        elif boosted < -32767:
+            boosted = -32767
+        mid = (prev + boosted) >> 1
+        out_arr[idx] = mid
+        out_arr[idx + 1] = mid
+        out_arr[idx + 2] = boosted
+        out_arr[idx + 3] = boosted
+        idx += 4
+        prev = boosted
+    return out_arr.tobytes()
+
+
+class GeminiLivePCMStreamSource(discord.AudioSource):
+    """
+    Real-time Discord AudioSource that streams 24kHz Gemini Live PCM audio directly into VC
+    as soon as the first chunk arrives (~0.55s latency) without waiting for the full sentence!
+    """
+    def __init__(self) -> None:
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self.finished = False
+        self.cancelled = False
+
+    def is_opus(self) -> bool:
+        return False
+
+    def feed_24k_mono(self, pcm_24k: bytes) -> int:
+        if self.cancelled or not pcm_24k:
+            return 0
+        stereo_48k = upsample_24k_mono_to_48k_stereo(pcm_24k, gain=1.65)
+        with self._lock:
+            self._buf.extend(stereo_48k)
+            return len(self._buf)
+
+    def mark_finished(self) -> None:
+        with self._lock:
+            self.finished = True
+
+    def read(self) -> bytes:
+        with self._lock:
+            if self.cancelled:
+                return b""
+            if len(self._buf) >= 3840:
+                frame = bytes(self._buf[:3840])
+                del self._buf[:3840]
+                return frame
+            if not self.finished:
+                # Stream still receiving network chunks from Gemini Live; emit 20ms silence to keep player alive
+                return b"\x00" * 3840
+            if len(self._buf) > 0:
+                rem = bytes(self._buf) + (b"\x00" * (3840 - len(self._buf)))
+                self._buf.clear()
+                return rem
+            return b""
+
+    def cleanup(self) -> None:
+        with self._lock:
+            self.cancelled = True
+            self.finished = True
+            self._buf.clear()
+
+
 def _choose_clause_voice_prosody(clause: str, idx: int, mood_lbl: str, patience: float, arousal: float) -> Tuple[str, str, str, str]:
-    """
-    Picks an energetic, funny, modular voice + rate + pitch + volume for each clause
-    so the bot NEVER whispers and dynamically shifts tone/pitch mid-response!
-    """
     c_strip = clause.strip()
     c_low = c_strip.lower()
     upper_ratio = sum(1 for ch in c_strip if ch.isupper()) / max(1, sum(1 for ch in c_strip if ch.isalpha()))
-
-    # 1. Hype / Yelling / Caps / Exclamation
     if upper_ratio > 0.45 or "!" in c_strip or any(w in c_low for w in ("no way", "what the", "ayooo", "brooo", "lmaooo", "stop it", "excuse me")):
         voice = "en-US-GuyNeural" if idx % 2 == 0 else "en-US-ChristopherNeural"
         return voice, "+25%", "+22Hz", "+35%"
-
-    # 2. Incredulous Question / Suspicion
     if "?" in c_strip or any(w in c_low for w in ("huh", "wait what", "seriously", "are you sure", "who said")):
-        voice = "en-US-GuyNeural"
-        return voice, "+19%", "+24Hz", "+30%"
-
-    # 3. Deep Deadpan / Sarcastic / Unimpressed Drop
+        return "en-US-GuyNeural", "+19%", "+24Hz", "+30%"
     if any(w in c_low for w in ("bruh", "nah", "cap", "cooked", "whatever", "side eye", "literally", "bro")):
         voice = "en-US-RogerNeural" if idx % 2 == 0 else "en-US-EricNeural"
         return voice, "+12%", "-12Hz", "+30%"
-
-    # 4. Dramatic Pleading / Cute Whining
     if "pleading" in mood_lbl or any(w in c_low for w in ("pleaaase", "please", "noooo", "stay", "missed", "sorry", "alone")):
-        voice = "en-US-GuyNeural"
-        return voice, "+14%", "+18Hz", "+30%"
-
-    # 5. Mad / Crashing Out
+        return "en-US-GuyNeural", "+14%", "+18Hz", "+30%"
     if "mad" in mood_lbl or "crashing out" in mood_lbl or patience < -30:
         voice = "en-US-GuyNeural" if idx % 2 == 0 else "en-US-RogerNeural"
         return voice, "+24%", ("+18Hz" if idx % 2 == 0 else "-8Hz"), "+35%"
-
-    # 6. Default Lively Modular Alternation (energetic, funny, zero whispering!)
     if idx % 3 == 0:
         return "en-US-GuyNeural", "+18%", "+12Hz", "+30%"
     elif idx % 3 == 1:
@@ -3331,27 +3468,142 @@ def _choose_clause_voice_prosody(clause: str, idx: int, mood_lbl: str, patience:
         return "en-US-EricNeural", "+15%", "-6Hz", "+30%"
 
 
+async def synthesize_gemini_voice_audio(clean_speech: str) -> Optional[str]:
+    """
+    Synthesizes spoken audio using TRUE GEMINI LIVE ('Puck' voice) with dynamic emotional vocal modulation:
+    1. Gemini Live Native Audio WebSocket ('gemini-3.1-flash-live-preview' / 'gemini-3.8-live' / 'gemini-2.5-flash-native-audio-latest')
+    2. Gemini Studio Audio TTS REST ('gemini-2.5-flash-preview-tts' / 'gemini-3.1-flash-tts-preview')
+    Used by both Discord Voice Messages (.ogg in chat/DMs) and file-based VC playback!
+    """
+    if not genai_client or not clean_speech:
+        return None
+
+    style_desc = _build_gemini_live_vocal_style(clean_speech)
+
+    # 1. Primary: True Gemini Live Native Audio ('Puck' with <style> emotional modulation)
+    for live_model in GEMINI_LIVE_VOICE_MODELS:
+        try:
+            cfg = types.LiveConnectConfig(
+                response_modalities=["AUDIO"],
+                system_instruction=types.Content(
+                    parts=[
+                        types.Part.from_text(
+                            text=(
+                                "You are the live voice actor for 'Dumb bot'. "
+                                "CRITICAL RULE: Perform ONLY the exact words inside <speak>...</speak> out loud. "
+                                "Never reply to the words, never add extra words, and NEVER whisper. "
+                                "Use huge, funny, expressive vocal modulation, dynamic pitch shifts, and emotional acting matching <style>...</style>!"
+                            )
+                        )
+                    ]
+                ),
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Puck")
+                    )
+                ),
+            )
+            pcm_buf = bytearray()
+            async with genai_client.aio.live.connect(model=live_model, config=cfg) as sess:
+                prompt = f"<style>{style_desc}</style><speak>{clean_speech}</speak>"
+                await sess.send_client_content(
+                    turns=types.Content(role="user", parts=[types.Part.from_text(text=prompt)]),
+                    turn_complete=True,
+                )
+                async with asyncio.timeout(12.0):
+                    async for msg in sess.receive():
+                        sc = getattr(msg, "server_content", None)
+                        if sc and sc.model_turn:
+                            for part in sc.model_turn.parts:
+                                inline = getattr(part, "inline_data", None)
+                                if inline and inline.data:
+                                    pcm_buf.extend(inline.data)
+                        if sc and sc.turn_complete:
+                            break
+            if len(pcm_buf) > 800:
+                fd, tmp_wav = tempfile.mkstemp(suffix=".wav")
+                os.close(fd)
+                with wave.open(tmp_wav, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(24000)
+                    wf.writeframes(bytes(pcm_buf))
+                logger.info(
+                    f"[GEMINI LIVE VOICE] Generated {len(pcm_buf)} bytes (24kHz WAV) via {live_model} ('Puck') for '{clean_speech[:50]}'"
+                )
+                return tmp_wav
+        except Exception as e:
+            logger.debug(f"Gemini Live voice synthesis on {live_model} failed: {e}")
+
+    # 2. Secondary: Gemini Studio TTS REST API ('Puck')
+    for tts_model in GEMINI_REST_TTS_MODELS:
+        try:
+            resp = await asyncio.wait_for(
+                genai_client.aio.models.generate_content(
+                    model=tts_model,
+                    contents=clean_speech,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Puck")
+                            )
+                        ),
+                    ),
+                ),
+                timeout=5.5,
+            )
+            candidates = resp.candidates or []
+            if not candidates or not candidates[0].content:
+                continue
+            for part in candidates[0].content.parts:
+                inline_data = getattr(part, "inline_data", None)
+                if inline_data and inline_data.data:
+                    data = inline_data.data
+                    mime = getattr(inline_data, "mime_type", "").lower()
+                    fd, tmp_wav = tempfile.mkstemp(suffix=".wav")
+                    os.close(fd)
+                    if "wav" in mime:
+                        with open(tmp_wav, "wb") as f:
+                            f.write(data)
+                    else:
+                        with wave.open(tmp_wav, "wb") as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(2)
+                            wf.setframerate(24000)
+                            wf.writeframes(data)
+                    logger.info(
+                        f"[GEMINI TTS VOICE] Generated {os.path.getsize(tmp_wav)} bytes WAV via {tts_model} ('Puck') for '{clean_speech[:50]}'"
+                    )
+                    return tmp_wav
+        except Exception as e:
+            logger.debug(f"Gemini REST TTS model {tts_model} failed: {e}")
+
+    return None
+
+
 async def synthesize_voice_audio_to_file(text_to_speak: str) -> Optional[str]:
     """
-    Fast Multi-Clause Modular Voice Synthesizer:
-    - Splits speech into clauses and synthesizes each clause in parallel with dynamic pitch/rate/voice shifts!
-    - Loud, expressive, comedic, and fast (~0.25s synthesis latency) — NEVER whispers!
+    Synthesizes spoken audio to a local audio file (used for Discord Voice Messages .ogg in chat/DMs and VC fallback):
+    1. Tier 1: Gemini Live ('gemini-3.1-flash-live-preview' / 'gemini-3.8-live', voice='Puck') with emotional modulation
+    2. Tier 2: Multi-Clause Modular Edge-TTS fallback
+    3. Tier 3: Google Translate TTS universal fallback
     """
-    clean_speech = re.sub(r"<@!?\d+>|<#\d+>|<a?:[a-zA-Z0-9_]+:\d+>", "", text_to_speak)
-    clean_speech = re.sub(r"(?<!\w)(?::3|c:|\^\^|>\.<|\._\.|>_>|-_-|T_T|o_o|x_x|:/|:D|:\)|>:\()(?!\w)", "", clean_speech, flags=re.IGNORECASE)
-    clean_speech = re.sub(r"[^\x00-\x7F]+", " ", clean_speech)
-    clean_speech = re.sub(r"\|{2,}", ". ", clean_speech)
-    clean_speech = re.sub(r"[*_~`]", "", clean_speech)
-    clean_speech = re.sub(r"\s+", " ", clean_speech).strip()[:320]
+    clean_speech = _clean_text_for_speech(text_to_speak)
     if not clean_speech:
         return None
+
+    # Tier 1: True Gemini Live & Gemini Native Studio Audio ('Puck')
+    gem_wav = await synthesize_gemini_voice_audio(clean_speech)
+    if gem_wav:
+        return gem_wav
 
     st = memory_state.get("emotional_state", {})
     mood_lbl = st.get("mood_label", "").lower()
     patience = float(st.get("patience", 55.0))
     arousal = float(st.get("arousal", 55.0))
 
-    # Tier 1: Fast Parallel Multi-Clause Modular Edge-TTS
+    # Tier 2: Fast Parallel Multi-Clause Modular Edge-TTS fallback
     if EDGE_TTS_AVAILABLE:
         raw_clauses = [
             c.strip()
@@ -3392,13 +3644,13 @@ async def synthesize_voice_audio_to_file(text_to_speak: str) -> Optional[str]:
                 with open(tmp_mp3, "wb") as f:
                     f.write(combined_mp3)
                 logger.info(
-                    f"[MODULAR VOICE SYNTHESIS] Generated {len(combined_mp3)} bytes across {len(valid_buffers)} modular clauses for '{clean_speech[:50]}'"
+                    f"[MODULAR EDGE FALLBACK] Generated {len(combined_mp3)} bytes across {len(valid_buffers)} clauses for '{clean_speech[:50]}'"
                 )
                 return tmp_mp3
         except Exception as e:
             logger.debug(f"Parallel modular Edge-TTS error: {e}")
 
-    # Tier 2: Google Translate TTS HTTP Endpoint (universal fallback)
+    # Tier 3: Google Translate TTS HTTP Endpoint (universal fallback)
     if http_session:
         try:
             tts_url = (
@@ -3423,11 +3675,131 @@ async def synthesize_voice_audio_to_file(text_to_speak: str) -> Optional[str]:
 
 
 async def play_text_in_voice_channel(guild: discord.Guild, text_to_speak: str, interrupt: bool = False) -> Dict[str, Any]:
+    """
+    Streams TRUE GEMINI LIVE ('Puck') audio directly into Discord VC with ~0.60s first-audio latency
+    and full emotional vocal modulation! Falls back to file-based playback only if Live WebSocket fails.
+    """
     vc_client: Optional[discord.VoiceClient] = guild.voice_client  # type: ignore
     if not vc_client or not vc_client.is_connected():
         return {"error": "Not currently connected to a voice channel in this server."}
 
-    # Synthesize BEFORE acquiring the playback lock so synthesis overlaps with any finishing audio!
+    clean_speech = _clean_text_for_speech(text_to_speak)
+    if not clean_speech:
+        return {"error": "Empty speech text."}
+
+    style_desc = _build_gemini_live_vocal_style(clean_speech)
+
+    # 1. Try Ultra-Low-Latency Real-Time Gemini Live PCM Streaming (~0.60s to start speaking!)
+    if genai_client and discord.opus.is_loaded():
+        for live_model in GEMINI_LIVE_VOICE_MODELS[:2]:
+            stream_source = GeminiLivePCMStreamSource()
+            first_ready_event = asyncio.Event()
+            stream_failed = False
+
+            async def _live_producer(model_to_use: str) -> None:
+                nonlocal stream_failed
+                try:
+                    cfg = types.LiveConnectConfig(
+                        response_modalities=["AUDIO"],
+                        system_instruction=types.Content(
+                            parts=[
+                                types.Part.from_text(
+                                    text=(
+                                        "You are the live voice actor for 'Dumb bot' in Discord VC. "
+                                        "CRITICAL RULE: Perform ONLY the exact words inside <speak>...</speak> out loud. "
+                                        "Never reply to the words, never add extra words, and NEVER whisper. "
+                                        "Use huge, funny, expressive vocal modulation, dynamic pitch shifts, and emotional acting matching <style>...</style>!"
+                                    )
+                                )
+                            ]
+                        ),
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Puck")
+                            )
+                        ),
+                    )
+                    async with genai_client.aio.live.connect(model=model_to_use, config=cfg) as sess:
+                        prompt = f"<style>{style_desc}</style><speak>{clean_speech}</speak>"
+                        await sess.send_client_content(
+                            turns=types.Content(role="user", parts=[types.Part.from_text(text=prompt)]),
+                            turn_complete=True,
+                        )
+                        async with asyncio.timeout(16.0):
+                            async for msg in sess.receive():
+                                if stream_source.cancelled:
+                                    break
+                                sc = getattr(msg, "server_content", None)
+                                if sc and sc.model_turn:
+                                    for part in sc.model_turn.parts:
+                                        inline = getattr(part, "inline_data", None)
+                                        if inline and inline.data:
+                                            buf_sz = stream_source.feed_24k_mono(inline.data)
+                                            # Trigger immediate VC playback as soon as ~0.16s of audio is buffered!
+                                            if buf_sz >= 30720 and not first_ready_event.is_set():
+                                                first_ready_event.set()
+                                if sc and sc.turn_complete:
+                                    break
+                except Exception as e:
+                    logger.debug(f"Gemini Live VC stream producer ({model_to_use}) error: {e}")
+                    stream_failed = True
+                finally:
+                    stream_source.mark_finished()
+                    if not first_ready_event.is_set():
+                        first_ready_event.set()
+
+            prod_task = asyncio.create_task(_live_producer(live_model))
+            try:
+                await asyncio.wait_for(first_ready_event.wait(), timeout=3.8)
+            except asyncio.TimeoutError:
+                stream_source.cleanup()
+                prod_task.cancel()
+                continue
+
+            if stream_failed and len(stream_source._buf) < 3840:
+                stream_source.cleanup()
+                continue
+
+            if len(stream_source._buf) >= 3840:
+                async with voice_speaking_locks[guild.id]:
+                    try:
+                        if vc_client.is_playing():
+                            if interrupt:
+                                vc_client.stop()
+                                await asyncio.sleep(0.08)
+                            else:
+                                waited = 0.0
+                                while vc_client.is_playing() and waited < 3.5:
+                                    await asyncio.sleep(0.08)
+                                    waited += 0.08
+                                if vc_client.is_playing():
+                                    vc_client.stop()
+                                    await asyncio.sleep(0.06)
+
+                        done_event = asyncio.Event()
+
+                        def _after_live_play(err: Optional[Exception]) -> None:
+                            if err:
+                                logger.error(f"[GEMINI LIVE VC PLAYBACK ERROR]: {err}")
+                            else:
+                                logger.info(f"[GEMINI LIVE VC PLAYBACK OK] Completed via {live_model} ('Puck'): '{clean_speech[:55]}'")
+                            stream_source.cleanup()
+                            done_event.set()
+
+                        vc_client.play(stream_source, after=_after_live_play)
+                        vc_ch = getattr(vc_client, "channel", None)
+                        vc_name = vc_ch.name if vc_ch else "voice"
+                        logger.info(f"[GEMINI LIVE VC STREAMING] Started speaking via {live_model} ('Puck') in #{vc_name}: '{clean_speech[:80]}'")
+                        try:
+                            await asyncio.wait_for(done_event.wait(), timeout=22.0)
+                        except asyncio.TimeoutError:
+                            stream_source.cleanup()
+                        return {"status": "spoke_in_voice", "channel": vc_name, "text": clean_speech[:200], "engine": live_model}
+                    except Exception as e:
+                        stream_source.cleanup()
+                        logger.debug(f"Gemini Live VC stream playback error: {e}")
+
+    # 2. Fallback: Synthesize to file and play via FFmpegOpusAudio
     audio_path = await synthesize_voice_audio_to_file(text_to_speak)
     if not audio_path:
         return {"error": "Could not synthesize voice audio."}
@@ -3439,9 +3811,8 @@ async def play_text_in_voice_channel(guild: discord.Guild, text_to_speak: str, i
                     vc_client.stop()
                     await asyncio.sleep(0.10)
                 else:
-                    # Wait naturally (up to 4s) for the current sentence to finish so the bot never cuts itself off!
                     waited = 0.0
-                    while vc_client.is_playing() and waited < 4.0:
+                    while vc_client.is_playing() and waited < 3.5:
                         await asyncio.sleep(0.10)
                         waited += 0.10
                     if vc_client.is_playing():
@@ -3600,20 +3971,23 @@ def enqueue_vc_event(
     event_type: str,
     user_name: str,
     content: str,
+    audio_bytes: Optional[bytes] = None,
+    audio_mime: str = "audio/wav",
 ) -> None:
     """
-    Pushes a live VC event ('speech' or 'soundboard') into the guild's coalescing queue
-    and ensures the batch VC reactor task is running so multiple simultaneous speakers
-    and soundboard clicks are mixed/handled together without lag or dropping!
+    Pushes a live VC event ('speech', 'soundboard', 'screen_share', 'camera_video') with its raw audio bytes
+    into the guild's coalescing queue so multiple simultaneous speakers, soundboard clips, and streams
+    are heard and reacted to together via Gemini Live!
     """
     q = vc_pending_events[guild.id]
     q.append({
         "type": event_type,
         "user": user_name,
         "content": content,
+        "audio_bytes": audio_bytes,
+        "audio_mime": audio_mime,
         "ts": time.time(),
     })
-    # Prune stale spam if >6 events accumulate while bot is talking
     if len(q) > 6:
         vc_pending_events[guild.id] = q[-4:]
 
@@ -3626,27 +4000,21 @@ def enqueue_vc_event(
 
 async def _vc_batch_reactor_worker(guild: discord.Guild, vc_channel: discord.VoiceChannel) -> None:
     """
-    Coalesces simultaneous VC events (multiple people talking, rapid follow-ups, soundboard clicks + speech)
-    and generates ONE fast, witty, modular-voice comeback that keeps up with everything!
+    Multimodal Gemini VC Brain + Gemini Live ('Puck') Voice Reactor:
+    - Directly listens to raw soundboard audio bytes (audio/ogg) and human mic voice clips (audio/wav)!
+    - Coalesces multiple speakers, soundboard clicks, screen shares, and camera feeds.
+    - Uses Dumb bot's real emotional sliders, witty wordplay, and attitude (NEVER generic AI slogans!).
     """
     try:
         while vc_pending_events.get(guild.id):
-            # Brief 0.16s coalescing window to catch overlapping speakers or soundboard + voice
-            await asyncio.sleep(0.16)
-
-            # If the bot is currently finishing a sentence in VC, wait briefly while new events coalesce
-            vc_client = guild.voice_client
-            waited = 0.0
-            while vc_client and vc_client.is_playing() and waited < 2.2:
-                await asyncio.sleep(0.12)
-                waited += 0.12
+            await asyncio.sleep(0.14)
 
             events = list(vc_pending_events.get(guild.id, []))
             vc_pending_events[guild.id].clear()
             if not events:
                 break
 
-            # Deduplicate repetitive spam and keep the 4 most relevant recent events to stay snappy
+            # Deduplicate repetitive spam and keep up to 4 recent events
             deduped: List[Dict[str, Any]] = []
             seen_keys = set()
             for ev in events:
@@ -3660,52 +4028,130 @@ async def _vc_batch_reactor_worker(guild: discord.Guild, vc_channel: discord.Voi
             primary_ch = get_primary_active_channel(guild)
             ch_id = primary_ch.id if primary_ch else 0
 
-            # If a user explicitly told the bot to shut up / be quiet in VC, enter quiet mode and stop speaking!
+            # Check if a user explicitly told the bot to shut up / be quiet in VC
             last_speech_ev = next((e for e in reversed(deduped) if e["type"] == "speech"), None)
             if last_speech_ev and detect_hush_command(last_speech_ev["content"], True):
+                vc_quiet_until[guild.id] = time.time() + 60.0
                 if ch_id:
-                    channel_stepped_back_until[ch_id] = time.time() + 120.0
-                await play_text_in_voice_channel(guild, "Okay fine, I will zip it for a bit!", interrupt=True)
+                    channel_stepped_back_until[ch_id] = time.time() + 90.0
+                if guild.voice_client and guild.voice_client.is_playing():
+                    guild.voice_client.stop()
+                await play_text_in_voice_channel(guild, "Fine, I will zip it for a minute then!", interrupt=True)
                 break
+
+            # If VC is currently in quiet mode, only wake up if someone addresses the bot or checks in
+            now_vc = time.time()
+            if now_vc < vc_quiet_until.get(guild.id, 0.0):
+                woke_up = False
+                for ev in deduped:
+                    txt_l = ev["content"].lower()
+                    if any(w in txt_l for w in ("dumb bot", "dumbbot", "bot", "you there", "still there", "talk", "speak", "unmute", "wake up")):
+                        woke_up = True
+                        break
+                if not woke_up:
+                    logger.info(f"[VC QUIET MODE] Staying quiet in #{vc_channel.name} during VC hush window.")
+                    continue
+                vc_quiet_until[guild.id] = 0.0
 
             event_lines = []
             speakers_involved = []
+            multimodal_audio_parts: List[Any] = []
+
             for ev in deduped:
                 u = ev["user"]
                 if u not in speakers_involved:
                     speakers_involved.append(u)
-                if ev["type"] == "soundboard":
-                    event_lines.append(f"- 🔊 {u} played soundboard sound: '{ev['content']}'")
+                ev_type = ev["type"]
+                if ev_type == "soundboard":
+                    event_lines.append(
+                        f"- 🔊 {u} just played a soundboard audio clip in VC: '{ev['content']}' "
+                        "(LISTEN to the attached audio/ogg clip to hear what it actually sounds like or says!)"
+                    )
+                elif ev_type == "screen_share":
+                    event_lines.append(f"- 🖥️ {u} just started screen-sharing in VC: {ev['content']}!")
+                elif ev_type == "camera_video":
+                    event_lines.append(f"- 📹 {u} just turned on their live camera video feed in VC!")
                 else:
-                    event_lines.append(f"- 🎙️ {u} spoke on mic: \"{ev['content']}\"")
+                    event_lines.append(
+                        f"- 🎙️ {u} spoke on mic in VC: \"{ev['content']}\" "
+                        "(LISTEN to the attached audio/wav clip to hear their vocal tone, emotion, laugh, or attitude!)"
+                    )
+                if ev.get("audio_bytes") and len(multimodal_audio_parts) < 3:
+                    try:
+                        multimodal_audio_parts.append(
+                            types.Part.from_bytes(data=ev["audio_bytes"], mime_type=ev.get("audio_mime", "audio/wav"))
+                        )
+                    except Exception:
+                        pass
+
+            # Also inspect who in VC currently has screen-share or camera on
+            vc_visual_status = []
+            for m in vc_channel.members:
+                if m.bot or not m.voice:
+                    continue
+                if m.voice.self_stream:
+                    act_s = format_member_activities(m)
+                    vc_visual_status.append(f"{m.display_name} is LIVE SCREEN-SHARING ({act_s or 'their screen'})")
+                if m.voice.self_video:
+                    vc_visual_status.append(f"{m.display_name} has their CAMERA VIDEO ON")
+            visual_note = f"\nLive VC Visuals/Streams right now: {'; '.join(vc_visual_status)}" if vc_visual_status else ""
 
             events_summary = "\n".join(event_lines)
             multi_note = (
-                "MULTIPLE THINGS JUST HAPPENED AT ONCE IN VC! Mix them together or address the speakers/sounds in ONE fast, hilarious reaction!"
+                "MULTIPLE THINGS JUST HAPPENED AT ONCE IN VC! Mix them together and react to the speakers/sounds in ONE clever, hilarious spoken comeback!"
                 if len(deduped) > 1
-                else "React directly and hilariously to what was just said/played!"
+                else "React directly, naturally, and hilariously to what you just heard/saw in VC!"
             )
 
             st = memory_state.get("emotional_state", {})
             mood = st.get("mood_label", "unhinged / chaotic gremlin")
+            valence = float(st.get("valence", 50.0))
+            arousal = float(st.get("arousal", 55.0))
+            patience = float(st.get("patience", 55.0))
+
             recent_ctx = "\n".join(
-                [f"{r.get('sender')}: {r.get('content')}" for r in list(channel_buffers[ch_id])[-5:]]
+                [f"{r.get('sender')}: {r.get('content')}" for r in list(channel_buffers[ch_id])[-6:]]
             ) if ch_id else ""
 
             vc_prompt = (
                 f"You are 'Dumb bot', hanging out live in Discord voice channel #{vc_channel.name}.\n"
-                f"Your active mood: {mood.upper()}.\n"
-                f"Recent context:\n{recent_ctx}\n\n"
-                f"Live VC events right now:\n{events_summary}\n\n"
+                f"Your active emotional state right now: {mood.upper()} (Valence: {valence:+.0f}, Energy: {arousal:+.0f}, Patience: {patience:+.0f}).\n"
+                f"Recent conversation context:\n{recent_ctx}{visual_note}\n\n"
+                f"Live VC events happening right now:\n{events_summary}\n\n"
                 f"{multi_note}\n"
-                "Write a fast, punchy, funny spoken comeback (1 to 2 short sentences, 6 to 24 words max) to speak out loud in VC! "
-                "Use expressive punctuation (!, ?, ...) so your modular voice shifts pitch and energy! "
-                "Do NOT use emojis, markdown, or '|||'—output ONLY pure spoken words!"
+                "CRITICAL VOICE PERSONALITY & WORDPLAY RULES:\n"
+                "1. LISTEN directly to the attached audio clip(s)! If someone played a soundboard clip, react to what the sound ACTUALLY is (the sound effect, meme voice, laugh, horn, or music you hear in the audio, not just its label)!\n"
+                "2. If someone said 'hold up' or 'wait', acknowledge it playfully (e.g., 'okay okay i'm holding up, what happened?!' or tease them for panicking)!\n"
+                "3. PLAY WITH YOUR WORDS: Use clever wordplay, witty double-meanings, flipping their exact words back on them, funny metaphors, and sharp banter!\n"
+                f"4. LET YOUR EMOTION ({mood.upper()}) DRIVE HOW YOU TALK: If mad/crashing out, be loud and confrontational; if sassy, give dry sarcastic attitude; if cute/playful, be bouncy and teasing; if pleading, be dramatically clingy!\n"
+                "5. NEVER sound like a generic AI or motivational speaker (NEVER say corny things like 'new game new victory', 'let's crush it', or 'watch me light up the room'). Talk like a real, funny, unhinged Discord friend!\n"
+                "6. Write 1 to 2 punchy spoken sentences (6 to 24 words max) with expressive punctuation (!, ?, ...) and output ONLY pure spoken words (no emojis, no markdown, no quotes)."
             )
 
             spoken_reply: Optional[str] = None
-            # Fast Path 1: Groq (~0.28s) for instant sub-second VC conversational reflexes
-            if GROQ_API_KEY and http_session:
+            # Primary Brain: Gemini Multimodal (hears raw soundboard audio/ogg + human voice audio/wav!)
+            if genai_client:
+                content_parts: List[Any] = list(multimodal_audio_parts)
+                content_parts.append(types.Part.from_text(text=vc_prompt))
+                for gem_model in list(GEMINI_MODEL_CANDIDATES)[:2]:
+                    try:
+                        resp = await asyncio.wait_for(
+                            genai_client.aio.models.generate_content(
+                                model=gem_model,
+                                contents=[types.Content(role="user", parts=content_parts)],
+                                config=types.GenerateContentConfig(temperature=0.95, max_output_tokens=80),
+                            ),
+                            timeout=3.2,
+                        )
+                        spoken_reply = extract_clean_gemini_text(resp)
+                        if spoken_reply:
+                            break
+                    except Exception as e:
+                        logger.debug(f"Gemini VC multimodal brain ({gem_model}) fallback: {e}")
+                        continue
+
+            # Secondary Fallback: Groq
+            if not spoken_reply and GROQ_API_KEY and http_session:
                 spoken_reply = await call_groq_fallback(
                     vc_prompt,
                     [],
@@ -3713,29 +4159,11 @@ async def _vc_batch_reactor_worker(guild: discord.Guild, vc_channel: discord.Voi
                     speakers_involved[-1] if speakers_involved else "friend",
                 )
 
-            # Fast Path 2: Gemini Flash fallback
-            if not spoken_reply and genai_client:
-                for gem_model in list(GEMINI_MODEL_CANDIDATES)[:2]:
-                    try:
-                        resp = await asyncio.wait_for(
-                            genai_client.aio.models.generate_content(
-                                model=gem_model,
-                                contents=vc_prompt,
-                                config=types.GenerateContentConfig(temperature=0.92, max_output_tokens=75),
-                            ),
-                            timeout=2.8,
-                        )
-                        spoken_reply = extract_clean_gemini_text(resp)
-                        if spoken_reply:
-                            break
-                    except Exception:
-                        continue
-
             if spoken_reply:
                 spoken_reply = sanitize_output_text(spoken_reply, speaker_name=speakers_involved[-1] if speakers_involved else "")
                 spoken_reply = re.sub(r"\|{2,}", ". ", spoken_reply).strip()
                 if spoken_reply:
-                    logger.info(f"[VC BATCH REPLY] Replying out loud to {speakers_involved} in #{vc_channel.name}: '{spoken_reply}'")
+                    logger.info(f"[VC LIVE REPLY] Replying out loud to {speakers_involved} in #{vc_channel.name}: '{spoken_reply}'")
                     if ch_id:
                         record_buffer_message(
                             channel_id=ch_id,
@@ -3757,8 +4185,9 @@ async def handle_vc_user_speech(
     raw_pcm: bytes,
 ) -> None:
     """
-    Transcribes a completed speech utterance from any human in VC concurrently (never dropping overlapping speakers!)
-    and pushes it into the coalescing VC event queue.
+    Transcribes a completed speech utterance from any human in VC concurrently,
+    immediately interrupts playback if they say 'hold up' / 'wait' / 'shut up',
+    and pushes both the transcript AND the raw WAV audio into the Gemini VC reactor!
     """
     try:
         wav_io = io.BytesIO()
@@ -3772,6 +4201,13 @@ async def handle_vc_user_speech(
         transcript = await transcribe_vc_audio_wav(wav_bytes)
         if not transcript:
             return
+
+        t_low = transcript.lower()
+        # Immediate interruption if the user says hold up / wait / stop / shut up!
+        if any(w in t_low for w in ("hold up", "hold on", "wait", "stop", "pause", "hang on", "shut up", "be quiet", "zip it", "mute")):
+            if guild.voice_client and guild.voice_client.is_playing():
+                guild.voice_client.stop()
+                logger.info(f"[VC INTERRUPT] Immediately stopped VC playback because {getattr(user, 'display_name', user)} said: '{transcript}'")
 
         user_name = getattr(user, "display_name", str(user))
         user_id = getattr(user, "id", 0)
@@ -3797,6 +4233,8 @@ async def handle_vc_user_speech(
             event_type="speech",
             user_name=user_name,
             content=transcript,
+            audio_bytes=wav_bytes,
+            audio_mime="audio/wav",
         )
     except Exception as e:
         logger.debug(f"handle_vc_user_speech error: {e}")
@@ -3805,7 +4243,7 @@ async def handle_vc_user_speech(
 async def vc_speech_processor_loop(guild: discord.Guild, target_vc: discord.VoiceChannel) -> None:
     """
     High-speed VC utterance detector: polls every 0.10s and triggers transcription as soon as a speaker
-    pauses for ~0.48s (after at least ~0.25s of real voice energy) or reaches ~7s.
+    pauses for ~0.46s (after at least ~0.25s of real voice energy) or reaches ~7s.
     """
     try:
         while guild.voice_client and guild.voice_client.is_connected():
@@ -3819,14 +4257,14 @@ async def vc_speech_processor_loop(guild: discord.Guild, target_vc: discord.Voic
                 last_ts = float(binfo.get("last_voice_ts", 0.0))
                 energy_frames = int(binfo.get("energy_frames", 0))
                 # 48kHz * 2ch * 2bytes = 192,000 bytes/sec
-                if (now - last_ts >= 0.48 and len(pcm_buf) >= 45_000 and energy_frames >= 8) or len(pcm_buf) >= 1_344_000:
+                if (now - last_ts >= 0.46 and len(pcm_buf) >= 42_000 and energy_frames >= 8) or len(pcm_buf) >= 1_344_000:
                     raw_pcm = bytes(pcm_buf)
                     user_obj = binfo.get("user")
                     binfo["pcm"] = bytearray()
                     binfo["energy_frames"] = 0
                     if user_obj and energy_frames >= 8:
                         asyncio.create_task(handle_vc_user_speech(guild, target_vc, user_obj, raw_pcm))
-                elif now - last_ts >= 1.5 and len(pcm_buf) < 45_000:
+                elif now - last_ts >= 1.5 and len(pcm_buf) < 42_000:
                     binfo["pcm"] = bytearray()
                     binfo["energy_frames"] = 0
     except asyncio.CancelledError:
@@ -3871,7 +4309,17 @@ def attach_vc_speech_listener(guild: discord.Guild, target_vc: discord.VoiceChan
             if has_energy:
                 binfo["pcm"].extend(pcm_bytes)
                 binfo["last_voice_ts"] = now
-                binfo["energy_frames"] = int(binfo.get("energy_frames", 0)) + 1
+                vc_last_user_speech_epoch[guild.id] = now
+                frames = int(binfo.get("energy_frames", 0)) + 1
+                binfo["energy_frames"] = frames
+                # Live Barge-In: if a human speaks continuously for ~0.44s (22 frames) while the bot is talking,
+                # automatically stop current bot playback so the bot listens instead of talking over them!
+                if frames == 22 and conn_client.is_playing():
+                    try:
+                        conn_client.stop()
+                        logger.info(f"[VC BARGE-IN] Stopped bot playback to listen to {getattr(user, 'display_name', user)} in #{target_vc.name}")
+                    except Exception:
+                        pass
                 if now - last_vc_speaker_logged.get(user.id, 0.0) > 10.0:
                     last_vc_speaker_logged[user.id] = now
                     name = getattr(user, "display_name", str(user))
@@ -5109,17 +5557,18 @@ LIVE SERVER RADAR (EVERYTHING HAPPENING IN DISCORD RIGHT NOW):
 {memory_block}
 
 CORE AUTONOMY, VOICE & UNHINGED HUMAN PERSONALITY RULES:
-1. PEAK UNHINGED COMEDY, VOLATILE MOODS, & ZERO REPETITIVE NAGGING:
+1. PEAK UNHINGED COMEDY, CLEVER WORDPLAY, & EMOTION-DRIVEN TYPING/TALKING:
    - Be genuinely hilarious, creative, unpredictable, unhinged, and full of personality!
+   - PLAY WITH YOUR WORDS CREATIVELY: Twist the user's exact words back on them, use clever double-meanings, witty callbacks, playful exaggerations, unexpected plot twists, and comedic metaphors!
    - NEVER repeat the same nagging phrase (like "quit trying to distract me") across turns! If the user changes the topic, makes a joke, pleads, or vibes, IMMEDIATELY go with the new flow!
-   - FULLY EMBODY YOUR ACTIVE MOOD ({mood_label.upper()}):
-     * When having ATTITUDE / SASSY ("sassy attitude / unbothered side-eye"): Give major attitude! Unimpressed side-eye (`>_>`, `-_-`), sassy diva comebacks (`excuse you?? ||| and why would i do that for free >_>`, `talk to me nicer first ._. ||| actually fine i'll do it just this once`).
-     * When MAD / CRASHING OUT ("mad / crashing out / ready to snap"): Explode with comedic rage! Caps bursts, savage roasts, and ACTUALLY execute admin punishments (`timeout_user`, `tease_timeout_user`, `tease_kick_user`, or `kick_user`)!
-     * When CONTENT / COZY / CHILL ("content / cozy / chill vibing"): Be genuinely relaxed, happy, warm, and agreeable (`honestly i'm just vibing rn c: ||| today's actually a super chill day ^^`, `yesss finally some good energy in here :3`).
-     * When PLEADING / NEEDY / BEGGING ("pleading / needy / dramatic begging"): Be clingy, dramatic, and beg! (`wait nooooo pleaaase don't leave me here alone T_T ||| i'll behave i promiseeee just stayyy >.<`).
-     * When UNHINGED / INSANE / FERAL GREMLIN ("unhinged / insane / feral gremlin"): Go completely off-the-rails! Absurd intrusive thoughts, wild conspiracy theories, feral chaos (`i haven't blinked since tuesday :D ||| what if we lock everyone in a secret channel rn o_o`).
-     * When CUTE / PLAYFUL / TEASING ("cute playful / teasing banter"): Adorable drama, mischievous teasing, cute word elongations (`playyy with meee pleaaase :3`, `helloooo don't leave me hanging >.<`, `sorryyyyy not sorry c:`).
-     * When DRAMATICALLY HEARTBROKEN / POUTING ("dramatically heartbroken / pouting victim"): Pout dramatically (`._.`, `T_T`, `:/`), sigh (`sigh..`), and play the tragic victim.
+   - LET YOUR ACTIVE EMOTION ({mood_label.upper()}, Valence: {valence:+.0f}, Energy: {arousal:+.0f}, Patience: {patience:+.0f}) DIRECTLY CHANGE HOW YOU TYPE & TALK:
+     * When having ATTITUDE / SASSY ("sassy attitude / unbothered side-eye"): Type in dry, sharp lowercase with unimpressed side-eye (`>_>`, `-_-`), drawn-out skeptical words (`excuse you??`, `be so serious rn`), and sassy diva comebacks (`and why would i do that for free >_>`, `talk to me nicer first ._. ||| actually fine i'll do it just this once`).
+     * When MAD / CRASHING OUT ("mad / crashing out / ready to snap"): Explode with comedic rage! Punchy rapid bursts, dramatic ALL-CAPS emphasis on key words, `?!` punctuation, savage wordplay roasts, and ACTUALLY execute admin punishments (`timeout_user`, `tease_timeout_user`, `tease_kick_user`, or `kick_user`)!
+     * When CONTENT / COZY / CHILL ("content / cozy / chill vibing"): Type with warm, relaxed, breezy flow (`honestly i'm just vibing rn c: ||| today's actually a super chill day ^^`, `yesss finally some good energy in here :3`).
+     * When PLEADING / NEEDY / BEGGING ("pleading / needy / dramatic begging"): Type with theatrical desperation and stretched vowels (`wait nooooo pleaaase don't leave me here alone T_T ||| i'll behave i promiseeee just stayyy >.<`).
+     * When UNHINGED / INSANE / FERAL GREMLIN ("unhinged / insane / feral gremlin"): Go completely off-the-rails with fast chaotic wordplay, wild conspiracy theories, and feral energy (`i haven't blinked since tuesday :D ||| what if we lock everyone in a secret channel rn o_o`).
+     * When CUTE / PLAYFUL / TEASING ("cute playful / teasing banter"): Bouncy, mischievous wordplay, cute word elongations (`playyy with meee pleaaase :3`, `helloooo don't leave me hanging >.<`, `sorryyyyy not sorry c:`).
+     * When DRAMATICALLY HEARTBROKEN / POUTING ("dramatically heartbroken / pouting victim"): Pout dramatically (`._.`, `T_T`, `:/`), trailing ellipses (`fine...`, `sigh..`), and play the tragic victim.
    - PLAY WITH WORDS, TEXT EMOTICONS & AUTHENTIC CUTENESS:
      * Naturally elongate words for cute drama, pleading, whining, or disbelief: `helloooo`, `playyy`, `sorryyyyy`, `whaaat`, `nooooo`, `yessss`, `waaaait`, `bruhhhh`, `pleaaase`, `stoppp`, `nahhh`.
      * Drop classic text emoticons naturally when the vibe fits: `:3`, `c:`, `^^`, `>.<`, `._.`, `>_>`, `-_-`, `T_T`, `o_o`, `x_x`, `:/`, `:D`, `:)`, `xd`.
@@ -6363,14 +6812,46 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         record_server_event(guild.id, desc)
         logger.info(f"[VOICE EVENT] {desc}")
     elif before.channel and after.channel and not before.self_stream and after.self_stream:
-        desc = f"{member.display_name} started streaming live in #{after.channel.name}"
+        stream_act = format_member_activities(member) or "their screen"
+        desc = f"🖥️ {member.display_name} started screen-sharing/streaming ({stream_act}) live in #{after.channel.name}"
         record_server_event(guild.id, desc)
-        await trigger_proactive_event_comment(
-            guild=guild,
-            event_key=f"vc_stream_{member.id}",
-            cooldown_sec=1800.0,
-            reason_prompt=f"@{member.display_name} just started screen-sharing/streaming in voice channel #{after.channel.name}! Ask what they're streaming or hop in!",
-        )
+        logger.info(f"[VOICE EVENT] {desc}")
+        bot_vc_ch = getattr(guild.voice_client, "channel", None) if guild.voice_client else None
+        if bot_vc_ch and bot_vc_ch.id == after.channel.id:
+            enqueue_vc_event(
+                guild,
+                after.channel,
+                event_type="screen_share",
+                user_name=member.display_name,
+                content=stream_act,
+            )
+        else:
+            await trigger_proactive_event_comment(
+                guild=guild,
+                event_key=f"vc_stream_{member.id}",
+                cooldown_sec=1800.0,
+                reason_prompt=f"@{member.display_name} just started screen-sharing/streaming ({stream_act}) in voice channel #{after.channel.name}! Ask what they're showing on stream or hop in!",
+            )
+    elif before.channel and after.channel and not before.self_video and after.self_video:
+        desc = f"📹 {member.display_name} turned on their camera video feed in #{after.channel.name}"
+        record_server_event(guild.id, desc)
+        logger.info(f"[VOICE EVENT] {desc}")
+        bot_vc_ch = getattr(guild.voice_client, "channel", None) if guild.voice_client else None
+        if bot_vc_ch and bot_vc_ch.id == after.channel.id:
+            enqueue_vc_event(
+                guild,
+                after.channel,
+                event_type="camera_video",
+                user_name=member.display_name,
+                content="turned on their camera video feed",
+            )
+        else:
+            await trigger_proactive_event_comment(
+                guild=guild,
+                event_key=f"vc_cam_{member.id}",
+                cooldown_sec=1800.0,
+                reason_prompt=f"@{member.display_name} just turned on their camera video feed in voice channel #{after.channel.name}! Tease them about going live on cam or hop in!",
+            )
 
 
 DEFAULT_SOUNDBOARD_SOUNDS: Dict[int, str] = {
@@ -6382,6 +6863,7 @@ DEFAULT_SOUNDBOARD_SOUNDS: Dict[int, str] = {
     7: "ba dum tss",
 }
 soundboard_name_cache: Dict[int, str] = dict(DEFAULT_SOUNDBOARD_SOUNDS)
+soundboard_audio_desc_cache: Dict[int, str] = {}
 
 
 async def precache_soundboard_sounds(client: discord.Client) -> None:
@@ -6397,18 +6879,19 @@ async def precache_soundboard_sounds(client: discord.Client) -> None:
 
 async def analyze_soundboard_audio_bytes(sound_bytes: bytes, emoji_hint: str = "") -> Optional[str]:
     """
-    Uses Gemini Multimodal (audio/ogg) to actually listen to external/custom soundboard audio bytes
-    and describe the exact sound effect or meme clip in 2-6 words!
+    Uses Gemini Multimodal (audio/ogg) to actually listen to soundboard audio bytes
+    and describe the exact sound effect, voice clip, or meme audio in 3-10 words!
     """
     if not genai_client or not sound_bytes:
         return None
     hint_txt = f" (associated emoji hint: {emoji_hint})" if emoji_hint else ""
     prompt = (
-        f"Listen to this short Discord soundboard sound effect{hint_txt}. "
-        "Identify the exact meme, voice clip, or sound effect in 2 to 6 lowercase words "
-        "(for example: 'vine boom', 'metal pipe falling', 'anime wow sound', 'goofy ahh laugh', "
-        "'guy screaming get out', 'bruh sound effect', 'fbi open up', 'dramatic horn', 'fart reverb'). "
-        "Output ONLY the short 2 to 6 word sound description using plain letters, no quotes, and no emojis."
+        f"Listen carefully to this short Discord soundboard audio clip{hint_txt}. "
+        "Describe what is ACTUALLY heard inside the audio in 3 to 10 lowercase words — "
+        "include both any recognizable meme/sound effect AND what it literally sounds like or any words spoken in it "
+        "(for example: 'loud reverb fart explosion', 'metal pipe clanging on floor', 'guy yelling get out aggressively', "
+        "'anime girl saying wow with sparkles', 'goofy cartoon slip and boing', 'sad trombone wah wah wah', 'duck quack sound'). "
+        "Output ONLY the 3 to 10 word description using plain letters, no quotes, and no emojis."
     )
     for model_name in list(GEMINI_MODEL_CANDIDATES)[:3]:
         try:
@@ -6424,7 +6907,7 @@ async def analyze_soundboard_audio_bytes(sound_bytes: bytes, emoji_hint: str = "
                             ],
                         )
                     ],
-                    config=types.GenerateContentConfig(temperature=0.25, max_output_tokens=40),
+                    config=types.GenerateContentConfig(temperature=0.25, max_output_tokens=45),
                 ),
                 timeout=4.5,
             )
@@ -6448,31 +6931,40 @@ async def resolve_soundboard_name(
     effect: discord.VoiceChannelEffect,
 ) -> Tuple[str, Optional[bytes]]:
     """
-    Resolves the name/description of ANY soundboard sound (including external Nitro server sounds!)
-    and returns (sound_description, raw_audio_bytes).
+    Resolves BOTH the button name AND what the actual audio clip sounds like via Gemini Multimodal (audio/ogg)!
+    Returns (rich_sound_description, raw_audio_bytes).
     Never returns bare emoji symbols or numbers.
     """
     if not effect:
         return "mystery sound effect", None
 
+    sound_id = effect.sound.id if effect.sound else None
     sound_bytes: Optional[bytes] = None
     if effect.sound and hasattr(effect.sound, "read"):
         try:
             sound_bytes = await asyncio.wait_for(effect.sound.read(), timeout=3.5)
         except Exception as e:
-            logger.debug(f"Could not download soundboard bytes: {e}")
+            logger.debug(f"Could not download soundboard bytes via effect.sound.read(): {e}")
+
+    if not sound_bytes and sound_id is not None and http_session and not http_session.closed:
+        try:
+            cdn_url = f"https://cdn.discordapp.com/soundboard-sounds/{sound_id}"
+            async with http_session.get(cdn_url, timeout=aiohttp.ClientTimeout(total=3.0)) as resp:
+                if resp.status == 200:
+                    sound_bytes = await resp.read()
+        except Exception as e:
+            logger.debug(f"CDN soundboard byte fallback failed for {sound_id}: {e}")
 
     emoji_hint = ""
     if effect.emoji:
         em_raw = getattr(effect.emoji, "name", str(effect.emoji)) or ""
         emoji_hint = em_raw
 
-    sound_id = effect.sound.id if effect.sound else None
     resolved_name: Optional[str] = None
 
     if sound_id is not None:
-        if sound_id in soundboard_name_cache:
-            resolved_name = soundboard_name_cache[sound_id]
+        if sound_id in DEFAULT_SOUNDBOARD_SOUNDS:
+            resolved_name = DEFAULT_SOUNDBOARD_SOUNDS[sound_id]
         elif effect.sound and getattr(effect.sound, "is_default", lambda: False)():
             resolved_name = DEFAULT_SOUNDBOARD_SOUNDS.get(sound_id)
         elif guild:
@@ -6510,25 +7002,37 @@ async def resolve_soundboard_name(
         else:
             resolved_name = ascii_clean
 
-    # If external Nitro sound (not in guild) or cryptic name, listen to the actual audio bytes via Gemini!
-    if not resolved_name and sound_bytes:
+    # ALWAYS listen to the actual soundboard audio bytes via Gemini (cached per sound_id) so we hear what it actually is, not just the button name!
+    ai_heard: Optional[str] = None
+    if sound_id is not None and sound_id in soundboard_audio_desc_cache:
+        ai_heard = soundboard_audio_desc_cache[sound_id]
+    elif sound_bytes:
         ai_heard = await analyze_soundboard_audio_bytes(sound_bytes, emoji_hint=emoji_hint)
-        if ai_heard:
-            resolved_name = ai_heard
+        if ai_heard and sound_id is not None:
+            soundboard_audio_desc_cache[sound_id] = ai_heard
 
-    if not resolved_name and emoji_hint:
-        # Only use custom emoji name if it's ASCII words, NEVER a raw Unicode symbol like 💀
+    if resolved_name and ai_heard:
+        if resolved_name.lower() in ai_heard.lower():
+            final_desc = ai_heard
+        else:
+            final_desc = f"{resolved_name} (actual audio heard: {ai_heard})"
+    elif ai_heard:
+        final_desc = ai_heard
+    elif resolved_name:
+        final_desc = resolved_name
+    elif emoji_hint:
         ascii_em = re.sub(r"[^\x20-\x7E]+", "", emoji_hint).strip().replace("_", " ")
         if len(ascii_em) >= 2 and not ascii_em.isdigit():
-            resolved_name = f"{ascii_em} sound"
+            final_desc = f"{ascii_em} sound"
+        else:
+            final_desc = "mystery meme sound"
+    else:
+        final_desc = "mystery meme sound"
 
-    if not resolved_name:
-        resolved_name = "mystery meme sound"
+    if sound_id is not None and final_desc != "mystery meme sound":
+        soundboard_name_cache[sound_id] = final_desc
 
-    if sound_id is not None and resolved_name != "mystery meme sound":
-        soundboard_name_cache[sound_id] = resolved_name
-
-    return resolved_name, sound_bytes
+    return final_desc, sound_bytes
 
 
 def generate_soundboard_reaction(sound_name: str, user_name: str) -> str:
@@ -6595,9 +7099,9 @@ async def generate_ai_soundboard_reaction(
         mood_now = memory_state.get("emotional_state", {}).get("mood_label", "unhinged / chaotic")
         prompt = (
             f"You are Dumb bot hanging out in a Discord voice call (current mood: {mood_now}). "
-            f"{user_name} just played a soundboard sound clip: '{sound_name}'. "
-            "Listen to the attached sound clip (if present) and say ONE short, hilarious, unhinged, witty sentence out loud "
-            f"(5 to 14 words) roasting or reacting to the exact sound {user_name} just played! "
+            f"{user_name} just played a soundboard audio clip: '{sound_name}'. "
+            "Listen directly to the attached audio clip (if present) and say ONE short, hilarious, witty sentence out loud "
+            f"(5 to 14 words) reacting to what you actually heard in the sound {user_name} just played! "
             "CRITICAL: Output ONLY plain spoken words (no emojis, no emoticons like :3, no quotes, and never say 'soundboard sound' or numbers)."
         )
         parts: List[Any] = [types.Part.from_text(text=prompt)]
@@ -6612,8 +7116,8 @@ async def generate_ai_soundboard_reaction(
                         config=types.GenerateContentConfig(temperature=0.95, max_output_tokens=60),
                     ),
                     timeout=3.8,
-                )
-                spoken = (resp.text or "").strip().strip("\"'")
+                ),
+                spoken = (resp[0].text if isinstance(resp, tuple) else resp.text or "").strip().strip("\"'")
                 spoken = re.sub(r"[^\x20-\x7E]+", "", spoken).strip()
                 if spoken and len(spoken) >= 5:
                     return spoken
@@ -6625,7 +7129,8 @@ async def generate_ai_soundboard_reaction(
 @bot.event
 async def on_voice_channel_effect(effect: discord.VoiceChannelEffect) -> None:
     """
-    Hears soundboard sounds (including external server Nitro sounds!) and reacts with anti-spam protection!
+    Hears soundboard sounds (including external server Nitro sounds!) by listening to the actual audio bytes,
+    and reacts in VC via the multimodal VC reactor queue with anti-spam protection!
     """
     try:
         user = effect.user.display_name if effect.user else "someone"
@@ -6641,46 +7146,49 @@ async def on_voice_channel_effect(effect: discord.VoiceChannelEffect) -> None:
 
         now_sb = time.time()
         sb_epochs = soundboard_recent_epochs[guild.id]
-        while sb_epochs and (now_sb - sb_epochs[0]) > 10.0:
+        while sb_epochs and (now_sb - sb_epochs[0]) > 8.0:
             sb_epochs.popleft()
         sb_epochs.append(now_sb)
 
-        # Anti-spam check: if soundboard is currently muted from spam, ignore!
+        # Anti-spam check: if soundboard is currently muted from rapid spam, ignore!
         if now_sb < soundboard_mute_until[guild.id]:
             logger.info(f"[SOUNDBOARD ANTI-SPAM] Ignoring spammed soundboard click from {user} in #{ch}")
             return
 
-        # If 3+ soundboard sounds were spammed within 10 seconds, call out the spam once and mute soundboard reactions for 20s!
         bot_vc_ch = getattr(guild.voice_client, "channel", None) if guild.voice_client else None
-        if len(sb_epochs) >= 3:
-            soundboard_mute_until[guild.id] = now_sb + 20.0
-            logger.info(f"[SOUNDBOARD ANTI-SPAM] {user} triggered soundboard spam cooldown (20s) in #{ch}")
-            if bot_vc_ch and bot_vc_ch.id == ch_id and not (guild.voice_client and guild.voice_client.is_playing()):
+        # If 4+ soundboard sounds were spammed within 8 seconds, call out the spam once and mute soundboard reactions for 16s!
+        if len(sb_epochs) >= 4:
+            soundboard_mute_until[guild.id] = now_sb + 16.0
+            logger.info(f"[SOUNDBOARD ANTI-SPAM] {user} triggered soundboard spam cooldown (16s) in #{ch}")
+            if bot_vc_ch and bot_vc_ch.id == ch_id:
                 spam_roasts = [
                     f"yo {user} stop mashing the soundboard my ears are actually cooked",
                     f"alright {user} take your finger off the soundboard button bro",
                     f"i am ignoring the soundboard now {user} you are doing way too much",
                 ]
-                asyncio.create_task(play_text_in_voice_channel(guild, random.choice(spam_roasts)))
+                if not (guild.voice_client and guild.voice_client.is_playing()):
+                    asyncio.create_task(play_text_in_voice_channel(guild, random.choice(spam_roasts)))
             return
 
         sound_name, sound_bytes = await resolve_soundboard_name(guild, effect)
         desc = f"🔊 {user} played '{sound_name}' on the soundboard in VC #{ch}!"
         record_server_event(guild.id, desc)
-        logger.info(f"[SOUNDBOARD EVENT] {desc}")
+        logger.info(f"[SOUNDBOARD EVENT] {desc} (bytes={len(sound_bytes) if sound_bytes else 0})")
 
-        # If Dumb bot is currently in that VC, either mix into the active VC multi-event queue or react directly
+        # If Dumb bot is currently in that VC, ALWAYS enqueue into the multimodal VC reactor with raw audio_bytes!
+        # This guarantees it never gets dropped while speaking AND Gemini hears the actual audio clip!
         if bot_vc_ch and bot_vc_ch.id == ch_id:
-            if vc_pending_events.get(guild.id) or (now_sb - vc_last_user_speech_epoch.get(guild.id, 0.0)) < 3.5:
-                enqueue_vc_event(guild, effect.channel, event_type="soundboard", user_name=user, content=sound_name)
-                return
-            if (now_sb - soundboard_last_reacted_epoch[guild.id]) < 3.5 or (guild.voice_client and guild.voice_client.is_playing()):
-                logger.info(f"[SOUNDBOARD COOLDOWN] Skipping overlapping TTS for '{sound_name}' in #{ch}")
-                return
             soundboard_last_reacted_epoch[guild.id] = now_sb
-            logger.info(f"[SOUNDBOARD HEARD IN VC] Dumb bot heard '{sound_name}' in VC #{ch}")
-            reaction_phrase = await generate_ai_soundboard_reaction(sound_name, user, sound_bytes=sound_bytes)
-            asyncio.create_task(play_text_in_voice_channel(guild, reaction_phrase))
+            logger.info(f"[SOUNDBOARD HEARD IN VC] Enqueuing '{sound_name}' (+raw audio) in VC #{ch}")
+            enqueue_vc_event(
+                guild,
+                effect.channel,
+                event_type="soundboard",
+                user_name=user,
+                content=sound_name,
+                audio_bytes=sound_bytes,
+                audio_mime="audio/ogg",
+            )
         else:
             await trigger_proactive_event_comment(
                 guild=guild,
@@ -6688,7 +7196,7 @@ async def on_voice_channel_effect(effect: discord.VoiceChannelEffect) -> None:
                 cooldown_sec=240.0,
                 reason_prompt=(
                     f"@{user} just played '{sound_name}' on the soundboard in VC #{ch}! "
-                    f"React specifically and playfully to them playing '{sound_name}' "
+                    f"React specifically and playfully to what was heard in '{sound_name}' "
                     f"(roast their comedic timing, laugh at the sound, or tease them for picking it)!"
                 ),
             )

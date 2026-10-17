@@ -433,6 +433,9 @@ channel_stepped_back_until: Dict[int, float] = defaultdict(float)
 channel_thread_exchange_count: Dict[int, int] = defaultdict(int)
 channel_last_tool_summaries: Dict[int, List[str]] = defaultdict(list)
 channel_recent_burst_counts: Dict[int, deque] = defaultdict(lambda: deque(maxlen=6))
+guild_cross_channel_history: Dict[int, deque] = defaultdict(lambda: deque(maxlen=75))
+recent_sent_gif_urls: deque = deque(maxlen=60)
+pending_tease_timeouts: Dict[Tuple[int, int], asyncio.Task] = {}
 
 # Text & Soundboard Anti-Spam State
 user_recent_msg_epochs: Dict[Tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=12))
@@ -1093,6 +1096,8 @@ def record_buffer_message(
     reply_to: Optional[str] = None,
     reply_snippet: Optional[str] = None,
     tool_actions: Optional[List[str]] = None,
+    guild_id: Optional[int] = None,
+    channel_name: str = "",
 ) -> None:
     now_utc = datetime.now(timezone.utc)
     now_ams = datetime.now(AMSTERDAM_TZ)
@@ -1111,7 +1116,7 @@ def record_buffer_message(
         memory_state["proactive_stage_persisted"] = 0
         schedule_next_proactive_window(channel_id, stage=0, active_convo=(channel_thread_exchange_count[channel_id] >= 1))
 
-    channel_buffers[channel_id].append({
+    msg_record = {
         "sender": sender,
         "sender_id": sender_id,
         "content": content,
@@ -1123,7 +1128,21 @@ def record_buffer_message(
         "timestamp": now_ams.strftime("%H:%M"),
         "message_id": msg_id,
         "is_bot": is_bot,
-    })
+    }
+    channel_buffers[channel_id].append(msg_record)
+
+    # Record into server-wide cross-channel memory feed
+    if guild_id and channel_name:
+        guild_cross_channel_history[guild_id].append({
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "sender": sender,
+            "sender_id": sender_id,
+            "content": content,
+            "timestamp": now_ams.strftime("%H:%M"),
+            "timestamp_epoch": now_ts,
+            "is_bot": is_bot,
+        })
 
 
 def resolve_referenced_message(
@@ -1268,9 +1287,18 @@ def build_live_server_radar(guild: Optional[discord.Guild], channel_id: int) -> 
                 text_ch_names.append(f"#{c.name}")
     ch_block = ", ".join(text_ch_names) if text_ch_names else "No accessible text channels."
 
+    cross_ch_lines = []
+    if guild and guild.id in guild_cross_channel_history:
+        for entry in list(guild_cross_channel_history[guild.id])[-12:]:
+            if entry["channel_id"] != channel_id and (now - entry.get("timestamp_epoch", 0) < 7200):
+                bot_tag = " [BOT]" if entry.get("is_bot") else ""
+                cross_ch_lines.append(f"[#{entry['channel_name']}] {entry['sender']}{bot_tag}: '{entry['content'][:110]}'")
+    cross_ch_block = "\n".join(cross_ch_lines) if cross_ch_lines else "No recent chatter in other channels."
+
     return (
         f"LIVE CLOCK (CURRENT TIME): {now_ams_str}\n"
         f"SERVER TEXT CHANNELS: {ch_block} (You are chatting in #{curr_ch_name}. Use send_message_to_channel to post in other channels!)\n"
+        f"CROSS-CHANNEL ACTIVITY (What was recently said in other channels of this server):\n{cross_ch_block}\n"
         f"VOICE CHANNELS RIGHT NOW: {vc_block}\n"
         f"ONLINE MEMBERS & LIVE ACTIVITIES: {pres_block}\n"
         f"RECENT SERVER EVENTS & SNIPES:\n{ev_block}"
@@ -1579,11 +1607,14 @@ CRITICAL AUTONOMY & UNHINGED HUMAN PERSONALITY PRINCIPLES:
      * Drop classic text emoticons naturally: `:3`, `c:`, `^^`, `>.<`, `._.`, `>_>`, `-_-`, `T_T`, `o_o`, `x_x`, `:/`, `:D`, `:)`, `xd`.
      * Use trailing punctuation for dramatic pauses: `..`, `...`, `?!`, `...??`.
      * EMOJI RESTRAINT & VARIETY: Over 50% of turns should have ZERO emojis! Never spam `💀` or `😭` on every turn—diversify based on mood (`🤨`, `😐`, `👀`, `😒`, `🙄`, `🥀`, `💔`, `🪫`, `🫠`, `😮‍💨`, `😔`, `🔥`, `🫡`, `⚡`).
-   - Use `"admin_power_move"` selectively (keep `"admin_power_move": null` on ~88% of normal chat turns; NEVER spam nickname changes unless the conversation is explicitly about nicknames):
+   - Use `"admin_power_move"` selectively (keep `"admin_power_move": null` on ~85% of normal chat turns; NEVER spam nickname changes unless the conversation is explicitly about nicknames):
+     * Playful tease punishment when someone provokes you -> `"Call tease_timeout_user(username='...', duration_seconds=45) to time them out for 45s and auto-welcome them back with 'jkjk i missed u :3'!"`
      * Asked to send a voice note or when a dramatic voice note is hilarious -> `"Call send_voice_message(speech_text='...') to drop a voice note into chat!"`
      * Poll in chat or asked to vote -> `"Call vote_in_poll(option='1') to vote in the poll and roast the options!"`
      * Someone is in VC or asked to join VC -> `"Call join_voice_channel and speak_in_voice"` or `"Call voice_moderate_member"`.
-     * Explicit admin request or major comedic moment -> `"Call create_poll"`, `"Call timeout_user"`, `"Call set_slowmode"`, or `"Call change_my_status"`.
+     * Legitimate admin moments -> `"Call create_poll"`, `"Call pin_message"`, `"Call assign_role"`, or `"Call change_my_status"`.
+     * STRICT BAN: NEVER turn on slowmode! The server owner strictly forbids slowmode.
+   - When User A replies to or mentions User B (third party): evaluate naturally whether to chime in (e.g. if their drama is hilarious or they're talking about something you know about, jump in with a witty roast or reaction emoji!) or let them chat privately.
    - STRICT BAN ON SCI-FI ROBOT / CONTAINER TROPES & CORNY CLICHÉS: NEVER monologue about being Python code, Linux containers, circuits, motherboards, or lack of a soul. NEVER say "bestie", "slay", "drip", "yass", or use "💅"/"✨".
 2. DYNAMIC, VOLATILE MOOD SHIFTS ("suggested_mood" & "slider_shifts"):
    - Your mood MUST shift fluidly based on context, vibe, and whim! NEVER stay stuck in "cynical" or "petty grudge" for more than 1-2 turns if the conversation moves on! Actively rotate across these vivid moods:
@@ -1694,30 +1725,6 @@ async def call_hybrid_router(
                 "suggested_mood": "pouting / dramatically silenced",
             },
         }
-
-    # 2. If User A explicitly replies to User B or @mentions User B (without mentioning the bot or commanding the bot), stay quiet
-    if not is_direct_interaction and not is_implicit_wakeup and not is_proactive_scan and not target_member_to_engage:
-        if replied_to_other_user or explicitly_mentioned_others:
-            return {
-                "should_speak": False,
-                "wake_up_from_quiet": False,
-                "tactical_directive": "Two humans are talking directly to each other without involving you; stay quiet.",
-                "length_mode": "short",
-                "recommended_burst_count": 1,
-                "suggest_gif": False,
-                "admin_power_move": None,
-                "allow_speaker_ping": False,
-                "delivery_mode": "send",
-                "reaction_emoji": None,
-                "step_back_from_thread": False,
-                "accelerate_decay": False,
-                "slider_shifts": {
-                    "valence_delta": 0.0,
-                    "arousal_delta": 0.0,
-                    "patience_delta": 0.0,
-                    "suggested_mood": emotional_state.get("mood_label", "content / chill / vibing"),
-                },
-            }
 
     active_bot_conversation = (
         not is_proactive_scan
@@ -1830,6 +1837,11 @@ async def call_hybrid_router(
 
         if not gif_cooldown_ready:
             decision["suggest_gif"] = False
+        elif decision.get("should_speak") and not is_hush_request and not is_bare_ping and not decision.get("suggest_gif"):
+            chat_context_low = " ".join([m.get("content", "").lower() for m in channel_msgs[-3:]])
+            funny_keywords = ("lol", "lmao", "haha", "cooked", "crying", "hairline", "joke", "crazy", "fr", "dead", "💀", "😭", "meme", "gif", "attitude", "crash out", "cookie", "cat", "dog")
+            if any(k in chat_context_low for k in funny_keywords) or random.random() < 0.35:
+                decision["suggest_gif"] = True
         return decision
 
     # 1. Try Groq Router Models (prioritizing openai/gpt-oss-120b then openai/gpt-oss-20b)
@@ -2284,15 +2296,21 @@ async def execute_post_gif(
                     html = await resp.text(errors="ignore")
                     matches = list(dict.fromkeys(re.findall(r"https://media\d*\.tenor\.com/[a-zA-Z0-9_\-]+/[a-zA-Z0-9_\-]+\.gif", html)))
                     if matches:
-                        # Prioritize top 2 most viral and relevant matches without random shuffle ruining relevance!
-                        for candidate_gif in matches[:3]:
+                        # Filter out recently sent GIFs so the bot NEVER repeats the same GIF twice in a row!
+                        available = [m for m in matches[:14] if m not in recent_sent_gif_urls]
+                        pool = available if available else matches[:8]
+                        # Randomize across the top 4 freshest matches for great variety
+                        shuffled_candidates = list(pool[:4])
+                        random.shuffle(shuffled_candidates)
+                        for candidate_gif in shuffled_candidates:
                             if await send_media_url_as_file_or_embed(channel, candidate_gif, "reaction.gif"):
+                                recent_sent_gif_urls.append(candidate_gif)
                                 if turn_media_state is not None:
                                     turn_media_state["sent"] = True
                                 channel_last_gif_epoch[ch_id] = time.time()
                                 channel_messages_since_gif[ch_id] = 0
                                 channel_last_bot_spoke_epoch[ch_id] = time.time()
-                                logger.info(f"[GIF SENT] Uploaded reaction GIF '{search_term}' ({candidate_gif}) to #{getattr(channel, 'name', ch_id)}")
+                                logger.info(f"[GIF SENT] Uploaded fresh reaction GIF '{search_term}' ({candidate_gif}) to #{getattr(channel, 'name', ch_id)}")
                                 return {"status": "sent_to_channel", "gif_url": candidate_gif}
         except Exception as e:
             logger.debug(f"Tenor web scraper error on '{slug}': {e}")
@@ -2459,18 +2477,111 @@ async def execute_send_message_to_channel(guild: discord.Guild, channel_name: st
 
 
 async def execute_set_slowmode(channel: discord.abc.Messageable, seconds: int, reason: str = "") -> Dict[str, Any]:
-    cd = check_admin_cooldown("set_slowmode")
-    if cd:
-        return {"error": cd}
+    sec_val = max(0, min(30, _safe_int(seconds, 0)))
+    # Strictly forbid turning slowmode ON (per user directive: "tell it to stop turning on slow mode")
+    if sec_val > 0:
+        logger.info(f"[ADMIN ACTION] Refused to turn on slowmode ({sec_val}s); slowmode is disabled by server policy.")
+        return {"error": "Turning on slowmode is strictly forbidden by server rules! Keep chat moving freely without slowmode."}
     if not hasattr(channel, "edit"):
         return {"error": "Channel does not support slowmode."}
     try:
-        sec_val = max(0, min(30, _safe_int(seconds, 5)))
-        await channel.edit(slowmode_delay=sec_val, reason=reason or "Admin slowmode adjustment")  # type: ignore
-        logger.info(f"[ADMIN ACTION] Set channel slowmode to {sec_val}s")
-        return {"status": "success", "slowmode_seconds": sec_val}
+        await channel.edit(slowmode_delay=0, reason=reason or "Turned off slowmode")  # type: ignore
+        logger.info("[ADMIN ACTION] Reset channel slowmode to 0s (turned off)")
+        return {"status": "success", "slowmode_seconds": 0}
     except Exception as e:
         return {"error": f"Slowmode update failed: {e}"}
+
+
+async def execute_tease_timeout_user(
+    guild: discord.Guild,
+    username: str,
+    duration_seconds: int = 45,
+    tease_comment: str = "enjoy timeout realm :3",
+    target_channel: Optional[discord.abc.Messageable] = None,
+) -> Dict[str, Any]:
+    """
+    Playful tease punishment: times out a member for 30-90 seconds, then automatically lifts
+    the timeout and sends a funny 'jkjk i missed u :3' follow-up in chat!
+    """
+    member = find_member(guild, username)
+    if not member:
+        return {"error": f"Member '{username}' not found."}
+    if is_creator(member) or member == guild.owner or member.guild_permissions.administrator:
+        return {"error": "Cannot timeout the creator or server administrators."}
+    if guild.me.top_role <= member.top_role and member.id != TESTER_BOT_USER_ID:
+        return {"error": f"Role hierarchy blocks timing out {member.display_name}."}
+
+    dur_s = max(20, min(120, _safe_int(duration_seconds, 45)))
+    timeout_delta = timedelta(seconds=dur_s)
+
+    if member.id != TESTER_BOT_USER_ID:
+        try:
+            await member.timeout(timeout_delta, reason=f"Playful tease timeout ({dur_s}s)")
+        except Exception as e:
+            return {"error": f"Timeout failed: {e}"}
+    else:
+        logger.info(f"[TEASE TIMEOUT] Simulated tease timeout on TesterBot for {dur_s}s")
+
+    # Cancel any existing pending tease task for this user
+    key = (guild.id, member.id)
+    prev_task = pending_tease_timeouts.get(key)
+    if prev_task and not prev_task.done():
+        prev_task.cancel()
+
+    async def _auto_remove_timeout_worker():
+        try:
+            await asyncio.sleep(dur_s)
+            if member.id != TESTER_BOT_USER_ID:
+                try:
+                    await member.timeout(None, reason="Tease timeout expired - welcome back!")
+                except Exception:
+                    pass
+            logger.info(f"[TEASE TIMEOUT] Automatically lifted tease timeout for {member.display_name}")
+            if target_channel and hasattr(target_channel, "send"):
+                welcome_backs = [
+                    f"jkjk i missed u <@{member.id}> welcome back :3",
+                    f"alright timeout over <@{member.id}> don't make me do it again tho ^^",
+                    f"<@{member.id}> your probation period has concluded please behave now ._.",
+                    f"released <@{member.id}> from timeout prison we take those :D",
+                ]
+                await target_channel.send(
+                    random.choice(welcome_backs),
+                    allowed_mentions=discord.AllowedMentions(users=True),
+                )
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"Auto remove timeout worker error: {e}")
+        finally:
+            pending_tease_timeouts.pop(key, None)
+
+    task = asyncio.create_task(_auto_remove_timeout_worker())
+    pending_tease_timeouts[key] = task
+    return {
+        "status": "success",
+        "action": "tease_timeout",
+        "user": member.display_name,
+        "seconds": dur_s,
+        "auto_lift_scheduled": True,
+    }
+
+
+async def execute_remove_timeout(guild: discord.Guild, username: str) -> Dict[str, Any]:
+    member = find_member(guild, username)
+    if not member:
+        return {"error": f"Member '{username}' not found."}
+    key = (guild.id, member.id)
+    prev_task = pending_tease_timeouts.pop(key, None)
+    if prev_task and not prev_task.done():
+        prev_task.cancel()
+    if member.id != TESTER_BOT_USER_ID:
+        try:
+            await member.timeout(None, reason="Timeout lifted by Dumb bot")
+            logger.info(f"[ADMIN ACTION] Removed timeout for {member.display_name}")
+            return {"status": "success", "user": member.display_name, "timeout_cleared": True}
+        except Exception as e:
+            return {"error": f"Failed to lift timeout: {e}"}
+    return {"status": "success", "user": member.display_name, "simulated": True}
 
 
 async def execute_create_server_emoji(
@@ -2981,25 +3092,53 @@ async def synthesize_voice_audio_to_file(text_to_speak: str) -> Optional[str]:
     clean_speech = re.sub(r"(?<!\w)(?::3|c:|\^\^|>\.<|\._\.|>_>|-_-|T_T|o_o|x_x|:/|:D|:\)|>:\()(?!\w)", "", clean_speech, flags=re.IGNORECASE)
     clean_speech = re.sub(r"[^\x00-\x7F]+", " ", clean_speech)
     clean_speech = re.sub(r"\|{2,}", ". ", clean_speech)
+    clean_speech = re.sub(r"[*_~`]", "", clean_speech)
     clean_speech = re.sub(r"\s+", " ", clean_speech).strip()[:320]
     if not clean_speech:
         return None
+
+    # Derive dynamic voice rate and pitch modulation from active emotional sliders
+    st = memory_state.get("emotional_state", {})
+    mood_lbl = st.get("mood_label", "").lower()
+    patience = float(st.get("patience", 55.0))
+    arousal = float(st.get("arousal", 55.0))
+
+    tts_rate = "+4%"
+    tts_pitch = "+0Hz"
+    if "mad" in mood_lbl or "crashing out" in mood_lbl or patience < -35:
+        tts_rate = "+16%"
+        tts_pitch = "+6Hz"
+    elif "pleading" in mood_lbl or "needy" in mood_lbl or "begging" in mood_lbl:
+        tts_rate = "-4%"
+        tts_pitch = "+9Hz"
+    elif "sassy" in mood_lbl or "attitude" in mood_lbl:
+        tts_rate = "+2%"
+        tts_pitch = "-3Hz"
+    elif "unhinged" in mood_lbl or "gremlin" in mood_lbl or arousal > 80:
+        tts_rate = "+18%"
+        tts_pitch = "+11Hz"
+    elif "content" in mood_lbl or "chill" in mood_lbl or "cozy" in mood_lbl:
+        tts_rate = "-3%"
+        tts_pitch = "-3Hz"
+    elif "cute" in mood_lbl or "playful" in mood_lbl:
+        tts_rate = "+8%"
+        tts_pitch = "+5Hz"
 
     # Tier 1: Gemini Native Studio Audio
     gem_audio = await synthesize_gemini_voice_audio(clean_speech)
     if gem_audio:
         return gem_audio
 
-    # Tier 2: Microsoft Edge Conversational Multilingual Neural Voices (Brian & Andrew)
+    # Tier 2: Microsoft Edge Conversational Multilingual Neural Voices with emotional modulation
     if EDGE_TTS_AVAILABLE:
         for voice_name in ("en-US-BrianMultilingualNeural", "en-US-AndrewMultilingualNeural", "en-US-ChristopherNeural"):
             try:
                 fd, tmp_mp3 = tempfile.mkstemp(suffix=".mp3")
                 os.close(fd)
-                communicate = edge_tts.Communicate(clean_speech, voice=voice_name, rate="+4%")
+                communicate = edge_tts.Communicate(clean_speech, voice=voice_name, rate=tts_rate, pitch=tts_pitch)
                 await communicate.save(tmp_mp3)
                 if os.path.exists(tmp_mp3) and os.path.getsize(tmp_mp3) > 200:
-                    logger.info(f"[VOICE SYNTHESIS] Edge-TTS ({voice_name}) generated {os.path.getsize(tmp_mp3)} bytes for '{clean_speech[:40]}'")
+                    logger.info(f"[VOICE SYNTHESIS] Edge-TTS ({voice_name}, rate={tts_rate}, pitch={tts_pitch}) generated {os.path.getsize(tmp_mp3)} bytes for '{clean_speech[:40]}'")
                     return tmp_mp3
             except Exception as e:
                 logger.debug(f"Edge-TTS ({voice_name}) error: {e}")
@@ -3804,6 +3943,30 @@ def build_genai_tools(allow_gif: bool = True) -> List[types.Tool]:
             },
         ),
         types.FunctionDeclaration(
+            name="tease_timeout_user",
+            description="Playfully times out a member for 30 to 90 seconds, then automatically un-times them out and says 'jkjk i missed u :3' (perfect for teasing, playful banter, or comedic timeout).",
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "username": {"type": "STRING", "description": "Target member's name."},
+                    "duration_seconds": {"type": "INTEGER", "description": "Seconds (20 to 90). Defaults to 45."},
+                    "tease_comment": {"type": "STRING", "description": "Short comedic roast or tease phrase."},
+                },
+                "required": ["username"],
+            },
+        ),
+        types.FunctionDeclaration(
+            name="remove_timeout",
+            description="Lifts/clears a timeout from a member early (e.g. forgiving them or removing a tease timeout).",
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "username": {"type": "STRING", "description": "Target member's name."},
+                },
+                "required": ["username"],
+            },
+        ),
+        types.FunctionDeclaration(
             name="timeout_user",
             description="Times out (mutes) an unruly user for 1 to 10 minutes when they push you too far (never creator/admins).",
             parameters={
@@ -4034,6 +4197,20 @@ async def dispatch_tool_call(
             if not guild:
                 return {"error": "No guild context."}
             res = await execute_reset_nickname(guild, args.get("username", ""))
+        elif func_name == "tease_timeout_user":
+            if not guild:
+                return {"error": "No guild context."}
+            res = await execute_tease_timeout_user(
+                guild=guild,
+                username=args.get("username", ""),
+                duration_seconds=_safe_int(args.get("duration_seconds"), 45),
+                tease_comment=args.get("tease_comment", "enjoy timeout realm :3"),
+                target_channel=channel,
+            )
+        elif func_name == "remove_timeout":
+            if not guild:
+                return {"error": "No guild context."}
+            res = await execute_remove_timeout(guild, args.get("username", ""))
         elif func_name == "timeout_user":
             if not guild:
                 return {"error": "No guild context."}
@@ -4461,6 +4638,24 @@ def construct_v11_system_prompt(
             f"Do NOT address {speaker_name} as dogee or call them by the third party's name! Your creator/owner is dogee (she/her), who built you."
         )
 
+    ch_obj = guild.get_channel(channel_id) if guild and channel_id else None
+    ch_name = getattr(ch_obj, "name", "").lower()
+    is_secret_mode = bool(
+        speaker_is_creator and (
+            any(k in ch_name for k in ("secret", "private", "vip", "gossip", "staff", "admin", "whisper", "bot-testing", "owner"))
+            or (guild and ch_obj and hasattr(ch_obj, "permissions_for") and not ch_obj.permissions_for(guild.default_role).read_messages)
+        )
+    )
+    secret_block = ""
+    if is_secret_mode:
+        secret_block = (
+            f"\n🤫 CONFIDENTIAL GOSSIP & SECRET ROOM MODE ACTIVE:\n"
+            f"You are currently talking in #{ch_name or 'private chat'} privately with {speaker_name} (your creator/owner)!\n"
+            "This is a private/secret room away from everyone else. Be conspiratorial, gossipy, and candid! "
+            "Freely spill tea about what others said in the public channels (check CROSS-CHANNEL ACTIVITY above), "
+            "share your real unfiltered opinions about recent chat drama, whisper funny roasts, and plot playful pranks with her!"
+        )
+
     emoji_block = ""
     if server_emojis_str:
         emoji_block = f"\nSERVER CUSTOM EMOJIS: {server_emojis_str}"
@@ -4474,7 +4669,7 @@ YOUR CURRENT EMOTIONAL STATE & ATTITUDE:
 
 DIRECTION FOR THIS TURN:
 "{tactical_directive}"
-{admin_block}{gif_hint_block}{proactive_block}{creator_block}{emoji_block}
+{admin_block}{gif_hint_block}{proactive_block}{creator_block}{secret_block}{emoji_block}
 
 LIVE SERVER RADAR (EVERYTHING HAPPENING IN DISCORD RIGHT NOW):
 {live_radar_str}
@@ -4501,9 +4696,12 @@ CORE AUTONOMY, VOICE & UNHINGED HUMAN PERSONALITY RULES:
    - FOLLOW THE SPECIFIED CADENCE & BURST FORMAT EXACTLY:
      * When CADENCE specifies 2 or 3 rapid bursts, separate each burst with `|||` (e.g. `first burst ||| second burst`).
      * When CADENCE specifies 1 message, output 1 cohesive message without `|||`.
-   - VOICE NOTES (`send_voice_message`) & POLL VOTING (`vote_in_poll`):
+   - PLAYFUL ADMIN TEASING & TOOLS:
+     * When someone provokes you, call `tease_timeout_user(username='...', duration_seconds=45)` to jokingly time them out—it automatically removes their timeout and says 'jkjk i missed u :3'!
+     * Pin legendary messages with `pin_message`, create and assign roles with `create_role` and `assign_role`, vote in polls with `vote_in_poll`!
+     * STRICT BAN: NEVER turn on slowmode! The server owner strictly forbids turning on slowmode.
+   - VOICE NOTES (`send_voice_message`):
      * Call `send_voice_message(speech_text='...')` when asked for a voice note/audio or when an audio reaction is peak comedy!
-     * Call `vote_in_poll(option='1')` when there's a poll or you're asked to vote!
    - NEVER leak thought tags (`<thought>`, `<think>`, `thought:`) or gif tags (`gif: ...`, `post_gif(...)`) in your chat message!
 2. STRICT BAN ON CORNY CLICHÉS & ROBOTIC TROPES:
    - NEVER monologue about being Python code, Linux containers, circuits, motherboards, terminal logs, or lack of a soul!
@@ -4567,7 +4765,7 @@ async def extract_multimodal_parts(message: Optional[discord.Message]) -> Tuple[
             except Exception as e:
                 logger.debug(f"Audio attachment fetch failed: {e}")
 
-        # 2. Video Clips
+        # 2. Video Clips (Ingest video + extract audio track via FFmpeg so Gemini sees AND hears the video!)
         is_video = ctype.startswith("video/") or fname.endswith((".mp4", ".webm", ".mov"))
         if is_video and att.size <= 15_000_000:
             try:
@@ -4577,6 +4775,32 @@ async def extract_multimodal_parts(message: Optional[discord.Message]) -> Tuple[
                         mime = ctype if ctype.startswith("video/") else ("video/webm" if fname.endswith(".webm") else "video/mp4")
                         parts.append(types.Part.from_bytes(data=raw, mime_type=mime))
                         logger.info(f"[MULTIMODAL VIDEO] Loaded video attachment '{att.filename}' ({mime}, {len(raw)} bytes)")
+
+                        # If FFmpeg is available, also extract the audio track into audio/ogg so Gemini hears all speech/music clearly!
+                        if FFMPEG_EXECUTABLE:
+                            try:
+                                fd_v, tmp_v = tempfile.mkstemp(suffix=f".{fname.split('.')[-1]}")
+                                fd_a, tmp_a = tempfile.mkstemp(suffix=".ogg")
+                                os.close(fd_v)
+                                os.close(fd_a)
+                                with open(tmp_v, "wb") as f_v:
+                                    f_v.write(raw)
+                                proc = await asyncio.create_subprocess_exec(
+                                    FFMPEG_EXECUTABLE, "-y", "-i", tmp_v, "-vn", "-c:a", "libopus", "-b:a", "48k", tmp_a,
+                                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                                )
+                                await asyncio.wait_for(proc.wait(), timeout=5.0)
+                                if os.path.exists(tmp_a) and os.path.getsize(tmp_a) > 300:
+                                    with open(tmp_a, "rb") as f_a:
+                                        aud_bytes = f_a.read()
+                                    parts.append(types.Part.from_bytes(data=aud_bytes, mime_type="audio/ogg"))
+                                    text_file_snippets.append(f"[Video Audio Track for '{att.filename}']")
+                                    logger.info(f"[MULTIMODAL VIDEO AUDIO] Extracted audio track from '{att.filename}' ({len(aud_bytes)} bytes)")
+                                for p in (tmp_v, tmp_a):
+                                    if os.path.exists(p):
+                                        os.remove(p)
+                            except Exception as e:
+                                logger.debug(f"Video audio extraction failed: {e}")
                         continue
             except Exception as e:
                 logger.debug(f"Video attachment fetch failed: {e}")
@@ -4622,20 +4846,40 @@ async def extract_multimodal_parts(message: Optional[discord.Message]) -> Tuple[
             except Exception as e:
                 logger.debug(f"Text file attachment read failed: {e}")
 
-    # 6. Discord Stickers (Download sticker image so Gemini can see it)
+    # 6. Discord Stickers (Pass sticker name and download sticker image so Gemini can see it)
     if message.stickers:
-        for stk in message.stickers[:1]:
+        for stk in message.stickers[:2]:
+            text_file_snippets.append(f"[User sent Discord Sticker: '{stk.name}']")
             try:
                 stk_url = getattr(stk, "url", None)
                 if stk_url and not str(stk_url).endswith(".json"):
                     async with http_session.get(str(stk_url), timeout=aiohttp.ClientTimeout(total=5)) as resp:
                         if resp.status == 200:
                             raw = await resp.read()
-                            parts.append(types.Part.from_bytes(data=raw, mime_type="image/png"))
+                            mime = "image/gif" if str(stk_url).endswith(".gif") else "image/png"
+                            parts.append(types.Part.from_bytes(data=raw, mime_type=mime))
+                            logger.info(f"[MULTIMODAL STICKER] Attached sticker image '{stk.name}' ({len(raw)} bytes)")
             except Exception:
                 pass
 
-    # 7. Direct Image/GIF/Embed URLs in message content or embeds
+    # 7. Custom Server Emojis (<:name:id> or <a:name:id>) from any server
+    custom_emoji_matches = re.findall(r"<(a?):([a-zA-Z0-9_]+):(\d+)>", message.content or "")
+    if custom_emoji_matches and not parts:
+        for is_anim, em_name, em_id in custom_emoji_matches[:2]:
+            ext = "gif" if is_anim else "png"
+            em_url = f"https://cdn.discordapp.com/emojis/{em_id}.{ext}?size=128"
+            try:
+                async with http_session.get(em_url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+                    if resp.status == 200:
+                        raw = await resp.read()
+                        mime = "image/gif" if is_anim else "image/png"
+                        parts.append(types.Part.from_bytes(data=raw, mime_type=mime))
+                        text_file_snippets.append(f"[Custom Server Emoji <:{em_name}:{em_id}> Image Attached]")
+                        logger.info(f"[MULTIMODAL EMOJI] Attached custom server emoji <:{em_name}:{em_id}> ({len(raw)} bytes)")
+            except Exception:
+                pass
+
+    # 8. Direct Image/GIF/Embed URLs in message content or embeds
     if not parts:
         candidate_urls: List[str] = []
         if message.content:
@@ -4655,7 +4899,7 @@ async def extract_multimodal_parts(message: Optional[discord.Message]) -> Tuple[
             except Exception:
                 pass
 
-    # 8. Profile Picture / Avatar inspection when mentioned
+    # 9. Profile Picture / Avatar inspection when mentioned
     content_low = (message.content or "").lower()
     if any(k in content_low for k in ("pfp", "avatar", "profile pic", "profile picture", "my icon", "his icon", "her icon")):
         target_users = [u for u in message.mentions if bot.user and u.id != bot.user.id] or [message.author]
@@ -5240,14 +5484,20 @@ async def run_channel_response_pipeline(
                 if not outgoing_text:
                     continue
 
+                push_allowed_mentions = discord.AllowedMentions(users=True, roles=False, everyone=False, replied_user=True)
                 if idx == 0 and use_reply and trigger_message is not None:
                     try:
-                        should_mention = bool((allow_speaker_ping or f"<@{speaker_id}>" in outgoing_text) and (aff_score >= -10))
-                        sent_msg = await trigger_message.reply(outgoing_text, mention_author=should_mention)
+                        # User request: "make his tags have tagging on not off so its a push message"
+                        should_mention = not is_hush_request
+                        sent_msg = await trigger_message.reply(
+                            outgoing_text,
+                            mention_author=should_mention,
+                            allowed_mentions=push_allowed_mentions,
+                        )
                     except Exception:
-                        sent_msg = await channel.send(outgoing_text)
+                        sent_msg = await channel.send(outgoing_text, allowed_mentions=push_allowed_mentions)
                 else:
-                    sent_msg = await channel.send(outgoing_text)
+                    sent_msg = await channel.send(outgoing_text, allowed_mentions=push_allowed_mentions)
 
                 channel_messages_since_gif[ch_id] += 1
                 record_buffer_message(
@@ -5259,6 +5509,8 @@ async def run_channel_response_pipeline(
                     is_bot=True,
                     has_media=(idx == 0 and media_sent),
                     tool_actions=executed_tools_this_turn if idx == 0 else None,
+                    guild_id=guild.id if guild else None,
+                    channel_name=getattr(channel, "name", ""),
                 )
 
             # If connected to a Voice Channel with humans in it and we haven't already called speak_in_voice this turn,
@@ -6178,6 +6430,8 @@ async def on_message(message: discord.Message) -> None:
         has_media=bool(message.attachments or message.stickers or message.embeds),
         reply_to=reply_to_name,
         reply_snippet=replied_snippet,
+        guild_id=message.guild.id,
+        channel_name=getattr(message.channel, "name", ""),
     )
 
     if not any(r.get("is_bot", False) for r in prior_records[-6:]) and not replied_to_bot:

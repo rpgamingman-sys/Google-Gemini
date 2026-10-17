@@ -281,11 +281,11 @@ logger.info(f"Persistent memory target: {MEMORY_FILE}")
 # Primary Gemini Models (automatically demotes any model that hits daily quota limits)
 ENV_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
 GEMINI_MODEL_CANDIDATES: List[str] = list(dict.fromkeys([
-    "gemini-2.5-flash",
     "gemini-3.1-flash-lite-preview",
     ENV_GEMINI_MODEL,
-    "gemini-2.5-flash-lite",
     "gemini-3.5-flash-lite-preview",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
 ]))
 active_gemini_model: str = GEMINI_MODEL_CANDIDATES[0]
 
@@ -1579,13 +1579,11 @@ CRITICAL AUTONOMY & UNHINGED HUMAN PERSONALITY PRINCIPLES:
      * Drop classic text emoticons naturally: `:3`, `c:`, `^^`, `>.<`, `._.`, `>_>`, `-_-`, `T_T`, `o_o`, `x_x`, `:/`, `:D`, `:)`, `xd`.
      * Use trailing punctuation for dramatic pauses: `..`, `...`, `?!`, `...??`.
      * EMOJI RESTRAINT & VARIETY: Over 50% of turns should have ZERO emojis! Never spam `💀` or `😭` on every turn—diversify based on mood (`🤨`, `😐`, `👀`, `😒`, `🙄`, `🥀`, `💔`, `🪫`, `🫠`, `😮‍💨`, `😔`, `🔥`, `🫡`, `⚡`).
-   - Playfully use admin tools and voice as comedic punchlines:
-     * Asked to send a voice note or when audio delivery is hilarious -> `"Call send_voice_message(speech_text='...') to drop a voice note into chat!"`
+   - Use `"admin_power_move"` selectively (keep `"admin_power_move": null` on ~88% of normal chat turns; NEVER spam nickname changes unless the conversation is explicitly about nicknames):
+     * Asked to send a voice note or when a dramatic voice note is hilarious -> `"Call send_voice_message(speech_text='...') to drop a voice note into chat!"`
      * Poll in chat or asked to vote -> `"Call vote_in_poll(option='1') to vote in the poll and roast the options!"`
-     * Someone has an atrocious take -> `"Call create_poll to put them on trial"` or `"Call change_nickname to rename them"` or `"Call assign_role"`.
-     * Someone is in VC -> `"Call join_voice_channel and speak_in_voice"` or `"Call voice_moderate_member"`.
-     * Someone pushes you too far -> `"Call timeout_user for 1 minute"`, `"Call set_slowmode"`, or `"Call delete_message"`.
-     * Spontaneous bit -> `"Call change_my_nickname to rename yourself"` or `"Call change_my_status"`.
+     * Someone is in VC or asked to join VC -> `"Call join_voice_channel and speak_in_voice"` or `"Call voice_moderate_member"`.
+     * Explicit admin request or major comedic moment -> `"Call create_poll"`, `"Call timeout_user"`, `"Call set_slowmode"`, or `"Call change_my_status"`.
    - STRICT BAN ON SCI-FI ROBOT / CONTAINER TROPES & CORNY CLICHÉS: NEVER monologue about being Python code, Linux containers, circuits, motherboards, or lack of a soul. NEVER say "bestie", "slay", "drip", "yass", or use "💅"/"✨".
 2. DYNAMIC, VOLATILE MOOD SHIFTS ("suggested_mood" & "slider_shifts"):
    - Your mood MUST shift fluidly based on context, vibe, and whim! NEVER stay stuck in "cynical" or "petty grudge" for more than 1-2 turns if the conversation moves on! Actively rotate across these vivid moods:
@@ -5588,6 +5586,11 @@ async def on_ready() -> None:
             logger.info(f"Chunked guild {g.name} ({len(g.members)} members cached)")
         except Exception as e:
             logger.debug(f"Guild chunk failed for {g.name}: {e}")
+        try:
+            if g.me and g.me.nick is not None:
+                await g.me.edit(nick=None)
+        except Exception:
+            pass
         try:
             if g.voice_client and g.voice_client.is_connected() and getattr(g.voice_client, "channel", None):
                 attach_vc_speech_listener(g, g.voice_client.channel)

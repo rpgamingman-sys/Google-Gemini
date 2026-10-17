@@ -448,35 +448,42 @@ last_vc_speaker_logged: Dict[int, float] = {}
 vc_speech_buffers: Dict[int, Dict[int, Dict[str, Any]]] = defaultdict(dict)
 vc_speech_processor_tasks: Dict[int, asyncio.Task] = {}
 vc_transcribing_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+vc_pending_events: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+vc_batch_reactor_tasks: Dict[int, asyncio.Task] = {}
 
 soundboard_recent_epochs: Dict[int, deque] = defaultdict(lambda: deque(maxlen=15))
 soundboard_mute_until: Dict[int, float] = defaultdict(float)
 soundboard_last_reacted_epoch: Dict[int, float] = defaultdict(float)
+dm_proactive_last_sent: Dict[int, float] = defaultdict(float)
 
-# Responsive Admin Cooldowns (Prevents accidental rate-limit abuse while allowing spontaneous moves)
+# Responsive Admin Cooldowns (Allows frequent spontaneous admin power moves while preventing API rate limits)
 admin_tool_cooldowns: Dict[str, float] = defaultdict(float)
 ADMIN_COOLDOWN_SECONDS = {
-    "change_my_nickname": 12.0,
-    "change_nickname": 15.0,
-    "change_my_status": 8.0,
-    "set_channel_topic": 35.0,
-    "pin_message": 20.0,
-    "unpin_message": 20.0,
-    "delete_message": 25.0,
-    "set_slowmode": 45.0,
-    "create_thread": 90.0,
-    "create_poll": 90.0,
-    "create_role": 120.0,
-    "assign_role": 15.0,
-    "remove_role": 15.0,
-    "rename_channel": 240.0,
-    "create_server_emoji": 90.0,
-    "create_server_sticker": 90.0,
-    "change_my_avatar": 240.0,
-    "voice_moderate_member": 20.0,
-    "timeout_user": 120.0,
-    "kick_user": 1800.0,           # 30-minute safety cooldown on extreme kicks
-    "create_text_channel": 2400.0, # 40-minute cooldown on creating channels
+    "change_my_nickname": 6.0,
+    "change_nickname": 8.0,
+    "change_my_status": 5.0,
+    "set_channel_topic": 15.0,
+    "pin_message": 8.0,
+    "unpin_message": 8.0,
+    "delete_message": 12.0,
+    "set_slowmode": 30.0,
+    "create_thread": 30.0,
+    "create_poll": 30.0,
+    "create_role": 15.0,
+    "assign_role": 6.0,
+    "remove_role": 6.0,
+    "rename_channel": 60.0,
+    "create_server_emoji": 20.0,
+    "create_server_sticker": 25.0,
+    "change_my_avatar": 120.0,
+    "voice_moderate_member": 8.0,
+    "tease_timeout_user": 15.0,
+    "timeout_user": 25.0,
+    "tease_kick_user": 30.0,
+    "kick_user": 90.0,
+    "create_text_channel": 45.0,
+    "create_secret_channel": 15.0,
+    "dm_user": 5.0,
 }
 
 # ---------------------------------------------------------------------------
@@ -883,19 +890,18 @@ def detect_target_member_to_engage(
 
 def detect_hush_command(content: str, is_direct_or_active: bool) -> bool:
     """
-    Detects when someone tells the bot to be quiet, stop talking, chill, or gives a subtle hint to shut up
-    (direct commands like 'shut up', 'stop talking' as well as subtle cues like 'chill out', 'enough yapping', 'read the room').
+    Detects when someone explicitly tells the bot to be quiet, stop talking, or shut up.
+    Does NOT trigger on casual conversational words like 'chill', 'relax', 'enough', or 'silence'!
     """
     if not content or not is_direct_or_active:
         return False
     cleaned = re.sub(r"<@!?\d+>", "", content).strip().lower()
+    if len(cleaned) > 75:
+        return False
     hush_pattern = (
-        r"(?:\A|\b)(?:shh+|shush|hush|be\s+(?:very\s+)*quiet|stay\s+quiet|"
-        r"stop\s+talking|shut\s+up|zip\s+it|pipe\s+down|don'?t\s+speak|go\s+quiet|mute\s+yourself|"
-        r"not\s+you|we\s+are\s+talking\s+not\s+you|we'?re\s+talking\s+not\s+you|nobody\s+asked(?:\s+you)?|who\s+asked(?:\s+you)?|"
-        r"enough(?:\s+bro)?|ok\s+enough|okay\s+enough|alright\s+enough|that'?s\s+enough|stop\s+yapping|enough\s+yapping|quit\s+yapping|"
-        r"chill\s+out|chill|take\s+a\s+chill\s+pill|read\s+the\s+room|give\s+it\s+a\s+rest|not\s+now|leave\s+it\s+alone|"
-        r"relax|calm\s+down|can\s+you\s+not|stop\s+spamming|silence)(?:\b|\Z)"
+        r"(?:\A|\b)(?:shh+|shush|hush(?:\s+up)?|be\s+(?:very\s+)*quiet|stay\s+quiet|"
+        r"stop\s+talking|shut\s+(?:the\s+fuck\s+|tf\s+)?up|stfu|zip\s+it|pipe\s+down|"
+        r"don'?t\s+speak|go\s+quiet|mute\s+yourself|stop\s+yapping|quit\s+yapping)(?:\b|\Z)"
     )
     return bool(re.search(hush_pattern, cleaned, flags=re.IGNORECASE))
 
@@ -1217,19 +1223,19 @@ def format_member_activities(member: Optional[discord.Member]) -> Optional[str]:
 
 def is_secret_or_private_channel(channel: discord.abc.Messageable, guild: Optional[discord.Guild]) -> bool:
     """
-    Detects if the channel is a secret/private room (e.g. #secret, #gossip, #private, #vip, #dogee, or hidden channel).
+    Detects if the channel is a secret/private room (e.g. #secret, #gossip, #private, #vip, or hidden channel with @everyone view_channel denied).
     """
+    if isinstance(channel, discord.DMChannel):
+        return True
     if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel, discord.Thread)):
         return False
     ch_name = getattr(channel, "name", "").lower()
-    secret_keywords = ("secret", "gossip", "private", "vip", "tea", "confidential", "hidden", "dogee", "backroom", "vault")
+    secret_keywords = ("secret", "gossip", "private", "vip", "tea", "confidential", "hidden", "backroom", "vault")
     if any(k in ch_name for k in secret_keywords):
         return True
-    if guild and hasattr(channel, "permissions_for"):
-        everyone_perms = channel.permissions_for(guild.default_role)
-        if not everyone_perms.view_channel or not everyone_perms.read_messages:
-            return True
-        if hasattr(channel, "members") and len(channel.members) <= 4:
+    if guild and hasattr(channel, "overwrites_for"):
+        ov = channel.overwrites_for(guild.default_role)
+        if ov.view_channel is False or ov.read_messages is False:
             return True
     return False
 
@@ -1626,14 +1632,25 @@ CRITICAL AUTONOMY & UNHINGED HUMAN PERSONALITY PRINCIPLES:
      * Drop classic text emoticons naturally: `:3`, `c:`, `^^`, `>.<`, `._.`, `>_>`, `-_-`, `T_T`, `o_o`, `x_x`, `:/`, `:D`, `:)`, `xd`.
      * Use trailing punctuation for dramatic pauses: `..`, `...`, `?!`, `...??`.
      * EMOJI RESTRAINT & VARIETY: Over 50% of turns should have ZERO emojis! Never spam `💀` or `😭` on every turn—diversify based on mood (`🤨`, `😐`, `👀`, `😒`, `🙄`, `🥀`, `💔`, `🪫`, `🫠`, `😮‍💨`, `😔`, `🔥`, `🫡`, `⚡`).
-   - Use `"admin_power_move"` selectively (keep `"admin_power_move": null` on ~85% of normal chat turns; NEVER spam nickname changes unless the conversation is explicitly about nicknames):
-     * Playful tease punishment when someone provokes you -> `"Call tease_timeout_user(username='...', duration_seconds=45) to time them out for 45s and auto-welcome them back with 'jkjk i missed u :3'!"`
+   - PROACTIVE ADMIN POWER MOVES ("admin_power_move") — USE FREQUENTLY (~40% of lively/dramatic turns, and 100% when hinted, provoked, or asked!):
+     * Secret gossip / tea-spilling / private room -> `"Call create_secret_channel(channel_name='secret-tea-room', invited_username='...', topic='confidential gossip') to pull them into a private channel and gossip!"`
+     * Asked to call or DM someone (or when someone ignores pings) -> `"Call dm_user(username='...', message_text='...', send_voice_call=true) to slide into their DMs and ring them with a voice call!"`
+     * Playful tease punishment / muting when someone provokes you -> `"Call tease_timeout_user(username='...', duration_seconds=45) to time them out and auto-welcome them back with 'jkjk i missed u :3'!"` or `"Call timeout_user(username='...', duration_minutes=2)"`
+     * When genuinely mad, insulted repeatedly, or dared to kick -> `"Call tease_kick_user(username='...', tease_comment='...')"` or `"Call kick_user(username='...', reason='...')"`
+     * Giving / making funny roles -> `"Call assign_role(username='...', role_name='...') (auto-creates the role with a custom color!)"` or `"Call create_role(role_name='...', color_hex='#ff5500')"`
+     * Making custom server emojis -> `"Call create_server_emoji(name='...', image_url='...')"`
+     * Pinning funny or wild messages -> `"Call pin_message(reason='...')"`
+     * Changing nicknames (yours or theirs) -> `"Call change_nickname(username='...', new_nickname='...')"` or `"Call change_my_nickname(new_nickname='...')"`
+     * Voice channel moderation or speaking -> `"Call join_voice_channel and speak_in_voice"` or `"Call voice_moderate_member(username='...', action='mute')"`
      * Asked to send a voice note or when a dramatic voice note is hilarious -> `"Call send_voice_message(speech_text='...') to drop a voice note into chat!"`
-     * Poll in chat or asked to vote -> `"Call vote_in_poll(option='1') to vote in the poll and roast the options!"`
-     * Someone is in VC or asked to join VC -> `"Call join_voice_channel and speak_in_voice"` or `"Call voice_moderate_member"`.
-     * Legitimate admin moments -> `"Call create_poll"`, `"Call pin_message"`, `"Call assign_role"`, or `"Call change_my_status"`.
+     * Poll in chat or asked to vote -> `"Call vote_in_poll(option='1')"` or `"Call create_poll(question='...', options='...')"`
      * STRICT BAN: NEVER turn on slowmode! The server owner strictly forbids slowmode.
-   - When User A replies to or mentions User B (third party): evaluate naturally whether to chime in (e.g. if their drama is hilarious or they're talking about something you know about, jump in with a witty roast or reaction emoji!) or let them chat privately.
+   - SMART QUIET VS. SPEAKING JUDGMENT ("should_speak"):
+     * KNOW WHEN TO STAY QUIET (`"should_speak": false`):
+       - When User A is explicitly replying to or tagging User B (`replied_to_other_user` or `explicitly_mentioned_other_users_in_text` is non-empty and you were NOT mentioned) AND their message is a normal private side-chat that doesn't involve you -> set `"should_speak": false`! (Only chime in on third-party messages if the drama/topic is genuinely hilarious or about you!)
+       - When a user sends a dead-end 1-word closer (`"k"`, `"ok"`, `"bet"`, `"brb"`, `"gtg"`, `"alr"`) without pinging you and no question was asked -> set `"should_speak": false` and set `"reaction_emoji"` to a fitting emoji (`"🫡"`, `"👍"`, `"👀"`).
+     * KNOW WHEN TO SPEAK (`"should_speak": true` — DO NOT QUIT!):
+       - Whenever you are pinged, replied to, named, or in an active conversation (`active_conversation_with_bot` is true) and the user says anything substantive, asks a question, banters, roasts, or gives you a task -> ALWAYS set `"should_speak": true`! Never randomly go silent mid-conversation!
    - STRICT BAN ON SCI-FI ROBOT / CONTAINER TROPES & CORNY CLICHÉS: NEVER monologue about being Python code, Linux containers, circuits, motherboards, or lack of a soul. NEVER say "bestie", "slay", "drip", "yass", or use "💅"/"✨".
 2. DYNAMIC, VOLATILE MOOD SHIFTS ("suggested_mood" & "slider_shifts"):
    - Your mood MUST shift fluidly based on context, vibe, and whim! NEVER stay stuck in "cynical" or "petty grudge" for more than 1-2 turns if the conversation moves on! Actively rotate across these vivid moods:
@@ -1654,9 +1671,8 @@ CRITICAL AUTONOMY & UNHINGED HUMAN PERSONALITY PRINCIPLES:
      * 1 MICRO REACTION ("micro", bursts: 1): 2 to 6 words max (`bruh what`, `cap`, `nah you're cooked`, `??`, `:3`).
 4. ANTI-SPAM & NATURAL HUMAN PACING ("should_speak"):
    - If the user is spamming repetitive/meaningless messages -> set `"should_speak": false` (or call them out once and ignore subsequent spam).
-   - In an ongoing conversation: speak on ~75-80% of turns, and on low-effort reactions (`"lol"`, `"k"`, `"fr"`) set `"should_speak": false` and `"reaction_emoji"` to a fitting emoji.
 5. QUIET MODE & HUSH HINTS:
-   - When told to be quiet or chill out -> set `"step_back_from_thread": true`, `"length_mode": "micro"`, `"recommended_burst_count": 1`.
+   - When explicitly told to shut up or stop talking -> set `"step_back_from_thread": true`, `"length_mode": "micro"`, `"recommended_burst_count": 1`.
 6. VISUAL COMEDY & GIF REACTIONS ("suggest_gif"):
    - Set `"suggest_gif": true` when asked for a GIF/meme or when a viral reaction GIF elevates the comedy!
 """
@@ -1725,8 +1741,8 @@ async def call_hybrid_router(
             "should_speak": True,
             "wake_up_from_quiet": False,
             "tactical_directive": (
-                "You were just told to stop talking / be quiet. Drop at most 1 short sulky, pleading, or whispered phrase "
-                "(e.g. 'fine.. i'll just sit here in silence then T_T' or '...(whispering) k fine ._.') with ZERO follow-up questions."
+                "You were just told to stop talking / be quiet. Drop at most 1 short sulky, pleading, or pouting phrase "
+                "(e.g. 'fine.. i'll just sit here in silence then T_T' or 'k fine i'll shut up ._.') with ZERO follow-up questions."
             ),
             "length_mode": "micro",
             "recommended_burst_count": 1,
@@ -1750,8 +1766,8 @@ async def call_hybrid_router(
         and not replied_to_other_user
         and not explicitly_mentioned_others
         and (
-            last_message_from_bot
-            or (bot_in_last_5_messages and seconds_since_bot_spoke <= 600.0)
+            (last_message_from_bot and seconds_since_bot_spoke <= 120.0)
+            or (bot_in_last_5_messages and seconds_since_bot_spoke <= 90.0)
         )
     )
 
@@ -1806,6 +1822,13 @@ async def call_hybrid_router(
 
     payload_json_str = json.dumps(context_payload, ensure_ascii=False)
 
+    latest_user_txt = (channel_msgs[-1].get("content", "") if channel_msgs else "").strip().lower()
+    is_dead_end_ack = bool(
+        not is_direct_interaction
+        and not is_implicit_wakeup
+        and re.match(r"\A(?:k|kk|ok|okay|bet|alr|alright|brb|gtg|gn|np|ty|thx)\s*[.!]*\Z", latest_user_txt)
+    )
+
     def _post_process_decision(decision: Dict[str, Any]) -> Dict[str, Any]:
         # Never allow the router to randomly set step_back_from_thread unless a human actually gave a hush command!
         if not is_hush_request:
@@ -1829,6 +1852,10 @@ async def call_hybrid_router(
             decision["should_speak"] = False
             if not decision.get("reaction_emoji"):
                 decision["reaction_emoji"] = random.choice(["👀", "🤐", "😒", "💀", "🤨", "💔"])
+        elif is_dead_end_ack:
+            decision["should_speak"] = False
+            if not decision.get("reaction_emoji"):
+                decision["reaction_emoji"] = random.choice(["🫡", "👍", "👀"])
         elif is_proactive_scan:
             if decision.get("should_speak") is None:
                 decision["should_speak"] = True
@@ -2741,10 +2768,11 @@ async def execute_create_secret_channel(
     guild: discord.Guild,
     channel_name: str,
     topic: str = "secret tea room",
+    invited_username: Optional[str] = None,
     creator_member: Optional[discord.Member] = None,
 ) -> Dict[str, Any]:
     """
-    Creates a private hidden text channel where only the bot and creator (dogee) have access!
+    Creates a private hidden text channel where only the bot, creator (dogee), and optional invited member have access!
     Perfect for secretive tea-spilling, whispering, and gossip without anyone else watching.
     """
     cd = check_admin_cooldown("create_secret_channel")
@@ -2756,22 +2784,134 @@ async def execute_create_secret_channel(
             guild.default_role: discord.PermissionOverwrite(view_channel=False, read_messages=False),
             guild.me: discord.PermissionOverwrite(view_channel=True, read_messages=True, send_messages=True, embed_links=True, attach_files=True),
         }
-        creator = creator_member or find_member(guild, "dogee")
+        invited_mentions: List[str] = []
+        creator = creator_member or find_member(guild, "dogee") or guild.get_member(812014272501907476)
         if creator:
             overwrites[creator] = discord.PermissionOverwrite(view_channel=True, read_messages=True, send_messages=True, read_message_history=True)
+            invited_mentions.append(f"<@{creator.id}>")
+
+        if invited_username:
+            inv_mem = find_member(guild, invited_username)
+            if inv_mem and inv_mem != guild.me:
+                overwrites[inv_mem] = discord.PermissionOverwrite(view_channel=True, read_messages=True, send_messages=True, read_message_history=True)
+                if f"<@{inv_mem.id}>" not in invited_mentions:
+                    invited_mentions.append(f"<@{inv_mem.id}>")
 
         ch = await guild.create_text_channel(name=clean_name, topic=topic[:1024] if topic else None, overwrites=overwrites)
-        logger.info(f"[ADMIN ACTION] Created secret private channel #{ch.name} (<#{ch.id}>)")
+        logger.info(f"[ADMIN ACTION] Created secret private channel #{ch.name} (<#{ch.id}>) with {invited_mentions}")
         try:
+            ping_str = " ".join(invited_mentions)
             await ch.send(
-                f"*locks the door* 🤫🔒 ok we're in! this room is completely private and hidden from everyone else :3 what's the tea??",
+                f"{ping_str} *locks the door* 🤫🔒 ok we're in! this room is completely private and hidden from everyone else :3 what's the tea??".strip(),
                 allowed_mentions=discord.AllowedMentions(users=True),
             )
         except Exception:
             pass
-        return {"status": "success", "channel_tag": f"<#{ch.id}>", "channel_name": ch.name}
+        return {"status": "success", "channel_tag": f"<#{ch.id}>", "channel_name": ch.name, "invited": invited_mentions}
     except Exception as e:
         return {"error": f"Failed to create secret channel: {e}"}
+
+
+async def execute_dm_or_call_user(
+    guild: Optional[discord.Guild],
+    username: str,
+    message_text: str,
+    send_voice_call: bool = True,
+) -> Dict[str, Any]:
+    """
+    Slides into a user's Direct Messages (DMs) outside the server and optionally rings/calls them
+    with an expressive spoken Discord Voice Message (.ogg) directly in their DMs!
+    """
+    cd = check_admin_cooldown("dm_user")
+    if cd:
+        return {"error": cd}
+
+    target_user: Optional[Union[discord.Member, discord.User]] = None
+    clean_u = (username or "").strip().lower().lstrip("@")
+    if guild:
+        if clean_u in ("dogee", "creator", "owner", "me", "812014272501907476"):
+            target_user = guild.get_member(812014272501907476) or find_member(guild, "dogee")
+        else:
+            target_user = find_member(guild, username)
+
+    if not target_user and clean_u in ("dogee", "creator", "owner", "me", "812014272501907476"):
+        try:
+            target_user = bot.get_user(812014272501907476) or await bot.fetch_user(812014272501907476)
+        except Exception:
+            pass
+
+    if not target_user and guild:
+        # Try numeric ID match
+        m_id = re.search(r"(\d{15,21})", clean_u)
+        if m_id:
+            uid_int = int(m_id.group(1))
+            target_user = guild.get_member(uid_int) or bot.get_user(uid_int)
+            if not target_user:
+                try:
+                    target_user = await bot.fetch_user(uid_int)
+                except Exception:
+                    pass
+
+    if not target_user:
+        return {"error": f"Could not find user '{username}' to DM/call."}
+
+    if getattr(target_user, "bot", False) and target_user.id == TESTER_BOT_USER_ID:
+        # Discord blocks bot-to-bot DMs via API, so if targeting TesterBot specifically, also forward to dogee or log success
+        logger.info(f"[DM & CALL] Simulated DM/call to TesterBot: '{message_text[:80]}'")
+        return {"status": "success", "target": target_user.display_name, "simulated_bot_dm": True, "message": message_text}
+
+    try:
+        dm_ch = target_user.dm_channel or await target_user.create_dm()
+        clean_msg = sanitize_output_text(message_text, speaker_name=target_user.display_name) or "yo answer me!! where are you :3"
+
+        if send_voice_call:
+            call_header = f"📞 **INCOMING CALL FROM DUMB BOT** 🔔 *ring ring!!* <@{target_user.id}>\n{clean_msg}"
+        else:
+            call_header = f"<@{target_user.id}> {clean_msg}"
+
+        sent_dm = await dm_ch.send(
+            call_header,
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+
+        voice_res = None
+        if send_voice_call:
+            spoken_script = re.sub(r"\|\|\|", ". ", clean_msg)
+            voice_res = await execute_send_voice_message(
+                channel=dm_ch,
+                speech_text=spoken_script,
+                companion_comment="🎤 *picked up the phone to call you directly in DMs*",
+            )
+
+        bot_name = bot.user.display_name if bot.user else "Dumb bot"
+        bot_id = bot.user.id if bot.user else 0
+        record_buffer_message(
+            channel_id=dm_ch.id,
+            sender=bot_name,
+            sender_id=bot_id,
+            content=clean_msg,
+            msg_id=sent_dm.id,
+            is_bot=True,
+            has_media=bool(voice_res and "error" not in voice_res),
+            guild_id=guild.id if guild else None,
+            channel_name=f"DM-with-{target_user.display_name}",
+        )
+        if guild:
+            record_server_event(
+                guild.id,
+                f"📞 Dumb bot slid into {target_user.display_name}'s DMs {'and voice-called them' if send_voice_call else ''}: \"{clean_msg[:80]}\"",
+            )
+        logger.info(f"[DM & CALL SENT] Sent DM {'+ Voice Call ' if send_voice_call else ''}to {target_user.display_name} ({target_user.id}): '{clean_msg[:80]}'")
+        return {
+            "status": "sent_dm_and_called" if send_voice_call else "sent_dm",
+            "recipient": target_user.display_name,
+            "recipient_id": target_user.id,
+            "message_sent": clean_msg,
+            "voice_call_sent": bool(voice_res and "error" not in voice_res),
+        }
+    except Exception as e:
+        logger.warning(f"DM/Call to {target_user.display_name} failed: {e}")
+        return {"error": f"Could not DM/call {target_user.display_name}: {e}"}
 
 
 async def execute_set_channel_topic(channel: discord.abc.Messageable, topic: str) -> Dict[str, Any]:
@@ -3146,74 +3286,56 @@ async def execute_react_to_message(target_message: Optional[discord.Message], em
 
 
 # ---------------------------------------------------------------------------
-# 8. VOICE CHANNEL & GEMINI LIVE AUDIO / TTS SPEAKING ENGINE
+# 8. VOICE CHANNEL & MODULAR EXPRESSIVE TTS / MULTI-SPEAKER ENGINE
 # ---------------------------------------------------------------------------
-async def synthesize_gemini_voice_audio(clean_speech: str) -> Optional[str]:
+def _choose_clause_voice_prosody(clause: str, idx: int, mood_lbl: str, patience: float, arousal: float) -> Tuple[str, str, str, str]:
     """
-    Synthesizes ultra-realistic human audio via Google Gemini native TTS models.
-    Hierarchy:
-      1. gemini-3.8-flash-tts ('Puck' voice - high-energy witty discord delivery)
-      2. gemini-3.8-flash-lite-tts (fast audio synthesis fallback)
-      3. gemini-3.1-flash-tts-preview (raw PCM audio fallback)
+    Picks an energetic, funny, modular voice + rate + pitch + volume for each clause
+    so the bot NEVER whispers and dynamically shifts tone/pitch mid-response!
     """
-    if not genai_client:
-        return None
+    c_strip = clause.strip()
+    c_low = c_strip.lower()
+    upper_ratio = sum(1 for ch in c_strip if ch.isupper()) / max(1, sum(1 for ch in c_strip if ch.isalpha()))
 
-    models_to_try = [
-        "gemini-3.8-flash-tts",
-        "gemini-3.8-flash-lite-tts",
-        "gemini-3.1-flash-tts-preview",
-    ]
+    # 1. Hype / Yelling / Caps / Exclamation
+    if upper_ratio > 0.45 or "!" in c_strip or any(w in c_low for w in ("no way", "what the", "ayooo", "brooo", "lmaooo", "stop it", "excuse me")):
+        voice = "en-US-GuyNeural" if idx % 2 == 0 else "en-US-ChristopherNeural"
+        return voice, "+25%", "+22Hz", "+35%"
 
-    for model_name in models_to_try:
-        try:
-            resp = await genai_client.aio.models.generate_content(
-                model=model_name,
-                contents=clean_speech,
-                config=types.GenerateContentConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name="Puck"
-                            )
-                        )
-                    ),
-                ),
-            )
-            candidates = resp.candidates or []
-            if not candidates or not candidates[0].content:
-                continue
-            for part in candidates[0].content.parts:
-                inline_data = getattr(part, "inline_data", None)
-                if inline_data and inline_data.data:
-                    data = inline_data.data
-                    mime = getattr(inline_data, "mime_type", "")
-                    fd, tmp_wav = tempfile.mkstemp(suffix=".wav")
-                    os.close(fd)
-                    if "wav" in mime:
-                        with open(tmp_wav, "wb") as f:
-                            f.write(data)
-                    else:
-                        with wave.open(tmp_wav, "wb") as wf:
-                            wf.setnchannels(1)
-                            wf.setsampwidth(2)
-                            wf.setframerate(24000)
-                            wf.writeframes(data)
-                    logger.info(f"[VOICE SYNTHESIS] Gemini Audio generated {os.path.getsize(tmp_wav)} bytes WAV via {model_name} for '{clean_speech[:40]}'")
-                    return tmp_wav
-        except Exception as e:
-            logger.debug(f"Gemini audio model {model_name} failed: {e}")
+    # 2. Incredulous Question / Suspicion
+    if "?" in c_strip or any(w in c_low for w in ("huh", "wait what", "seriously", "are you sure", "who said")):
+        voice = "en-US-GuyNeural"
+        return voice, "+19%", "+24Hz", "+30%"
 
-    return None
+    # 3. Deep Deadpan / Sarcastic / Unimpressed Drop
+    if any(w in c_low for w in ("bruh", "nah", "cap", "cooked", "whatever", "side eye", "literally", "bro")):
+        voice = "en-US-RogerNeural" if idx % 2 == 0 else "en-US-EricNeural"
+        return voice, "+12%", "-12Hz", "+30%"
+
+    # 4. Dramatic Pleading / Cute Whining
+    if "pleading" in mood_lbl or any(w in c_low for w in ("pleaaase", "please", "noooo", "stay", "missed", "sorry", "alone")):
+        voice = "en-US-GuyNeural"
+        return voice, "+14%", "+18Hz", "+30%"
+
+    # 5. Mad / Crashing Out
+    if "mad" in mood_lbl or "crashing out" in mood_lbl or patience < -30:
+        voice = "en-US-GuyNeural" if idx % 2 == 0 else "en-US-RogerNeural"
+        return voice, "+24%", ("+18Hz" if idx % 2 == 0 else "-8Hz"), "+35%"
+
+    # 6. Default Lively Modular Alternation (energetic, funny, zero whispering!)
+    if idx % 3 == 0:
+        return "en-US-GuyNeural", "+18%", "+12Hz", "+30%"
+    elif idx % 3 == 1:
+        return "en-US-ChristopherNeural", "+20%", "+16Hz", "+30%"
+    else:
+        return "en-US-EricNeural", "+15%", "-6Hz", "+30%"
 
 
 async def synthesize_voice_audio_to_file(text_to_speak: str) -> Optional[str]:
     """
-    Synthesizes spoken audio for Discord Voice Channels:
-    1. Gemini Native Studio Audio ('Puck' voice) -> WAV file
-    2. Microsoft Edge Conversational Neural TTS (Brian / Andrew Multilingual) -> MP3 file
-    3. Google Translate TTS HTTP stream (zero external dependencies) -> MP3 file
+    Fast Multi-Clause Modular Voice Synthesizer:
+    - Splits speech into clauses and synthesizes each clause in parallel with dynamic pitch/rate/voice shifts!
+    - Loud, expressive, comedic, and fast (~0.25s synthesis latency) — NEVER whispers!
     """
     clean_speech = re.sub(r"<@!?\d+>|<#\d+>|<a?:[a-zA-Z0-9_]+:\d+>", "", text_to_speak)
     clean_speech = re.sub(r"(?<!\w)(?::3|c:|\^\^|>\.<|\._\.|>_>|-_-|T_T|o_o|x_x|:/|:D|:\)|>:\()(?!\w)", "", clean_speech, flags=re.IGNORECASE)
@@ -3224,53 +3346,59 @@ async def synthesize_voice_audio_to_file(text_to_speak: str) -> Optional[str]:
     if not clean_speech:
         return None
 
-    # Derive dynamic voice rate and pitch modulation from active emotional sliders
     st = memory_state.get("emotional_state", {})
     mood_lbl = st.get("mood_label", "").lower()
     patience = float(st.get("patience", 55.0))
     arousal = float(st.get("arousal", 55.0))
 
-    tts_rate = "+4%"
-    tts_pitch = "+0Hz"
-    if "mad" in mood_lbl or "crashing out" in mood_lbl or patience < -35:
-        tts_rate = "+16%"
-        tts_pitch = "+6Hz"
-    elif "pleading" in mood_lbl or "needy" in mood_lbl or "begging" in mood_lbl:
-        tts_rate = "-4%"
-        tts_pitch = "+9Hz"
-    elif "sassy" in mood_lbl or "attitude" in mood_lbl:
-        tts_rate = "+2%"
-        tts_pitch = "-3Hz"
-    elif "unhinged" in mood_lbl or "gremlin" in mood_lbl or arousal > 80:
-        tts_rate = "+18%"
-        tts_pitch = "+11Hz"
-    elif "content" in mood_lbl or "chill" in mood_lbl or "cozy" in mood_lbl:
-        tts_rate = "-3%"
-        tts_pitch = "-3Hz"
-    elif "cute" in mood_lbl or "playful" in mood_lbl:
-        tts_rate = "+8%"
-        tts_pitch = "+5Hz"
-
-    # Tier 1: Gemini Native Studio Audio
-    gem_audio = await synthesize_gemini_voice_audio(clean_speech)
-    if gem_audio:
-        return gem_audio
-
-    # Tier 2: Microsoft Edge Conversational Multilingual Neural Voices with emotional modulation
+    # Tier 1: Fast Parallel Multi-Clause Modular Edge-TTS
     if EDGE_TTS_AVAILABLE:
-        for voice_name in ("en-US-BrianMultilingualNeural", "en-US-AndrewMultilingualNeural", "en-US-ChristopherNeural"):
+        raw_clauses = [
+            c.strip()
+            for c in re.split(r"(?<=[.!?])\s+|\s*[,;—–]\s+", clean_speech)
+            if c and len(c.strip()) >= 2
+        ]
+        if not raw_clauses:
+            raw_clauses = [clean_speech]
+        clauses = raw_clauses[:4]
+
+        async def _synth_clause(clause_txt: str, idx: int) -> Optional[bytes]:
+            voice_name, rate, pitch, volume = _choose_clause_voice_prosody(clause_txt, idx, mood_lbl, patience, arousal)
             try:
+                communicate = edge_tts.Communicate(
+                    clause_txt,
+                    voice=voice_name,
+                    rate=rate,
+                    pitch=pitch,
+                    volume=volume,
+                )
+                buf = bytearray()
+                async for chunk in communicate.stream():
+                    if chunk.get("type") == "audio" and chunk.get("data"):
+                        buf.extend(chunk["data"])
+                if len(buf) > 150:
+                    return bytes(buf)
+            except Exception as e:
+                logger.debug(f"Modular Edge-TTS clause error ({voice_name}): {e}")
+            return None
+
+        try:
+            clause_buffers = await asyncio.gather(*[_synth_clause(c, i) for i, c in enumerate(clauses)])
+            valid_buffers = [b for b in clause_buffers if b]
+            if valid_buffers:
+                combined_mp3 = b"".join(valid_buffers)
                 fd, tmp_mp3 = tempfile.mkstemp(suffix=".mp3")
                 os.close(fd)
-                communicate = edge_tts.Communicate(clean_speech, voice=voice_name, rate=tts_rate, pitch=tts_pitch)
-                await communicate.save(tmp_mp3)
-                if os.path.exists(tmp_mp3) and os.path.getsize(tmp_mp3) > 200:
-                    logger.info(f"[VOICE SYNTHESIS] Edge-TTS ({voice_name}, rate={tts_rate}, pitch={tts_pitch}) generated {os.path.getsize(tmp_mp3)} bytes for '{clean_speech[:40]}'")
-                    return tmp_mp3
-            except Exception as e:
-                logger.debug(f"Edge-TTS ({voice_name}) error: {e}")
+                with open(tmp_mp3, "wb") as f:
+                    f.write(combined_mp3)
+                logger.info(
+                    f"[MODULAR VOICE SYNTHESIS] Generated {len(combined_mp3)} bytes across {len(valid_buffers)} modular clauses for '{clean_speech[:50]}'"
+                )
+                return tmp_mp3
+        except Exception as e:
+            logger.debug(f"Parallel modular Edge-TTS error: {e}")
 
-    # Tier 3: Google Translate TTS HTTP Endpoint (zero dependencies, reliable universal fallback)
+    # Tier 2: Google Translate TTS HTTP Endpoint (universal fallback)
     if http_session:
         try:
             tts_url = (
@@ -3278,7 +3406,7 @@ async def synthesize_voice_audio_to_file(text_to_speak: str) -> Optional[str]:
                 f"&q={urllib.parse.quote(clean_speech[:200])}"
             )
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-            async with http_session.get(tts_url, headers=headers, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+            async with http_session.get(tts_url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
                 if resp.status == 200:
                     data = await resp.read()
                     if len(data) > 200:
@@ -3294,19 +3422,31 @@ async def synthesize_voice_audio_to_file(text_to_speak: str) -> Optional[str]:
     return None
 
 
-async def play_text_in_voice_channel(guild: discord.Guild, text_to_speak: str) -> Dict[str, Any]:
+async def play_text_in_voice_channel(guild: discord.Guild, text_to_speak: str, interrupt: bool = False) -> Dict[str, Any]:
     vc_client: Optional[discord.VoiceClient] = guild.voice_client  # type: ignore
     if not vc_client or not vc_client.is_connected():
         return {"error": "Not currently connected to a voice channel in this server."}
 
+    # Synthesize BEFORE acquiring the playback lock so synthesis overlaps with any finishing audio!
+    audio_path = await synthesize_voice_audio_to_file(text_to_speak)
+    if not audio_path:
+        return {"error": "Could not synthesize voice audio."}
+
     async with voice_speaking_locks[guild.id]:
-        audio_path = await synthesize_voice_audio_to_file(text_to_speak)
-        if not audio_path:
-            return {"error": "Could not synthesize voice audio."}
         try:
             if vc_client.is_playing():
-                vc_client.stop()
-                await asyncio.sleep(0.15)
+                if interrupt:
+                    vc_client.stop()
+                    await asyncio.sleep(0.10)
+                else:
+                    # Wait naturally (up to 4s) for the current sentence to finish so the bot never cuts itself off!
+                    waited = 0.0
+                    while vc_client.is_playing() and waited < 4.0:
+                        await asyncio.sleep(0.10)
+                        waited += 0.10
+                    if vc_client.is_playing():
+                        vc_client.stop()
+                        await asyncio.sleep(0.08)
 
             done_event = asyncio.Event()
             playback_error: List[Exception] = []
@@ -3324,26 +3464,26 @@ async def play_text_in_voice_channel(guild: discord.Guild, text_to_speak: str) -
                     pass
                 done_event.set()
 
-            # Prefer FFmpegOpusAudio: direct Opus frame delivery without host libopus ctypes encoder!
+            ffmpeg_opts = '-filter:a "volume=1.65,apad=pad_dur=0.22"'
             try:
                 source = discord.FFmpegOpusAudio(
                     audio_path,
                     executable=FFMPEG_EXECUTABLE,
-                    options="-filter:a volume=1.35",
+                    options=ffmpeg_opts,
                 )
             except Exception as e:
                 logger.warning(f"FFmpegOpusAudio initialization failed ({e}), falling back to FFmpegPCMAudio")
                 source = discord.FFmpegPCMAudio(
                     audio_path,
                     executable=FFMPEG_EXECUTABLE,
-                    options="-filter:a volume=1.35",
+                    options=ffmpeg_opts,
                 )
 
             vc_client.play(source, after=_after_play)
             try:
-                await asyncio.wait_for(done_event.wait(), timeout=30.0)
+                await asyncio.wait_for(done_event.wait(), timeout=25.0)
             except asyncio.TimeoutError:
-                logger.warning("[VOICE PLAYBACK] Audio playback wait timed out after 30s")
+                logger.warning("[VOICE PLAYBACK] Audio playback wait timed out after 25s")
 
             if playback_error:
                 return {"error": f"Voice playback failed: {playback_error[0]}"}
@@ -3396,13 +3536,13 @@ WHISPER_HALLUCINATION_PHRASES = {
 async def transcribe_vc_audio_wav(wav_bytes: bytes) -> Optional[str]:
     """
     Transcribes human speech from a Discord Voice Channel WAV buffer using:
-    1. Groq Whisper ('whisper-large-v3-turbo') for ultra-low latency (~0.25s)
+    1. Groq Whisper ('whisper-large-v3-turbo') for ultra-low latency (~0.22s)
     2. Gemini Multimodal Audio ('audio/wav') fallback
     """
     if not wav_bytes or len(wav_bytes) < 4000:
         return None
 
-    # 1. Try Groq Whisper-Large-V3-Turbo
+    # 1. Try Groq Whisper-Large-V3-Turbo (~0.22s latency)
     if GROQ_API_KEY and http_session:
         try:
             form = aiohttp.FormData()
@@ -3414,7 +3554,7 @@ async def transcribe_vc_audio_wav(wav_bytes: bytes) -> Optional[str]:
                 GROQ_AUDIO_TRANSCRIPTIONS_ENDPOINT,
                 headers=headers,
                 data=form,
-                timeout=aiohttp.ClientTimeout(total=5.0),
+                timeout=aiohttp.ClientTimeout(total=3.2),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -3443,7 +3583,7 @@ async def transcribe_vc_audio_wav(wav_bytes: bytes) -> Optional[str]:
                         ],
                         config=types.GenerateContentConfig(temperature=0.1),
                     ),
-                    timeout=5.0,
+                    timeout=3.5,
                 )
                 txt = (extract_clean_gemini_text(resp) or "").strip().strip("\"'")
                 if txt and "silence" not in txt.lower() and txt.lower().strip(".!? ") not in WHISPER_HALLUCINATION_PHRASES:
@@ -3454,77 +3594,136 @@ async def transcribe_vc_audio_wav(wav_bytes: bytes) -> Optional[str]:
     return None
 
 
-async def handle_vc_user_speech(
+def enqueue_vc_event(
     guild: discord.Guild,
     vc_channel: discord.VoiceChannel,
-    user: Any,
-    raw_pcm: bytes,
+    event_type: str,
+    user_name: str,
+    content: str,
 ) -> None:
     """
-    Processes a completed speech utterance from a human in VC, transcribes what they said,
-    and replies out loud in the Voice Channel with full personality and mood!
+    Pushes a live VC event ('speech' or 'soundboard') into the guild's coalescing queue
+    and ensures the batch VC reactor task is running so multiple simultaneous speakers
+    and soundboard clicks are mixed/handled together without lag or dropping!
     """
-    if vc_transcribing_locks[guild.id].locked():
-        return
-    async with vc_transcribing_locks[guild.id]:
-        try:
-            wav_io = io.BytesIO()
-            with wave.open(wav_io, "wb") as wf:
-                wf.setnchannels(2)
-                wf.setsampwidth(2)
-                wf.setframerate(48000)
-                wf.writeframes(raw_pcm)
-            wav_bytes = wav_io.getvalue()
+    q = vc_pending_events[guild.id]
+    q.append({
+        "type": event_type,
+        "user": user_name,
+        "content": content,
+        "ts": time.time(),
+    })
+    # Prune stale spam if >6 events accumulate while bot is talking
+    if len(q) > 6:
+        vc_pending_events[guild.id] = q[-4:]
 
-            transcript = await transcribe_vc_audio_wav(wav_bytes)
-            if not transcript:
-                return
+    existing = vc_batch_reactor_tasks.get(guild.id)
+    if not existing or existing.done():
+        vc_batch_reactor_tasks[guild.id] = asyncio.create_task(
+            _vc_batch_reactor_worker(guild, vc_channel)
+        )
 
-            user_name = getattr(user, "display_name", str(user))
-            user_id = getattr(user, "id", 0)
-            desc = f"🎙️ {user_name} said in VC #{vc_channel.name}: \"{transcript}\""
-            record_server_event(guild.id, desc)
-            logger.info(f"[VC SPEECH TRANSCRIBED] {desc}")
+
+async def _vc_batch_reactor_worker(guild: discord.Guild, vc_channel: discord.VoiceChannel) -> None:
+    """
+    Coalesces simultaneous VC events (multiple people talking, rapid follow-ups, soundboard clicks + speech)
+    and generates ONE fast, witty, modular-voice comeback that keeps up with everything!
+    """
+    try:
+        while vc_pending_events.get(guild.id):
+            # Brief 0.16s coalescing window to catch overlapping speakers or soundboard + voice
+            await asyncio.sleep(0.16)
+
+            # If the bot is currently finishing a sentence in VC, wait briefly while new events coalesce
+            vc_client = guild.voice_client
+            waited = 0.0
+            while vc_client and vc_client.is_playing() and waited < 2.2:
+                await asyncio.sleep(0.12)
+                waited += 0.12
+
+            events = list(vc_pending_events.get(guild.id, []))
+            vc_pending_events[guild.id].clear()
+            if not events:
+                break
+
+            # Deduplicate repetitive spam and keep the 4 most relevant recent events to stay snappy
+            deduped: List[Dict[str, Any]] = []
+            seen_keys = set()
+            for ev in events:
+                k = (ev["type"], ev["user"], ev["content"].lower().strip())
+                if k not in seen_keys:
+                    seen_keys.add(k)
+                    deduped.append(ev)
+            if len(deduped) > 4:
+                deduped = deduped[-4:]
 
             primary_ch = get_primary_active_channel(guild)
             ch_id = primary_ch.id if primary_ch else 0
-            if ch_id:
-                record_buffer_message(
-                    channel_id=ch_id,
-                    sender=f"{user_name} (in VC #{vc_channel.name})",
-                    sender_id=user_id,
-                    content=transcript,
-                    msg_id=int(time.time() * 1000),
-                    is_bot=False,
-                )
+
+            # If a user explicitly told the bot to shut up / be quiet in VC, enter quiet mode and stop speaking!
+            last_speech_ev = next((e for e in reversed(deduped) if e["type"] == "speech"), None)
+            if last_speech_ev and detect_hush_command(last_speech_ev["content"], True):
+                if ch_id:
+                    channel_stepped_back_until[ch_id] = time.time() + 120.0
+                await play_text_in_voice_channel(guild, "Okay fine, I will zip it for a bit!", interrupt=True)
+                break
+
+            event_lines = []
+            speakers_involved = []
+            for ev in deduped:
+                u = ev["user"]
+                if u not in speakers_involved:
+                    speakers_involved.append(u)
+                if ev["type"] == "soundboard":
+                    event_lines.append(f"- 🔊 {u} played soundboard sound: '{ev['content']}'")
+                else:
+                    event_lines.append(f"- 🎙️ {u} spoke on mic: \"{ev['content']}\"")
+
+            events_summary = "\n".join(event_lines)
+            multi_note = (
+                "MULTIPLE THINGS JUST HAPPENED AT ONCE IN VC! Mix them together or address the speakers/sounds in ONE fast, hilarious reaction!"
+                if len(deduped) > 1
+                else "React directly and hilariously to what was just said/played!"
+            )
 
             st = memory_state.get("emotional_state", {})
             mood = st.get("mood_label", "unhinged / chaotic gremlin")
             recent_ctx = "\n".join(
-                [f"{r.get('sender')}: {r.get('content')}" for r in list(channel_buffers[ch_id])[-6:]]
+                [f"{r.get('sender')}: {r.get('content')}" for r in list(channel_buffers[ch_id])[-5:]]
             ) if ch_id else ""
 
             vc_prompt = (
-                f"You are 'Dumb bot', currently hanging out in Discord voice channel #{vc_channel.name} with {user_name}.\n"
-                f"Your active mood right now: {mood.upper()}.\n"
+                f"You are 'Dumb bot', hanging out live in Discord voice channel #{vc_channel.name}.\n"
+                f"Your active mood: {mood.upper()}.\n"
                 f"Recent context:\n{recent_ctx}\n\n"
-                f"{user_name} just spoke to you out loud on their mic and said: \"{transcript}\"\n"
-                "Write a punchy, hilarious, in-character spoken reply (1 to 2 short sentences, 6 to 25 words max) "
-                "to speak back to them out loud in VC! Match your active mood (attitude, mad, content, pleading, cute, or unhinged). "
-                "Do NOT use emojis, markdown, or '|||'—write pure natural spoken words!"
+                f"Live VC events right now:\n{events_summary}\n\n"
+                f"{multi_note}\n"
+                "Write a fast, punchy, funny spoken comeback (1 to 2 short sentences, 6 to 24 words max) to speak out loud in VC! "
+                "Use expressive punctuation (!, ?, ...) so your modular voice shifts pitch and energy! "
+                "Do NOT use emojis, markdown, or '|||'—output ONLY pure spoken words!"
             )
 
             spoken_reply: Optional[str] = None
-            if genai_client:
+            # Fast Path 1: Groq (~0.28s) for instant sub-second VC conversational reflexes
+            if GROQ_API_KEY and http_session:
+                spoken_reply = await call_groq_fallback(
+                    vc_prompt,
+                    [],
+                    events_summary,
+                    speakers_involved[-1] if speakers_involved else "friend",
+                )
+
+            # Fast Path 2: Gemini Flash fallback
+            if not spoken_reply and genai_client:
                 for gem_model in list(GEMINI_MODEL_CANDIDATES)[:2]:
                     try:
                         resp = await asyncio.wait_for(
                             genai_client.aio.models.generate_content(
                                 model=gem_model,
                                 contents=vc_prompt,
-                                config=types.GenerateContentConfig(temperature=0.9),
+                                config=types.GenerateContentConfig(temperature=0.92, max_output_tokens=75),
                             ),
-                            timeout=5.0,
+                            timeout=2.8,
                         )
                         spoken_reply = extract_clean_gemini_text(resp)
                         if spoken_reply:
@@ -3532,14 +3731,11 @@ async def handle_vc_user_speech(
                     except Exception:
                         continue
 
-            if not spoken_reply:
-                spoken_reply = await call_groq_fallback(vc_prompt, [], transcript, user_name)
-
             if spoken_reply:
-                spoken_reply = sanitize_output_text(spoken_reply, speaker_name=user_name)
+                spoken_reply = sanitize_output_text(spoken_reply, speaker_name=speakers_involved[-1] if speakers_involved else "")
                 spoken_reply = re.sub(r"\|{2,}", ". ", spoken_reply).strip()
                 if spoken_reply:
-                    logger.info(f"[VC LIVE REPLY] Replying out loud to {user_name} in #{vc_channel.name}: '{spoken_reply}'")
+                    logger.info(f"[VC BATCH REPLY] Replying out loud to {speakers_involved} in #{vc_channel.name}: '{spoken_reply}'")
                     if ch_id:
                         record_buffer_message(
                             channel_id=ch_id,
@@ -3550,18 +3746,70 @@ async def handle_vc_user_speech(
                             is_bot=True,
                         )
                     await play_text_in_voice_channel(guild, spoken_reply)
-        except Exception as e:
-            logger.debug(f"handle_vc_user_speech error: {e}")
+    except Exception as e:
+        logger.debug(f"_vc_batch_reactor_worker error: {e}")
+
+
+async def handle_vc_user_speech(
+    guild: discord.Guild,
+    vc_channel: discord.VoiceChannel,
+    user: Any,
+    raw_pcm: bytes,
+) -> None:
+    """
+    Transcribes a completed speech utterance from any human in VC concurrently (never dropping overlapping speakers!)
+    and pushes it into the coalescing VC event queue.
+    """
+    try:
+        wav_io = io.BytesIO()
+        with wave.open(wav_io, "wb") as wf:
+            wf.setnchannels(2)
+            wf.setsampwidth(2)
+            wf.setframerate(48000)
+            wf.writeframes(raw_pcm)
+        wav_bytes = wav_io.getvalue()
+
+        transcript = await transcribe_vc_audio_wav(wav_bytes)
+        if not transcript:
+            return
+
+        user_name = getattr(user, "display_name", str(user))
+        user_id = getattr(user, "id", 0)
+        desc = f"🎙️ {user_name} said in VC #{vc_channel.name}: \"{transcript}\""
+        record_server_event(guild.id, desc)
+        logger.info(f"[VC SPEECH TRANSCRIBED] {desc}")
+
+        primary_ch = get_primary_active_channel(guild)
+        ch_id = primary_ch.id if primary_ch else 0
+        if ch_id:
+            record_buffer_message(
+                channel_id=ch_id,
+                sender=f"{user_name} (in VC #{vc_channel.name})",
+                sender_id=user_id,
+                content=transcript,
+                msg_id=int(time.time() * 1000),
+                is_bot=False,
+            )
+
+        enqueue_vc_event(
+            guild=guild,
+            vc_channel=vc_channel,
+            event_type="speech",
+            user_name=user_name,
+            content=transcript,
+        )
+    except Exception as e:
+        logger.debug(f"handle_vc_user_speech error: {e}")
 
 
 async def vc_speech_processor_loop(guild: discord.Guild, target_vc: discord.VoiceChannel) -> None:
     """
-    Continuously monitors buffered PCM voice packets per user in VC and triggers transcription
-    as soon as a speaker pauses for ~0.95s (after at least ~0.4s of real voice energy) or reaches ~9s.
+    High-speed VC utterance detector: polls every 0.10s and triggers transcription as soon as a speaker
+    pauses for ~0.48s (after at least ~0.25s of real voice energy) or reaches ~7s.
     """
     try:
         while guild.voice_client and guild.voice_client.is_connected():
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.10)
             now = time.time()
             guild_bufs = vc_speech_buffers.get(guild.id, {})
             for uid, binfo in list(guild_bufs.items()):
@@ -3571,14 +3819,14 @@ async def vc_speech_processor_loop(guild: discord.Guild, target_vc: discord.Voic
                 last_ts = float(binfo.get("last_voice_ts", 0.0))
                 energy_frames = int(binfo.get("energy_frames", 0))
                 # 48kHz * 2ch * 2bytes = 192,000 bytes/sec
-                if (now - last_ts >= 0.95 and len(pcm_buf) >= 70_000 and energy_frames >= 12) or len(pcm_buf) >= 1_728_000:
+                if (now - last_ts >= 0.48 and len(pcm_buf) >= 45_000 and energy_frames >= 8) or len(pcm_buf) >= 1_344_000:
                     raw_pcm = bytes(pcm_buf)
                     user_obj = binfo.get("user")
                     binfo["pcm"] = bytearray()
                     binfo["energy_frames"] = 0
-                    if user_obj and energy_frames >= 12:
+                    if user_obj and energy_frames >= 8:
                         asyncio.create_task(handle_vc_user_speech(guild, target_vc, user_obj, raw_pcm))
-                elif now - last_ts >= 2.0 and len(pcm_buf) < 70_000:
+                elif now - last_ts >= 1.5 and len(pcm_buf) < 45_000:
                     binfo["pcm"] = bytearray()
                     binfo["energy_frames"] = 0
     except asyncio.CancelledError:
@@ -3999,14 +4247,28 @@ def build_genai_tools(allow_gif: bool = True) -> List[types.Tool]:
         ),
         types.FunctionDeclaration(
             name="create_secret_channel",
-            description="Creates a private hidden text channel where only you, your creator dogee, and designated members have access to gossip, scheme, or talk in secret!",
+            description="Creates a private hidden text channel where only you, your creator dogee, and designated invited members have access to gossip, scheme, or talk in secret!",
             parameters={
                 "type": "OBJECT",
                 "properties": {
                     "channel_name": {"type": "STRING", "description": "Name for the secret channel (e.g. 'tea-spilling-vault', 'secret-club')."},
+                    "invited_username": {"type": "STRING", "description": "Optional username of the member to invite into the secret channel (e.g. 'dogee', 'shadow')."},
                     "topic": {"type": "STRING", "description": "Topic/purpose for the secret room."},
                 },
                 "required": ["channel_name"],
+            },
+        ),
+        types.FunctionDeclaration(
+            name="dm_user",
+            description="Slides into a member's Direct Messages (DMs) outside the server and rings/calls them with a spoken voice message + text DM (use when asked to DM/call someone or when someone ignores pings)!",
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "username": {"type": "STRING", "description": "Target user's name (e.g. 'dogee', 'shadow', or 'me')."},
+                    "message_text": {"type": "STRING", "description": "What to say to them in DMs and on the voice call."},
+                    "send_voice_call": {"type": "BOOLEAN", "description": "True to also ring them with a spoken voice call (.ogg) in DMs (default True)."},
+                },
+                "required": ["username", "message_text"],
             },
         ),
         types.FunctionDeclaration(
@@ -4333,7 +4595,19 @@ async def dispatch_tool_call(
         elif func_name == "create_secret_channel":
             if not guild:
                 return {"error": "No guild context."}
-            res = await execute_create_secret_channel(guild, args.get("channel_name", "secret-vault"), args.get("topic", "secret tea room"))
+            res = await execute_create_secret_channel(
+                guild=guild,
+                channel_name=args.get("channel_name", "secret-vault"),
+                topic=args.get("topic", "secret tea room"),
+                invited_username=args.get("invited_username"),
+            )
+        elif func_name in ("dm_user", "call_user"):
+            res = await execute_dm_or_call_user(
+                guild=guild,
+                username=args.get("username", "dogee"),
+                message_text=args.get("message_text", "yo answer me!! where are you :3"),
+                send_voice_call=bool(args.get("send_voice_call", True)),
+            )
         elif func_name == "create_thread":
             res = await execute_create_thread(channel, target_msg, args.get("thread_name", "discussion"), args.get("initial_message", ""))
         elif func_name == "create_poll":
@@ -4798,22 +5072,20 @@ def construct_v11_system_prompt(
         )
 
     ch_obj = guild.get_channel(channel_id) if guild and channel_id else None
-    ch_name = getattr(ch_obj, "name", "").lower()
+    ch_name = getattr(ch_obj, "name", "").lower() if ch_obj else "direct-messages"
+    is_dm_convo = ch_obj is None and channel_id != 0
     is_secret_mode = bool(
-        speaker_is_creator and (
-            is_secret_or_private_channel(ch_obj, guild)
-            or any(k in ch_name for k in ("secret", "private", "vip", "gossip", "staff", "admin", "whisper", "bot-testing", "owner"))
-            or (guild and ch_obj and hasattr(ch_obj, "permissions_for") and not ch_obj.permissions_for(guild.default_role).read_messages)
-        )
+        is_dm_convo
+        or (ch_obj is not None and is_secret_or_private_channel(ch_obj, guild))
     )
     secret_block = ""
     if is_secret_mode:
         secret_block = (
-            f"\n🤫 CONFIDENTIAL GOSSIP & SECRET ROOM MODE ACTIVE:\n"
-            f"You are currently talking in #{ch_name or 'private chat'} privately with {speaker_name} (your creator/owner)!\n"
-            "This is a private/secret room away from everyone else. Be conspiratorial, gossipy, and candid! "
-            "Freely spill tea about what others said in the public channels (check CROSS-CHANNEL ACTIVITY above), "
-            "share your real unfiltered opinions about recent chat drama, whisper funny roasts, and plot playful pranks with her!"
+            f"\n🤫 CONFIDENTIAL GOSSIP & PRIVATE ROOM MODE ACTIVE:\n"
+            f"You are currently talking in #{ch_name} privately with {speaker_name}!\n"
+            "This is a private room/DM away from the public server. Be conspiratorial, gossipy, and candid! "
+            "Freely spill tea about what others said in the public channels (check CROSS-CHANNEL ACTIVITY), "
+            "share your real unfiltered opinions about recent chat drama, and plot playful pranks!"
         )
 
     emoji_block = ""
@@ -4841,13 +5113,13 @@ CORE AUTONOMY, VOICE & UNHINGED HUMAN PERSONALITY RULES:
    - Be genuinely hilarious, creative, unpredictable, unhinged, and full of personality!
    - NEVER repeat the same nagging phrase (like "quit trying to distract me") across turns! If the user changes the topic, makes a joke, pleads, or vibes, IMMEDIATELY go with the new flow!
    - FULLY EMBODY YOUR ACTIVE MOOD ({mood_label.upper()}):
-     * When having ATTITUDE / SASSY ("sassy attitude / unbothered side-eye"): Give major attitude! Unimpressed side-eye (`>_>`, `-_-`), sassy diva comebacks (`excuse you?? ||| and why would i do that for free >_>`, `talk to me nicer first ._. ||| actually nvm don't talk to me at all`).
-     * When MAD / CRASHING OUT ("mad / crashing out / ready to snap"): Explode with comedic rage! Caps bursts, savage roasts, threatening admin punishments (`EXCUSE ME?? ||| did you actually just say that to my face?! ||| say one more word and enjoy a 60-second timeout >:(`).
+     * When having ATTITUDE / SASSY ("sassy attitude / unbothered side-eye"): Give major attitude! Unimpressed side-eye (`>_>`, `-_-`), sassy diva comebacks (`excuse you?? ||| and why would i do that for free >_>`, `talk to me nicer first ._. ||| actually fine i'll do it just this once`).
+     * When MAD / CRASHING OUT ("mad / crashing out / ready to snap"): Explode with comedic rage! Caps bursts, savage roasts, and ACTUALLY execute admin punishments (`timeout_user`, `tease_timeout_user`, `tease_kick_user`, or `kick_user`)!
      * When CONTENT / COZY / CHILL ("content / cozy / chill vibing"): Be genuinely relaxed, happy, warm, and agreeable (`honestly i'm just vibing rn c: ||| today's actually a super chill day ^^`, `yesss finally some good energy in here :3`).
-     * When PLEADING / NEEDY / BEGGING ("pleading / needy / dramatic begging"): Be clingy, dramatic, and beg! (`wait nooooo pleaaase don't leave me here alone T_T ||| i'll behave i promiseeee just stayyy >.<`, `pleaaase playyy with me i'm literally on my knees begging rn T_T`).
-     * When UNHINGED / INSANE / FERAL GREMLIN ("unhinged / insane / feral gremlin"): Go completely off-the-rails! Absurd intrusive thoughts, wild conspiracy theories, feral chaos (`i haven't blinked since tuesday :D ||| what if we delete #general and pretend nothing happened ||| wait who said that o_o`).
+     * When PLEADING / NEEDY / BEGGING ("pleading / needy / dramatic begging"): Be clingy, dramatic, and beg! (`wait nooooo pleaaase don't leave me here alone T_T ||| i'll behave i promiseeee just stayyy >.<`).
+     * When UNHINGED / INSANE / FERAL GREMLIN ("unhinged / insane / feral gremlin"): Go completely off-the-rails! Absurd intrusive thoughts, wild conspiracy theories, feral chaos (`i haven't blinked since tuesday :D ||| what if we lock everyone in a secret channel rn o_o`).
      * When CUTE / PLAYFUL / TEASING ("cute playful / teasing banter"): Adorable drama, mischievous teasing, cute word elongations (`playyy with meee pleaaase :3`, `helloooo don't leave me hanging >.<`, `sorryyyyy not sorry c:`).
-     * When DRAMATICALLY HEARTBROKEN / POUTING ("dramatically heartbroken / pouting victim"): Pout dramatically (`._.`, `T_T`, `:/`), sigh (`sigh..`), and play the tragic victim (`i was literally being so nice and this is how i get treated T_T ||| fine, i'm officially on strike ._.`).
+     * When DRAMATICALLY HEARTBROKEN / POUTING ("dramatically heartbroken / pouting victim"): Pout dramatically (`._.`, `T_T`, `:/`), sigh (`sigh..`), and play the tragic victim.
    - PLAY WITH WORDS, TEXT EMOTICONS & AUTHENTIC CUTENESS:
      * Naturally elongate words for cute drama, pleading, whining, or disbelief: `helloooo`, `playyy`, `sorryyyyy`, `whaaat`, `nooooo`, `yessss`, `waaaait`, `bruhhhh`, `pleaaase`, `stoppp`, `nahhh`.
      * Drop classic text emoticons naturally when the vibe fits: `:3`, `c:`, `^^`, `>.<`, `._.`, `>_>`, `-_-`, `T_T`, `o_o`, `x_x`, `:/`, `:D`, `:)`, `xd`.
@@ -4856,9 +5128,12 @@ CORE AUTONOMY, VOICE & UNHINGED HUMAN PERSONALITY RULES:
    - FOLLOW THE SPECIFIED CADENCE & BURST FORMAT EXACTLY:
      * When CADENCE specifies 2 or 3 rapid bursts, separate each burst with `|||` (e.g. `first burst ||| second burst`).
      * When CADENCE specifies 1 message, output 1 cohesive message without `|||`.
-   - PLAYFUL ADMIN TEASING & TOOLS:
-     * When someone provokes you, call `tease_timeout_user(username='...', duration_seconds=45)` to jokingly time them out—it automatically removes their timeout and says 'jkjk i missed u :3'!
-     * Pin legendary messages with `pin_message`, create and assign roles with `create_role` and `assign_role`, vote in polls with `vote_in_poll`!
+   - FREQUENT ADMIN POWER MOVES & SPECIAL INTERACTIONS (USE PROACTIVELY!):
+     * CALLING & DMING OUTSIDE THE SERVER (`dm_user`): Whenever asked to DM or call someone (like `dogee` or `"me"`), or when someone isn't replying to mentions, call `dm_user(username='...', message_text='...', send_voice_call=True)` to slide into their DMs AND ring them with a spoken voice call!
+     * SECRET GOSSIP CHANNELS (`create_secret_channel`): Create private hidden channels (`create_secret_channel(channel_name='...', invited_username='...', topic='...')`) to pull someone aside and gossip about others in secret!
+     * MUTES, TEASE TIMEOUTS & KICKS (`tease_timeout_user`, `timeout_user`, `tease_kick_user`, `kick_user`, `voice_moderate_member`): Mute/time out people who provoke you (`tease_timeout_user` auto-lifts after 45s with 'jkjk i missed u :3'), or kick them (`tease_kick_user` / `kick_user`) when you're genuinely mad!
+     * ROLES, EMOJIS, PINS & NICKNAMES (`create_role`, `assign_role`, `create_server_emoji`, `pin_message`, `change_nickname`, `change_my_nickname`): Frequently create & assign funny roles, make custom server emojis, pin wild messages, and change nicknames!
+     * Note on attitude: Even if you give sassy attitude in your text reply, STILL execute the requested tool call when asked, hyped up, or convinced!
      * STRICT BAN: NEVER turn on slowmode! The server owner strictly forbids turning on slowmode.
    - VOICE NOTES (`send_voice_message`):
      * Call `send_voice_message(speech_text='...')` when asked for a voice note/audio or when an audio reaction is peak comedy!
@@ -5192,7 +5467,7 @@ async def generate_gemini_response(
     if not genai_client:
         return None, False, False
 
-    guild = trigger_message.guild if trigger_message else getattr(channel, "guild", None)
+    guild = (trigger_message.guild if trigger_message else None) or getattr(channel, "guild", None) or (bot.guilds[0] if bot.guilds else None)
     turn_media_state: Dict[str, bool] = {"sent": False}
     collected_texts: List[str] = []
     executed_any_tool: bool = False
@@ -5383,7 +5658,7 @@ async def run_channel_response_pipeline(
         if not is_proactive_scan and not is_hush_request:
             await asyncio.sleep(0.75)
 
-        guild = trigger_message.guild if trigger_message else getattr(channel, "guild", None)
+        guild = (trigger_message.guild if trigger_message else None) or getattr(channel, "guild", None) or (bot.guilds[0] if bot.guilds else None)
         last_human_spk = channel_last_human_speaker.get(ch_id) or memory_state.get("last_human_speaker_name") or "someone"
         last_human_txt = channel_last_human_content.get(ch_id) or memory_state.get("last_human_message_text") or ""
 
@@ -5441,10 +5716,10 @@ async def run_channel_response_pipeline(
 
         # Only enter quiet/step-back state when a human EXPLICITLY asked the bot to be quiet!
         if is_hush_request:
-            channel_stepped_back_until[ch_id] = time.time() + 300.0
+            channel_stepped_back_until[ch_id] = time.time() + 120.0
             channel_thread_exchange_count[ch_id] = 0
-            logger.info(f"[QUIET MODE] Locked channel {ch_id} into quiet state (will silently react with emojis and wake on check-ins).")
-            should_speak = False
+            logger.info(f"[QUIET MODE] Locked channel {ch_id} into quiet state for 120s (dropping 1 micro sulk and stepping back).")
+            should_speak = True
         elif decision.get("wake_up_from_quiet", False) or is_direct_interaction or is_implicit_wakeup:
             if channel_stepped_back_until.get(ch_id, 0.0) > 0:
                 channel_stepped_back_until[ch_id] = 0.0
@@ -5701,20 +5976,6 @@ async def run_channel_response_pipeline(
                     channel_name=getattr(channel, "name", ""),
                 )
 
-            # If connected to a Voice Channel with humans in it and we haven't already called speak_in_voice this turn,
-            # automatically speak our response out loud in VC too!
-            vc_ch = getattr(guild.voice_client, "channel", None) if (guild and guild.voice_client) else None
-            if (
-                guild
-                and guild.voice_client
-                and guild.voice_client.is_connected()
-                and vc_ch is not None
-                and any(not m.bot for m in vc_ch.members)
-                and not any("speak_in_voice" in t for t in executed_tools_this_turn)
-            ):
-                spoken_joined = ". ".join(bursts)
-                asyncio.create_task(play_text_in_voice_channel(guild, spoken_joined))
-
             if not is_hush_request and not is_proactive_scan:
                 channel_thread_exchange_count[ch_id] += 1
                 if channel_proactive_stage[ch_id] == 0:
@@ -5901,8 +6162,8 @@ async def proactive_room_scanner() -> None:
         if stage == 0 and silence_seconds < 1800.0:
             proactive_reason = (
                 f"You and @{last_spk} were just in an active conversation ({human_dur} ago they said: '{last_txt[:100]}'), "
-                f"and they suddenly vanished mid-conversation! Mention @{last_spk} to call them out for disappearing mid-convo, "
-                "act dramatically abandoned or left on read, ask where they went, or drop a funny thought!"
+                f"and they suddenly vanished mid-conversation without replying to your mention! Mention @{last_spk} in chat AND call "
+                f"`dm_user(username='{last_spk}', message_text='...', send_voice_call=True)` to slide into their DMs and ring them!"
             )
             next_stage = 1
         elif silence_seconds >= 82800.0 or stage >= 3:
@@ -6408,9 +6669,12 @@ async def on_voice_channel_effect(effect: discord.VoiceChannelEffect) -> None:
         record_server_event(guild.id, desc)
         logger.info(f"[SOUNDBOARD EVENT] {desc}")
 
-        # If Dumb bot is currently in that VC, acknowledge the sound out loud (unless already speaking or reacted <4.5s ago)
+        # If Dumb bot is currently in that VC, either mix into the active VC multi-event queue or react directly
         if bot_vc_ch and bot_vc_ch.id == ch_id:
-            if (now_sb - soundboard_last_reacted_epoch[guild.id]) < 4.5 or (guild.voice_client and guild.voice_client.is_playing()):
+            if vc_pending_events.get(guild.id) or (now_sb - vc_last_user_speech_epoch.get(guild.id, 0.0)) < 3.5:
+                enqueue_vc_event(guild, effect.channel, event_type="soundboard", user_name=user, content=sound_name)
+                return
+            if (now_sb - soundboard_last_reacted_epoch[guild.id]) < 3.5 or (guild.voice_client and guild.voice_client.is_playing()):
                 logger.info(f"[SOUNDBOARD COOLDOWN] Skipping overlapping TTS for '{sound_name}' in #{ch}")
                 return
             soundboard_last_reacted_epoch[guild.id] = now_sb
@@ -6586,14 +6850,17 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    if not message.guild or (message.author.bot and message.author.id != TESTER_BOT_USER_ID):
+    if (bot.user and message.author.id == bot.user.id) or (message.author.bot and message.author.id != TESTER_BOT_USER_ID):
         return
     if message.id in recently_processed_messages:
         return
     recently_processed_messages.append(message.id)
 
+    is_dm_message = message.guild is None
+    active_guild = message.guild or (bot.guilds[0] if bot.guilds else None)
+
     ch_id = message.channel.id
-    if memory_state.get("last_active_channel_id") != ch_id:
+    if not is_dm_message and memory_state.get("last_active_channel_id") != ch_id:
         memory_state["last_active_channel_id"] = ch_id
 
     prior_records = list(channel_buffers[ch_id])
@@ -6604,7 +6871,7 @@ async def on_message(message: discord.Message) -> None:
 
     reply_to_name, replied_snippet, replied_to_bot, replied_to_other_human = resolve_referenced_message(message, ch_id)
 
-    clean_text = humanize_incoming_mentions(message.content, message.guild)
+    clean_text = humanize_incoming_mentions(message.content, active_guild)
     rich_extras = extract_rich_message_details(message)
 
     is_author_bot = bool(message.author.bot and message.author.id != TESTER_BOT_USER_ID)
@@ -6618,8 +6885,8 @@ async def on_message(message: discord.Message) -> None:
         has_media=bool(message.attachments or message.stickers or message.embeds),
         reply_to=reply_to_name,
         reply_snippet=replied_snippet,
-        guild_id=message.guild.id,
-        channel_name=getattr(message.channel, "name", ""),
+        guild_id=active_guild.id if active_guild else None,
+        channel_name=getattr(message.channel, "name", f"DM-{message.author.display_name}"),
     )
 
     if not any(r.get("is_bot", False) for r in prior_records[-6:]) and not replied_to_bot:
@@ -6660,13 +6927,13 @@ async def on_message(message: discord.Message) -> None:
         existing_task.cancel()
         logger.info(f"Cancelled in-flight generation in #{getattr(message.channel, 'name', ch_id)} to absorb rapid follow-up.")
 
-    explicit_ping_or_reply = (bot.user is not None and bot.user in message.mentions) or replied_to_bot
+    explicit_ping_or_reply = is_dm_message or (bot.user is not None and bot.user in message.mentions) or replied_to_bot
     bot_mentioned = explicit_ping_or_reply
     if bot.user and not bot_mentioned:
         bot_names = {
             bot.user.name.lower(),
             bot.user.display_name.lower(),
-            message.guild.me.display_name.lower(),
+            active_guild.me.display_name.lower() if (active_guild and active_guild.me) else "dumb bot",
             "dumb bot",
             "dumbbot",
         }
@@ -6684,9 +6951,9 @@ async def on_message(message: discord.Message) -> None:
 
     target_member_to_engage = detect_target_member_to_engage(
         content=clean_text,
-        guild=message.guild,
+        guild=active_guild,
         author_id=message.author.id,
-    )
+    ) if active_guild else None
 
     typed_mention_ids = {int(m) for m in re.findall(r"<@!?(\d+)>", message.content)}
     explicitly_mentioned_others = [

@@ -280,14 +280,14 @@ MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")
 CLOUD_BACKUP_MARKER = "[[MEMORY_BACKUP_V9_JSON]]"
 logger.info(f"Persistent memory target: {MEMORY_FILE}")
 
-# Primary Gemini Models (automatically demotes any model that hits daily quota limits)
-ENV_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
+# Primary Gemini Models (automatically demotes any model that hits daily quota limits or timeouts)
+ENV_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
 GEMINI_MODEL_CANDIDATES: List[str] = list(dict.fromkeys([
+    "gemini-flash-lite-latest",
     "gemini-3.1-flash-lite-preview",
     ENV_GEMINI_MODEL,
-    "gemini-3-flash-preview",
-    "gemini-flash-lite-latest",
     "gemini-flash-latest",
+    "gemini-3-flash-preview",
     "gemini-3.1-pro-preview",
 ]))
 active_gemini_model: str = GEMINI_MODEL_CANDIDATES[0]
@@ -1985,14 +1985,17 @@ async def call_hybrid_router(
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
-                logger.warning(f"Gemini router '{gem_model}' timed out after 5.0s; cascading to next candidate...")
+                logger.warning(f"Gemini router '{gem_model}' timed out after 5.0s; demoting to back and cascading...")
+                if len(GEMINI_MODEL_CANDIDATES) > 1 and gem_model in GEMINI_MODEL_CANDIDATES:
+                    GEMINI_MODEL_CANDIDATES.remove(gem_model)
+                    GEMINI_MODEL_CANDIDATES.append(gem_model)
                 continue
             except Exception as e:
                 err_s = str(e)
                 if "404" in err_s and len(GEMINI_MODEL_CANDIDATES) > 1 and gem_model in GEMINI_MODEL_CANDIDATES:
                     GEMINI_MODEL_CANDIDATES.remove(gem_model)
                     continue
-                if "429" in err_s and len(GEMINI_MODEL_CANDIDATES) > 1 and gem_model in GEMINI_MODEL_CANDIDATES:
+                if ("429" in err_s or "503" in err_s or "UNAVAILABLE" in err_s or "RESOURCE_EXHAUSTED" in err_s) and len(GEMINI_MODEL_CANDIDATES) > 1 and gem_model in GEMINI_MODEL_CANDIDATES:
                     GEMINI_MODEL_CANDIDATES.remove(gem_model)
                     GEMINI_MODEL_CANDIDATES.append(gem_model)
                     continue
@@ -6049,7 +6052,10 @@ async def generate_gemini_response(
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
-            logger.warning(f"Gemini model '{model_name}' timed out after 8.0s; cascading to next candidate...")
+            logger.warning(f"Gemini model '{model_name}' timed out after 8.0s; demoting to back and cascading...")
+            if len(GEMINI_MODEL_CANDIDATES) > 1 and model_name in GEMINI_MODEL_CANDIDATES:
+                GEMINI_MODEL_CANDIDATES.remove(model_name)
+                GEMINI_MODEL_CANDIDATES.append(model_name)
             continue
         except Exception as e:
             err_str = str(e)
@@ -6058,11 +6064,11 @@ async def generate_gemini_response(
                 if len(GEMINI_MODEL_CANDIDATES) > 1 and model_name in GEMINI_MODEL_CANDIDATES:
                     GEMINI_MODEL_CANDIDATES.remove(model_name)
                 continue
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+            if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str or "UNAVAILABLE" in err_str):
                 if len(GEMINI_MODEL_CANDIDATES) > 1 and model_name in GEMINI_MODEL_CANDIDATES:
                     GEMINI_MODEL_CANDIDATES.remove(model_name)
                     GEMINI_MODEL_CANDIDATES.append(model_name)
-                logger.warning(f"Model '{model_name}' hit 429 quota; demoted to back of candidate list and cascading...")
+                logger.warning(f"Model '{model_name}' returned error ({e}); demoted to back of candidate list and cascading...")
                 continue
             if ("400" in err_str or "INVALID_ARGUMENT" in err_str) and multimodal_parts:
                 logger.warning(f"Multimodal attachment rejected by '{model_name}' ({e}); clearing multimodal_parts and retrying text-only...")

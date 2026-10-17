@@ -3590,27 +3590,27 @@ def _build_gemini_live_vocal_style(clean_speech: str) -> str:
     elif "mad" in mood_lbl or "crashing out" in mood_lbl or patience < -25:
         base_style = (
             "Comedic fury and explosive crash-out energy! Speak loud, fast, and punchy "
-            "with sharp dramatic pitch spikes, savage roasts, and unhinged attitude. NEVER sound jolly, polite, or whisper!"
+            "with sharp dramatic pitch spikes, savage roasts, and unhinged attitude. NEVER sound cheerful, sweet, or polite, and NEVER whisper!"
         )
     elif "sassy" in mood_lbl or "attitude" in mood_lbl or "side-eye" in mood_lbl or valence < 0:
         base_style = (
             "Dripping with sassy attitude and sarcastic comedic flair! Shift your vocal pitch dynamically "
-            "from dry, unbothered deadpan to sudden incredulous disbelief and vocal eye-rolls. Sarcastic, punchy, NEVER jolly and NEVER whisper!"
+            "from dry, unbothered deadpan to sudden incredulous disbelief and vocal eye-rolls. Sarcastic, punchy, NEVER sound sweet or cheerful, and NEVER whisper!"
         )
     elif "pleading" in mood_lbl or "needy" in mood_lbl or "begging" in mood_lbl or "heartbroken" in mood_lbl or any(w in c_low for w in ("pleaaase", "noooo", "stay", "alone")):
         base_style = (
             "Over-the-top theatrical pleading and hilarious melodramatic whining! Stretch out your vowels "
-            "with bouncy, dramatic pitch shifts and playful desperation. Loud, clear, NEVER jolly and NEVER whisper!"
+            "with bouncy, dramatic pitch shifts and playful desperation. Loud, clear, NEVER sound overly polite, and NEVER whisper!"
         )
     elif "cute" in mood_lbl or "playful" in mood_lbl or "teasing" in mood_lbl:
         base_style = (
             "Mischievous, sassy, teasing, and effortlessly hilarious! Speak with witty attitude, sharp comebacks, "
-            "and dynamic vocal modulation. NEVER sound like a generic polite assistant or jolly storybook narrator, NEVER whisper!"
+            "and dynamic vocal modulation. NEVER sound like a generic polite assistant or storybook narrator, NEVER whisper!"
         )
     else:
         base_style = (
             "Unhinged, hilarious, hyper-expressive vocal modulation! Sarcastic wit, sharp comedic timing, and "
-            "sudden bursts of hype or deadpan disbelief. Punchy, loud, funny, NEVER jolly and NEVER whisper!"
+            "sudden bursts of hype or deadpan disbelief. Punchy, loud, funny, NEVER sound sweet or cheerful, and NEVER whisper!"
         )
 
     if "?" in clean_speech and "!" in clean_speech:

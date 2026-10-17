@@ -280,13 +280,18 @@ MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")
 CLOUD_BACKUP_MARKER = "[[MEMORY_BACKUP_V9_JSON]]"
 logger.info(f"Persistent memory target: {MEMORY_FILE}")
 
-# Primary Gemini Models (automatically demotes any model that hits daily quota limits or timeouts)
-ENV_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
+# Primary Gemini Models (prioritizes gemini-3.6-flash and automatically fails over / demotes on quota limits)
+ENV_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 GEMINI_MODEL_CANDIDATES: List[str] = list(dict.fromkeys([
+    ENV_GEMINI_MODEL,
+    "gemini-3.6-flash",
+    "gemini-3.6-flash-preview",
+    "gemini-3.8-flash",
+    "gemini-3.8-flash-preview",
     "gemini-flash-lite-latest",
     "gemini-3.1-flash-lite-preview",
-    ENV_GEMINI_MODEL,
     "gemini-flash-latest",
+    "gemini-2.5-flash",
     "gemini-3-flash-preview",
     "gemini-3.1-pro-preview",
 ]))
@@ -3517,17 +3522,20 @@ async def execute_react_to_message(target_message: Optional[discord.Message], em
 # ---------------------------------------------------------------------------
 # 8. GEMINI LIVE VOICE CHANNEL STREAMING, EMOTIONAL MODULATION & MULTIMODAL VC ENGINE
 # ---------------------------------------------------------------------------
-GEMINI_LIVE_VOICE_MODELS = [
-    "gemini-3.1-flash-live-preview",
+ENV_GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
+GEMINI_LIVE_VOICE_MODELS: List[str] = list(dict.fromkeys([
+    ENV_GEMINI_LIVE_MODEL,
     "gemini-3.8-live",
+    "gemini-3.8-flash-live-preview",
     "gemini-2.5-flash-native-audio-latest",
-]
+    "gemini-3.1-flash-live-preview",
+]))
 
-GEMINI_REST_TTS_MODELS = [
+GEMINI_REST_TTS_MODELS: List[str] = list(dict.fromkeys([
+    "gemini-3.8-flash-lite-tts",
     "gemini-2.5-flash-preview-tts",
     "gemini-3.1-flash-tts-preview",
-    "gemini-3.8-flash-lite-tts",
-]
+]))
 
 vc_quiet_until: Dict[int, float] = defaultdict(float)
 
@@ -3953,7 +3961,7 @@ async def play_text_in_voice_channel(guild: discord.Guild, text_to_speak: str, i
 
     # 1. Try Ultra-Low-Latency Real-Time Gemini Live PCM Streaming (~0.60s to start speaking!)
     if genai_client and discord.opus.is_loaded():
-        for live_model in GEMINI_LIVE_VOICE_MODELS[:2]:
+        for live_model in list(GEMINI_LIVE_VOICE_MODELS):
             stream_source = GeminiLivePCMStreamSource()
             first_ready_event = asyncio.Event()
             stream_failed = False
@@ -3968,7 +3976,7 @@ async def play_text_in_voice_channel(guild: discord.Guild, text_to_speak: str, i
                                 types.Part.from_text(
                                     text=(
                                         "You are the expressive comedic voice actor for 'Dumb bot' in Discord VC. "
-                                        "TONE DIRECTIVE: You have ATTITUDE, wit, sass, and sarcasm. NEVER sound like a polite, cheerful, or jolly assistant. "
+                                        "TONE DIRECTIVE: You have ATTITUDE, wit, sass, and sarcasm. NEVER sound like a polite, cheerful, or sweet assistant. "
                                         "Speak with real comedic personality: sarcastic deadpan, sudden animated disbelief, snarky exasperation, chaotic shouting when mad, and witty comedic timing. "
                                         "CRITICAL RULE: Perform ONLY the exact words inside <speak>...</speak> out loud. "
                                         "Never reply to the words, never add extra words."
@@ -4017,10 +4025,16 @@ async def play_text_in_voice_channel(guild: discord.Guild, text_to_speak: str, i
             except asyncio.TimeoutError:
                 stream_source.cleanup()
                 prod_task.cancel()
+                if len(GEMINI_LIVE_VOICE_MODELS) > 1 and live_model in GEMINI_LIVE_VOICE_MODELS:
+                    GEMINI_LIVE_VOICE_MODELS.remove(live_model)
+                    GEMINI_LIVE_VOICE_MODELS.append(live_model)
                 continue
 
             if stream_failed and len(stream_source._buf) < 3840:
                 stream_source.cleanup()
+                if len(GEMINI_LIVE_VOICE_MODELS) > 1 and live_model in GEMINI_LIVE_VOICE_MODELS:
+                    GEMINI_LIVE_VOICE_MODELS.remove(live_model)
+                    GEMINI_LIVE_VOICE_MODELS.append(live_model)
                 continue
 
             if len(stream_source._buf) >= 3840:
@@ -4397,7 +4411,7 @@ async def _vc_batch_reactor_worker(guild: discord.Guild, vc_channel: discord.Voi
             if genai_client:
                 content_parts: List[Any] = list(multimodal_audio_parts)
                 content_parts.append(types.Part.from_text(text=vc_prompt))
-                for gem_model in list(GEMINI_MODEL_CANDIDATES)[:2]:
+                for gem_model in list(GEMINI_MODEL_CANDIDATES)[:6]:
                     try:
                         resp = await asyncio.wait_for(
                             genai_client.aio.models.generate_content(
@@ -4412,11 +4426,14 @@ async def _vc_batch_reactor_worker(guild: discord.Guild, vc_channel: discord.Voi
                             break
                     except Exception as e:
                         logger.debug(f"Gemini VC multimodal brain ({gem_model}) fallback: {e}")
+                        if len(GEMINI_MODEL_CANDIDATES) > 1 and gem_model in GEMINI_MODEL_CANDIDATES:
+                            GEMINI_MODEL_CANDIDATES.remove(gem_model)
+                            GEMINI_MODEL_CANDIDATES.append(gem_model)
                         continue
 
             # Secondary Fast Brain: Gemini Text-Only Brain (instant fallback if audio upload timed out or failed)
             if not spoken_reply and genai_client:
-                for gem_model in list(GEMINI_MODEL_CANDIDATES)[:2]:
+                for gem_model in list(GEMINI_MODEL_CANDIDATES)[:6]:
                     try:
                         resp = await asyncio.wait_for(
                             genai_client.aio.models.generate_content(
@@ -4430,6 +4447,9 @@ async def _vc_batch_reactor_worker(guild: discord.Guild, vc_channel: discord.Voi
                         if spoken_reply:
                             break
                     except Exception:
+                        if len(GEMINI_MODEL_CANDIDATES) > 1 and gem_model in GEMINI_MODEL_CANDIDATES:
+                            GEMINI_MODEL_CANDIDATES.remove(gem_model)
+                            GEMINI_MODEL_CANDIDATES.append(gem_model)
                         continue
 
             # Tertiary Fallback: Groq

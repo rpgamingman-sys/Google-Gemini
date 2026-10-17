@@ -280,22 +280,127 @@ MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")
 CLOUD_BACKUP_MARKER = "[[MEMORY_BACKUP_V9_JSON]]"
 logger.info(f"Persistent memory target: {MEMORY_FILE}")
 
-# Primary Gemini Models (prioritizes gemini-3.6-flash and automatically fails over / demotes on quota limits)
-ENV_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-GEMINI_MODEL_CANDIDATES: List[str] = list(dict.fromkeys([
-    ENV_GEMINI_MODEL,
+# ---------------------------------------------------------------------------
+# TIERED MODEL WATERFALL ENGINE (Daily Priority & Dynamic Graceful Degradation)
+# ---------------------------------------------------------------------------
+# Priority #1 models are always restored at midnight (Europe/Amsterdam / UTC rollover).
+# During the day, as rate limits (429 / RESOURCE_EXHAUSTED) hit, models gracefully
+# step down through quality tiers, keeping the best available models at the front.
+
+MASTER_TEXT_MODELS_TIERED: List[str] = [
+    # Tier 1: Highest Intelligence & Expressiveness (Priority #1 every morning)
     "gemini-3.6-flash",
-    "gemini-3.6-flash-preview",
-    "gemini-3.8-flash",
-    "gemini-3.8-flash-preview",
-    "gemini-flash-lite-latest",
-    "gemini-3.1-flash-lite-preview",
+    "gemini-3.1-pro-preview",
+    "gemini-3-flash-preview",
+    # Tier 2: Strong Performance & High Reliability
     "gemini-flash-latest",
     "gemini-2.5-flash",
-    "gemini-3-flash-preview",
-    "gemini-3.1-pro-preview",
-]))
-active_gemini_model: str = GEMINI_MODEL_CANDIDATES[0]
+    "gemini-3.8-flash",
+    "gemini-3.6-flash-preview",
+    "gemini-3.8-flash-preview",
+    # Tier 3: High-RPS Lite / Emergency Gemini Fallbacks
+    "gemini-flash-lite-latest",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-2.5-flash-lite",
+]
+
+MASTER_LIVE_MODELS_TIERED: List[str] = [
+    # Tier 1: Flagship Live Voice (Best expressiveness & comedic timing)
+    "gemini-3.8-live",
+    "gemini-3.1-flash-live-preview",
+    # Tier 2: Live Flash Voice Previews
+    "gemini-3.8-flash-live-preview",
+    "gemini-2.5-flash-native-audio-latest",
+]
+
+MASTER_REST_TTS_MODELS_TIERED: List[str] = [
+    "gemini-3.8-flash-lite-tts",
+    "gemini-2.5-flash-preview-tts",
+    "gemini-3.1-flash-tts-preview",
+]
+
+GEMINI_MODEL_CANDIDATES: List[str] = []
+GEMINI_LIVE_VOICE_MODELS: List[str] = []
+GEMINI_REST_TTS_MODELS: List[str] = []
+active_gemini_model: str = "gemini-3.6-flash"
+
+model_rate_limited_until: Dict[str, float] = {}
+last_model_reset_date: Optional[Any] = None
+
+try:
+    AMSTERDAM_TZ = ZoneInfo("Europe/Amsterdam")
+except Exception:
+    AMSTERDAM_TZ = timezone(timedelta(hours=2))
+
+def get_current_day_marker() -> Any:
+    try:
+        return datetime.now(AMSTERDAM_TZ).date()
+    except Exception:
+        return datetime.now().date()
+
+def refresh_active_model_candidates(force_reset_all: bool = False) -> None:
+    """
+    Recalculates active model candidates according to quality tiers and rate-limit penalties.
+    At midnight (date change), all penalties are cleared and pristine Tier 1 models are prioritized.
+    """
+    global last_model_reset_date, GEMINI_MODEL_CANDIDATES, GEMINI_LIVE_VOICE_MODELS, GEMINI_REST_TTS_MODELS, active_gemini_model
+    now = time.time()
+    today = get_current_day_marker()
+
+    if force_reset_all or last_model_reset_date != today:
+        model_rate_limited_until.clear()
+        last_model_reset_date = today
+        logger.info(f"[MODEL WATERFALL] Daily model priority reset active for {today}! Pristine Tier-1 models restored.")
+
+    def _waterfall_sort(master_list: List[str]) -> List[str]:
+        # Models whose penalty has expired or never penalized
+        avail = [m for m in master_list if now >= model_rate_limited_until.get(m, 0.0)]
+        # Models currently under penalty, sorted by when they recover
+        penalized = [m for m in master_list if now < model_rate_limited_until.get(m, 0.0)]
+        penalized.sort(key=lambda m: model_rate_limited_until.get(m, 0.0))
+        return avail + penalized
+
+    # Build Text Candidates
+    master_text = list(MASTER_TEXT_MODELS_TIERED)
+    env_gemini = os.getenv("GEMINI_MODEL")
+    if env_gemini:
+        if env_gemini in master_text:
+            master_text.remove(env_gemini)
+        master_text.insert(0, env_gemini)
+
+    new_text_candidates = _waterfall_sort(master_text)
+    GEMINI_MODEL_CANDIDATES.clear()
+    GEMINI_MODEL_CANDIDATES.extend(new_text_candidates)
+    if GEMINI_MODEL_CANDIDATES:
+        active_gemini_model = GEMINI_MODEL_CANDIDATES[0]
+
+    # Build Voice Live Candidates
+    master_live = list(MASTER_LIVE_MODELS_TIERED)
+    env_live = os.getenv("GEMINI_LIVE_MODEL")
+    if env_live:
+        if env_live in master_live:
+            master_live.remove(env_live)
+        master_live.insert(0, env_live)
+
+    new_live_candidates = _waterfall_sort(master_live)
+    GEMINI_LIVE_VOICE_MODELS.clear()
+    GEMINI_LIVE_VOICE_MODELS.extend(new_live_candidates)
+
+    # Build Voice REST TTS Candidates
+    new_tts_candidates = _waterfall_sort(list(MASTER_REST_TTS_MODELS_TIERED))
+    GEMINI_REST_TTS_MODELS.clear()
+    GEMINI_REST_TTS_MODELS.extend(new_tts_candidates)
+
+def mark_model_rate_limited(model_name: str, penalty_seconds: float = 1800.0) -> None:
+    """Marks a model as rate-limited or temporarily exhausted, immediately pushing it down the waterfall."""
+    model_rate_limited_until[model_name] = time.time() + penalty_seconds
+    logger.warning(
+        f"[MODEL WATERFALL] Model '{model_name}' rate-limited/exhausted. Stepping down waterfall for {int(penalty_seconds)}s."
+    )
+    refresh_active_model_candidates()
+
+# Initialize pristine candidate lists on module load
+refresh_active_model_candidates(force_reset_all=True)
 
 
 # Groq Router Models (gpt-oss-120b / 20b + instant failover to Gemini; NEVER Qwen)
@@ -2177,19 +2282,16 @@ async def call_hybrid_router(
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
-                logger.warning(f"Gemini router '{gem_model}' timed out after 5.0s; demoting to back and cascading...")
-                if len(GEMINI_MODEL_CANDIDATES) > 1 and gem_model in GEMINI_MODEL_CANDIDATES:
-                    GEMINI_MODEL_CANDIDATES.remove(gem_model)
-                    GEMINI_MODEL_CANDIDATES.append(gem_model)
+                logger.warning(f"Gemini router '{gem_model}' timed out after 5.0s; stepping down waterfall...")
+                mark_model_rate_limited(gem_model, penalty_seconds=300.0)
                 continue
             except Exception as e:
                 err_s = str(e)
-                if "404" in err_s and len(GEMINI_MODEL_CANDIDATES) > 1 and gem_model in GEMINI_MODEL_CANDIDATES:
-                    GEMINI_MODEL_CANDIDATES.remove(gem_model)
+                if "404" in err_s:
+                    mark_model_rate_limited(gem_model, penalty_seconds=86400.0)
                     continue
-                if ("429" in err_s or "503" in err_s or "UNAVAILABLE" in err_s or "RESOURCE_EXHAUSTED" in err_s) and len(GEMINI_MODEL_CANDIDATES) > 1 and gem_model in GEMINI_MODEL_CANDIDATES:
-                    GEMINI_MODEL_CANDIDATES.remove(gem_model)
-                    GEMINI_MODEL_CANDIDATES.append(gem_model)
+                if ("429" in err_s or "503" in err_s or "UNAVAILABLE" in err_s or "RESOURCE_EXHAUSTED" in err_s):
+                    mark_model_rate_limited(gem_model, penalty_seconds=1800.0)
                     continue
                 logger.debug(f"Gemini router fallback error on {gem_model}: {e}")
                 continue
@@ -3519,24 +3621,7 @@ async def execute_react_to_message(target_message: Optional[discord.Message], em
     return {"status": "reacted", "emojis": applied}
 
 
-# ---------------------------------------------------------------------------
-# 8. GEMINI LIVE VOICE CHANNEL STREAMING, EMOTIONAL MODULATION & MULTIMODAL VC ENGINE
-# ---------------------------------------------------------------------------
-ENV_GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
-GEMINI_LIVE_VOICE_MODELS: List[str] = list(dict.fromkeys([
-    ENV_GEMINI_LIVE_MODEL,
-    "gemini-3.8-live",
-    "gemini-3.8-flash-live-preview",
-    "gemini-2.5-flash-native-audio-latest",
-    "gemini-3.1-flash-live-preview",
-]))
-
-GEMINI_REST_TTS_MODELS: List[str] = list(dict.fromkeys([
-    "gemini-3.8-flash-lite-tts",
-    "gemini-2.5-flash-preview-tts",
-    "gemini-3.1-flash-tts-preview",
-]))
-
+# Note: GEMINI_LIVE_VOICE_MODELS and GEMINI_REST_TTS_MODELS are managed by the Tiered Model Waterfall Engine above.
 vc_quiet_until: Dict[int, float] = defaultdict(float)
 
 
@@ -3803,6 +3888,9 @@ async def synthesize_gemini_voice_audio(clean_speech: str) -> Optional[str]:
                 return tmp_wav
         except Exception as e:
             logger.debug(f"Gemini Live voice synthesis on {live_model} failed: {e}")
+            err_s = str(e)
+            if "429" in err_s or "RESOURCE_EXHAUSTED" in err_s or "503" in err_s:
+                mark_model_rate_limited(live_model, penalty_seconds=1800.0)
 
     # 2. Secondary: Gemini Studio TTS REST API (dynamic voice)
     for tts_model in GEMINI_REST_TTS_MODELS:
@@ -3847,6 +3935,9 @@ async def synthesize_gemini_voice_audio(clean_speech: str) -> Optional[str]:
                     return tmp_wav
         except Exception as e:
             logger.debug(f"Gemini REST TTS model {tts_model} failed: {e}")
+            err_s = str(e)
+            if "429" in err_s or "RESOURCE_EXHAUSTED" in err_s or "503" in err_s:
+                mark_model_rate_limited(tts_model, penalty_seconds=1800.0)
 
     return None
 
@@ -4014,6 +4105,9 @@ async def play_text_in_voice_channel(guild: discord.Guild, text_to_speak: str, i
                 except Exception as e:
                     logger.debug(f"Gemini Live VC stream producer ({model_to_use}) error: {e}")
                     stream_failed = True
+                    err_s = str(e)
+                    if "429" in err_s or "RESOURCE_EXHAUSTED" in err_s or "503" in err_s:
+                        mark_model_rate_limited(model_to_use, penalty_seconds=1800.0)
                 finally:
                     stream_source.mark_finished()
                     if not first_ready_event.is_set():
@@ -4025,16 +4119,12 @@ async def play_text_in_voice_channel(guild: discord.Guild, text_to_speak: str, i
             except asyncio.TimeoutError:
                 stream_source.cleanup()
                 prod_task.cancel()
-                if len(GEMINI_LIVE_VOICE_MODELS) > 1 and live_model in GEMINI_LIVE_VOICE_MODELS:
-                    GEMINI_LIVE_VOICE_MODELS.remove(live_model)
-                    GEMINI_LIVE_VOICE_MODELS.append(live_model)
+                mark_model_rate_limited(live_model, penalty_seconds=300.0)
                 continue
 
             if stream_failed and len(stream_source._buf) < 3840:
                 stream_source.cleanup()
-                if len(GEMINI_LIVE_VOICE_MODELS) > 1 and live_model in GEMINI_LIVE_VOICE_MODELS:
-                    GEMINI_LIVE_VOICE_MODELS.remove(live_model)
-                    GEMINI_LIVE_VOICE_MODELS.append(live_model)
+                mark_model_rate_limited(live_model, penalty_seconds=1800.0)
                 continue
 
             if len(stream_source._buf) >= 3840:
@@ -4214,7 +4304,7 @@ async def transcribe_vc_audio_wav(wav_bytes: bytes) -> Optional[str]:
 
     # 2. Fallback to Gemini Multimodal Audio
     if genai_client:
-        for gem_model in list(GEMINI_MODEL_CANDIDATES)[:2]:
+        for gem_model in list(GEMINI_MODEL_CANDIDATES)[:5]:
             try:
                 resp = await asyncio.wait_for(
                     genai_client.aio.models.generate_content(
@@ -4238,6 +4328,9 @@ async def transcribe_vc_audio_wav(wav_bytes: bytes) -> Optional[str]:
                     return txt
             except Exception as e:
                 logger.debug(f"Gemini VC transcription error on {gem_model}: {e}")
+                err_s = str(e)
+                if "429" in err_s or "RESOURCE_EXHAUSTED" in err_s or "503" in err_s:
+                    mark_model_rate_limited(gem_model, penalty_seconds=1800.0)
                 continue
     return None
 
@@ -4426,9 +4519,9 @@ async def _vc_batch_reactor_worker(guild: discord.Guild, vc_channel: discord.Voi
                             break
                     except Exception as e:
                         logger.debug(f"Gemini VC multimodal brain ({gem_model}) fallback: {e}")
-                        if len(GEMINI_MODEL_CANDIDATES) > 1 and gem_model in GEMINI_MODEL_CANDIDATES:
-                            GEMINI_MODEL_CANDIDATES.remove(gem_model)
-                            GEMINI_MODEL_CANDIDATES.append(gem_model)
+                        err_s = str(e)
+                        if "429" in err_s or "RESOURCE_EXHAUSTED" in err_s or "503" in err_s:
+                            mark_model_rate_limited(gem_model, penalty_seconds=1800.0)
                         continue
 
             # Secondary Fast Brain: Gemini Text-Only Brain (instant fallback if audio upload timed out or failed)
@@ -4446,10 +4539,10 @@ async def _vc_batch_reactor_worker(guild: discord.Guild, vc_channel: discord.Voi
                         spoken_reply = extract_clean_gemini_text(resp)
                         if spoken_reply:
                             break
-                    except Exception:
-                        if len(GEMINI_MODEL_CANDIDATES) > 1 and gem_model in GEMINI_MODEL_CANDIDATES:
-                            GEMINI_MODEL_CANDIDATES.remove(gem_model)
-                            GEMINI_MODEL_CANDIDATES.append(gem_model)
+                    except Exception as e:
+                        err_s = str(e)
+                        if "429" in err_s or "RESOURCE_EXHAUSTED" in err_s or "503" in err_s:
+                            mark_model_rate_limited(gem_model, penalty_seconds=1800.0)
                         continue
 
             # Tertiary Fallback: Groq
@@ -6332,23 +6425,18 @@ async def generate_gemini_response(
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
-            logger.warning(f"Gemini model '{model_name}' timed out after 8.0s; demoting to back and cascading...")
-            if len(GEMINI_MODEL_CANDIDATES) > 1 and model_name in GEMINI_MODEL_CANDIDATES:
-                GEMINI_MODEL_CANDIDATES.remove(model_name)
-                GEMINI_MODEL_CANDIDATES.append(model_name)
+            logger.warning(f"Gemini model '{model_name}' timed out; stepping down waterfall...")
+            mark_model_rate_limited(model_name, penalty_seconds=300.0)
             continue
         except Exception as e:
             err_str = str(e)
             if "404" in err_str or "NOT_FOUND" in err_str:
-                logger.warning(f"Model '{model_name}' returned 404; pruning from candidate list and cascading...")
-                if len(GEMINI_MODEL_CANDIDATES) > 1 and model_name in GEMINI_MODEL_CANDIDATES:
-                    GEMINI_MODEL_CANDIDATES.remove(model_name)
+                logger.warning(f"Model '{model_name}' returned 404; demoting for 24h and cascading...")
+                mark_model_rate_limited(model_name, penalty_seconds=86400.0)
                 continue
             if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str or "UNAVAILABLE" in err_str):
-                if len(GEMINI_MODEL_CANDIDATES) > 1 and model_name in GEMINI_MODEL_CANDIDATES:
-                    GEMINI_MODEL_CANDIDATES.remove(model_name)
-                    GEMINI_MODEL_CANDIDATES.append(model_name)
-                logger.warning(f"Model '{model_name}' returned error ({e}); demoted to back of candidate list and cascading...")
+                logger.warning(f"Model '{model_name}' hit quota/rate-limit ({e}); stepping down waterfall...")
+                mark_model_rate_limited(model_name, penalty_seconds=1800.0)
                 continue
             if ("400" in err_str or "INVALID_ARGUMENT" in err_str) and multimodal_parts:
                 logger.warning(f"Multimodal attachment rejected by '{model_name}' ({e}); clearing multimodal_parts and retrying text-only...")
@@ -6796,6 +6884,19 @@ async def run_channel_response_pipeline(
 # ---------------------------------------------------------------------------
 # 12. BACKGROUND LOOPS: SPRING DECAY, PRESENCE & MULTI-HORIZON PROACTIVE ENGINE
 # ---------------------------------------------------------------------------
+@tasks.loop(minutes=5)
+async def model_daily_waterfall_maintenance_loop() -> None:
+    """
+    Background maintenance loop that runs every 5 minutes:
+    1. Checks if midnight date rollover occurred, restoring pristine Tier-1 models for tomorrow.
+    2. Recovers any models whose temporary 30m rate-limit penalty has elapsed.
+    """
+    try:
+        refresh_active_model_candidates()
+    except Exception as e:
+        logger.debug(f"[MODEL WATERFALL LOOP] Exception in maintenance loop: {e}")
+
+
 @tasks.loop(minutes=2)
 async def emotional_spring_maintenance_loop() -> None:
     async with memory_lock:
@@ -7211,6 +7312,8 @@ async def on_ready() -> None:
     )
 
 
+    if not model_daily_waterfall_maintenance_loop.is_running():
+        model_daily_waterfall_maintenance_loop.start()
     if not emotional_spring_maintenance_loop.is_running():
         emotional_spring_maintenance_loop.start()
     if not dynamic_presence_loop.is_running():
@@ -7351,7 +7454,7 @@ async def analyze_soundboard_audio_bytes(sound_bytes: bytes, emoji_hint: str = "
         "'anime girl saying wow with sparkles', 'goofy cartoon slip and boing', 'sad trombone wah wah wah', 'duck quack sound'). "
         "Output ONLY the 3 to 10 word description using plain letters, no quotes, and no emojis."
     )
-    for model_name in list(GEMINI_MODEL_CANDIDATES)[:3]:
+    for model_name in list(GEMINI_MODEL_CANDIDATES)[:5]:
         try:
             resp = await asyncio.wait_for(
                 genai_client.aio.models.generate_content(
@@ -7376,10 +7479,8 @@ async def analyze_soundboard_audio_bytes(sound_bytes: bytes, emoji_hint: str = "
                 return desc.lower()
         except Exception as e:
             err_s = str(e)
-            if "429" in err_s or "RESOURCE_EXHAUSTED" in err_s:
-                if len(GEMINI_MODEL_CANDIDATES) > 1 and model_name in GEMINI_MODEL_CANDIDATES:
-                    GEMINI_MODEL_CANDIDATES.remove(model_name)
-                    GEMINI_MODEL_CANDIDATES.append(model_name)
+            if "429" in err_s or "RESOURCE_EXHAUSTED" in err_s or "503" in err_s:
+                mark_model_rate_limited(model_name, penalty_seconds=1800.0)
             logger.debug(f"Soundboard audio analysis on {model_name} failed: {e}")
     return None
 
@@ -7565,7 +7666,7 @@ async def generate_ai_soundboard_reaction(
         parts: List[Any] = [types.Part.from_text(text=prompt)]
         if sound_bytes:
             parts.append(types.Part.from_bytes(data=sound_bytes, mime_type="audio/ogg"))
-        for model_name in list(GEMINI_MODEL_CANDIDATES)[:2]:
+        for model_name in list(GEMINI_MODEL_CANDIDATES)[:5]:
             try:
                 resp = await asyncio.wait_for(
                     genai_client.aio.models.generate_content(
@@ -7574,12 +7675,15 @@ async def generate_ai_soundboard_reaction(
                         config=types.GenerateContentConfig(temperature=0.95, max_output_tokens=60),
                     ),
                     timeout=3.8,
-                ),
+                )
                 spoken = (resp[0].text if isinstance(resp, tuple) else resp.text or "").strip().strip("\"'")
                 spoken = re.sub(r"[^\x20-\x7E]+", "", spoken).strip()
                 if spoken and len(spoken) >= 5:
                     return spoken
             except Exception as e:
+                err_s = str(e)
+                if "429" in err_s or "RESOURCE_EXHAUSTED" in err_s or "503" in err_s:
+                    mark_model_rate_limited(model_name, penalty_seconds=1800.0)
                 logger.debug(f"AI soundboard reaction fallback ({model_name}): {e}")
     return generate_soundboard_reaction(sound_name, user_name)
 

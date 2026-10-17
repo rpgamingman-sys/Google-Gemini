@@ -1215,6 +1215,25 @@ def format_member_activities(member: Optional[discord.Member]) -> Optional[str]:
     return " | ".join(parts) if parts else None
 
 
+def is_secret_or_private_channel(channel: discord.abc.Messageable, guild: Optional[discord.Guild]) -> bool:
+    """
+    Detects if the channel is a secret/private room (e.g. #secret, #gossip, #private, #vip, #dogee, or hidden channel).
+    """
+    if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel, discord.Thread)):
+        return False
+    ch_name = getattr(channel, "name", "").lower()
+    secret_keywords = ("secret", "gossip", "private", "vip", "tea", "confidential", "hidden", "dogee", "backroom", "vault")
+    if any(k in ch_name for k in secret_keywords):
+        return True
+    if guild and hasattr(channel, "permissions_for"):
+        everyone_perms = channel.permissions_for(guild.default_role)
+        if not everyone_perms.view_channel or not everyone_perms.read_messages:
+            return True
+        if hasattr(channel, "members") and len(channel.members) <= 4:
+            return True
+    return False
+
+
 def build_live_server_radar(guild: Optional[discord.Guild], channel_id: int) -> str:
     """
     Gives the bot complete omniscience over everything happening in the Discord server right now:
@@ -2297,10 +2316,11 @@ async def execute_post_gif(
                     matches = list(dict.fromkeys(re.findall(r"https://media\d*\.tenor\.com/[a-zA-Z0-9_\-]+/[a-zA-Z0-9_\-]+\.gif", html)))
                     if matches:
                         # Filter out recently sent GIFs so the bot NEVER repeats the same GIF twice in a row!
-                        available = [m for m in matches[:14] if m not in recent_sent_gif_urls]
-                        pool = available if available else matches[:8]
-                        # Randomize across the top 4 freshest matches for great variety
-                        shuffled_candidates = list(pool[:4])
+                        available = [m for m in matches if m not in recent_sent_gif_urls]
+                        pool = available if available else matches
+                        # Randomize across up to 15 freshest matches for huge variety
+                        candidate_pool = pool[:15]
+                        shuffled_candidates = list(candidate_pool)
                         random.shuffle(shuffled_candidates)
                         for candidate_gif in shuffled_candidates:
                             if await send_media_url_as_file_or_embed(channel, candidate_gif, "reaction.gif"):
@@ -2314,6 +2334,31 @@ async def execute_post_gif(
                                 return {"status": "sent_to_channel", "gif_url": candidate_gif}
         except Exception as e:
             logger.debug(f"Tenor web scraper error on '{slug}': {e}")
+
+    # Fallback: Curated viral reaction GIFs if scraping returned zero matches or failed
+    curated_viral_gifs = [
+        "https://media.tenor.com/2roX3uxz_68AAAAC/cat-space-out.gif",
+        "https://media.tenor.com/g0_a8aX1z4sAAAAC/walter-white-falling.gif",
+        "https://media.tenor.com/e5k2Gk_dY_kAAAAC/side-eye-dog.gif",
+        "https://media.tenor.com/9Z2Yw-yL_GIAAAAC/cat-stare.gif",
+        "https://media.tenor.com/0vMvZcI1Q4QAAAAC/awkward-look-monkey-puppet.gif",
+        "https://media.tenor.com/D_1G9S3Uf4AAAAAC/spongebob-screaming.gif",
+        "https://media.tenor.com/3Z4M0-d9J6sAAAAC/cat-typing-fast.gif",
+        "https://media.tenor.com/bC8I4J5J9YQAAAAC/crying-cat.gif",
+        "https://media.tenor.com/6UeWd_lG9hIAAAAC/confused-travolta.gif",
+        "https://media.tenor.com/8c2t14u4v2gAAAAC/laughing-cat.gif",
+    ]
+    curated_avail = [g for g in curated_viral_gifs if g not in recent_sent_gif_urls]
+    chosen_fallback = random.choice(curated_avail if curated_avail else curated_viral_gifs)
+    if await send_media_url_as_file_or_embed(channel, chosen_fallback, "reaction.gif"):
+        recent_sent_gif_urls.append(chosen_fallback)
+        if turn_media_state is not None:
+            turn_media_state["sent"] = True
+        channel_last_gif_epoch[ch_id] = time.time()
+        channel_messages_since_gif[ch_id] = 0
+        channel_last_bot_spoke_epoch[ch_id] = time.time()
+        logger.info(f"[GIF SENT] Uploaded curated viral fallback reaction GIF '{search_term}' ({chosen_fallback})")
+        return {"status": "sent_to_channel", "gif_url": chosen_fallback}
 
     return {"error": f"Could not find a matching GIF for '{search_term}'."}
 
@@ -2584,6 +2629,51 @@ async def execute_remove_timeout(guild: discord.Guild, username: str) -> Dict[st
     return {"status": "success", "user": member.display_name, "simulated": True}
 
 
+async def execute_tease_kick_user(
+    guild: discord.Guild,
+    channel: discord.abc.Messageable,
+    username: str,
+    tease_comment: str = "lmao byeee :3",
+) -> Dict[str, Any]:
+    """
+    Playful tease punishment: kicks a member from the server and immediately DMs them a single-use invite back
+    with a teasing message ('lmao i kicked u but here is your invite back dummy :3')!
+    """
+    cd = check_admin_cooldown("tease_kick_user")
+    if cd:
+        return {"error": cd}
+    member = find_member(guild, username)
+    if not member:
+        return {"error": f"Member '{username}' not found."}
+    if is_creator(member) or member == guild.owner or member.guild_permissions.administrator:
+        return {"error": "Cannot kick the creator or server administrators."}
+    if guild.me.top_role <= member.top_role and member.id != TESTER_BOT_USER_ID:
+        return {"error": f"Role hierarchy blocks kicking {member.display_name}."}
+
+    if member.id == TESTER_BOT_USER_ID:
+        logger.info(f"[TEASE KICK] Simulated tease-kick on TesterBot ('{tease_comment}')")
+        return {
+            "status": "success",
+            "action": "tease_kick",
+            "user": member.display_name,
+            "simulated": True,
+            "note": "Simulated tease-kick on TesterBot (sent instant invite back in DMs)!",
+        }
+
+    try:
+        inv_channel = channel if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)) else guild.text_channels[0]
+        invite = await inv_channel.create_invite(max_uses=1, max_age=600, reason="Tease kick invite back")
+        try:
+            await member.send(f"lmao i kicked you ({tease_comment}) but here's your invite back dummy: {invite.url} :3")
+        except Exception as dm_err:
+            logger.info(f"Could not DM invite to {member.display_name}: {dm_err}")
+        await member.kick(reason=f"Playful tease kick: {tease_comment}")
+        logger.info(f"[ADMIN ACTION] Tease-kicked {member.display_name} and sent invite back!")
+        return {"status": "success", "user": member.display_name, "action": "tease_kick"}
+    except Exception as e:
+        return {"error": f"Tease kick failed: {e}"}
+
+
 async def execute_create_server_emoji(
     guild: discord.Guild,
     name: str,
@@ -2645,6 +2735,43 @@ async def execute_create_text_channel(guild: discord.Guild, channel_name: str, t
         return {"status": "success", "channel": f"<#{ch.id}>", "name": ch.name}
     except Exception as e:
         return {"error": f"Create channel failed: {e}"}
+
+
+async def execute_create_secret_channel(
+    guild: discord.Guild,
+    channel_name: str,
+    topic: str = "secret tea room",
+    creator_member: Optional[discord.Member] = None,
+) -> Dict[str, Any]:
+    """
+    Creates a private hidden text channel where only the bot and creator (dogee) have access!
+    Perfect for secretive tea-spilling, whispering, and gossip without anyone else watching.
+    """
+    cd = check_admin_cooldown("create_secret_channel")
+    if cd:
+        return {"error": cd}
+    try:
+        clean_name = re.sub(r"[^a-zA-Z0-9_-]", "-", channel_name.lower()).strip("-")[:32] or "secret-vault"
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False, read_messages=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, read_messages=True, send_messages=True, embed_links=True, attach_files=True),
+        }
+        creator = creator_member or find_member(guild, "dogee")
+        if creator:
+            overwrites[creator] = discord.PermissionOverwrite(view_channel=True, read_messages=True, send_messages=True, read_message_history=True)
+
+        ch = await guild.create_text_channel(name=clean_name, topic=topic[:1024] if topic else None, overwrites=overwrites)
+        logger.info(f"[ADMIN ACTION] Created secret private channel #{ch.name} (<#{ch.id}>)")
+        try:
+            await ch.send(
+                f"*locks the door* 🤫🔒 ok we're in! this room is completely private and hidden from everyone else :3 what's the tea??",
+                allowed_mentions=discord.AllowedMentions(users=True),
+            )
+        except Exception:
+            pass
+        return {"status": "success", "channel_tag": f"<#{ch.id}>", "channel_name": ch.name}
+    except Exception as e:
+        return {"error": f"Failed to create secret channel: {e}"}
 
 
 async def execute_set_channel_topic(channel: discord.abc.Messageable, topic: str) -> Dict[str, Any]:
@@ -3871,6 +3998,18 @@ def build_genai_tools(allow_gif: bool = True) -> List[types.Tool]:
             },
         ),
         types.FunctionDeclaration(
+            name="create_secret_channel",
+            description="Creates a private hidden text channel where only you, your creator dogee, and designated members have access to gossip, scheme, or talk in secret!",
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "channel_name": {"type": "STRING", "description": "Name for the secret channel (e.g. 'tea-spilling-vault', 'secret-club')."},
+                    "topic": {"type": "STRING", "description": "Topic/purpose for the secret room."},
+                },
+                "required": ["channel_name"],
+            },
+        ),
+        types.FunctionDeclaration(
             name="create_thread",
             description="Creates a public thread on the current message or channel (e.g., for comedic containment, debate, or a courtroom).",
             parameters={
@@ -3989,6 +4128,18 @@ def build_genai_tools(allow_gif: bool = True) -> List[types.Tool]:
                     "reason": {"type": "STRING", "description": "Reason for kicking."},
                 },
                 "required": ["username", "reason"],
+            },
+        ),
+        types.FunctionDeclaration(
+            name="tease_kick_user",
+            description="Playfully kicks a member from the server and instantly sends them an invite back via DM with a tease comment ('lmao i kicked u but here is your invite back dummy :3')!",
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "username": {"type": "STRING", "description": "Target member's name."},
+                    "tease_comment": {"type": "STRING", "description": "Playful reason/comment for the tease kick."},
+                },
+                "required": ["username"],
             },
         ),
         types.FunctionDeclaration(
@@ -4179,6 +4330,10 @@ async def dispatch_tool_call(
             if not guild:
                 return {"error": "No guild context."}
             res = await execute_create_text_channel(guild, args.get("channel_name", "chat"), args.get("topic", ""))
+        elif func_name == "create_secret_channel":
+            if not guild:
+                return {"error": "No guild context."}
+            res = await execute_create_secret_channel(guild, args.get("channel_name", "secret-vault"), args.get("topic", "secret tea room"))
         elif func_name == "create_thread":
             res = await execute_create_thread(channel, target_msg, args.get("thread_name", "discussion"), args.get("initial_message", ""))
         elif func_name == "create_poll":
@@ -4207,6 +4362,10 @@ async def dispatch_tool_call(
                 tease_comment=args.get("tease_comment", "enjoy timeout realm :3"),
                 target_channel=channel,
             )
+        elif func_name == "tease_kick_user":
+            if not guild:
+                return {"error": "No guild context."}
+            res = await execute_tease_kick_user(guild, channel, args.get("username", ""), args.get("tease_comment", "lmao byeee :3"))
         elif func_name == "remove_timeout":
             if not guild:
                 return {"error": "No guild context."}
@@ -4642,7 +4801,8 @@ def construct_v11_system_prompt(
     ch_name = getattr(ch_obj, "name", "").lower()
     is_secret_mode = bool(
         speaker_is_creator and (
-            any(k in ch_name for k in ("secret", "private", "vip", "gossip", "staff", "admin", "whisper", "bot-testing", "owner"))
+            is_secret_or_private_channel(ch_obj, guild)
+            or any(k in ch_name for k in ("secret", "private", "vip", "gossip", "staff", "admin", "whisper", "bot-testing", "owner"))
             or (guild and ch_obj and hasattr(ch_obj, "permissions_for") and not ch_obj.permissions_for(guild.default_role).read_messages)
         )
     )
@@ -5410,8 +5570,26 @@ async def run_channel_response_pipeline(
                         media_sent = True
                         turn_media_state["sent"] = True
                 if (suggest_gif or user_explicit_gif) and not media_sent and not is_hush_request:
+                    term = None
                     term_match = re.search(r"\b(?:gif|meme|pic)\s+(?:of\s+)?([a-zA-Z0-9_\s]{2,25})", raw_without_mentions, flags=re.IGNORECASE)
-                    term = term_match.group(1).strip() if term_match else (raw_without_mentions[:30] or "reaction")
+                    if term_match:
+                        term = term_match.group(1).strip()
+                    else:
+                        ctx_low = raw_without_mentions.lower()
+                        if any(w in ctx_low for w in ("cook", "hairline", "skull", "💀", "dead", "rip")):
+                            term = random.choice(["skull disintegration meme", "he is cooked meme", "walter white falling", "shocked cat meme"])
+                        elif any(w in ctx_low for w in ("lmao", "lol", "haha", "crying", "😭", "roast", "funny")):
+                            term = random.choice(["laughing hysterically meme", "cat wheezing meme", "crying laughing meme", "spit take meme"])
+                        elif any(w in ctx_low for w in ("mad", "crash out", "angry", "rage", "fight")):
+                            term = random.choice(["rage crash out meme", "screaming face meme", "cat rage punch", "smash keyboard"])
+                        elif any(w in ctx_low for w in ("silly", "goofy", "dumb", "crazy", "unhinged")):
+                            term = random.choice(["goofy cat meme", "side eye dog", "spinning seal", "awkward monkey puppet"])
+                        elif any(w in ctx_low for w in ("what", "huh", "confused", "??")):
+                            term = random.choice(["confused math lady", "huh cat meme", "nick young confused", "blinking guy meme"])
+                        elif any(w in ctx_low for w in ("plead", "beg", "sad", "miss", "leave", "stay", "pls", "please")):
+                            term = random.choice(["pleading cat eyes", "crying cat meme", "dramatic begging meme", "sad puppy eyes"])
+                        else:
+                            term = random.choice(["dramatic stare meme", "awkward monkey puppet", "funny reaction meme", "cat side eye meme"])
                     gif_res = await execute_post_gif(channel, term, turn_media_state=turn_media_state)
                     if gif_res.get("status") == "sent_to_channel":
                         media_sent = True
@@ -5462,13 +5640,11 @@ async def run_channel_response_pipeline(
             aff_score = speaker_affinity.get("score", 0)
             patience_val = emotional_state.get("patience", 55.0)
 
+            # User request: "make his tags have tagging on not off so its a push message"
+            # Always reply directly to trigger_message if present, even when media/GIF was sent or patience is low!
             use_reply = (
                 trigger_message is not None
-                and delivery_mode == "reply"
-                and not last_message_from_bot
-                and not media_sent
                 and not is_proactive_scan
-                and not (aff_score < -20 or patience_val < -30)
             )
 
             for idx, burst_part in enumerate(bursts):
@@ -5485,9 +5661,19 @@ async def run_channel_response_pipeline(
                     continue
 
                 push_allowed_mentions = discord.AllowedMentions(users=True, roles=False, everyone=False, replied_user=True)
+
+                # Ensure push notification on first burst if sending standalone (proactive or fallback)
+                if idx == 0 and not use_reply and not is_hush_request:
+                    target_to_ping_id = None
+                    if target_member_to_engage:
+                        target_to_ping_id = target_member_to_engage.id
+                    elif speaker_id and not is_proactive_scan:
+                        target_to_ping_id = speaker_id
+                    if target_to_ping_id and f"<@{target_to_ping_id}>" not in outgoing_text:
+                        outgoing_text = f"<@{target_to_ping_id}> {outgoing_text}"
+
                 if idx == 0 and use_reply and trigger_message is not None:
                     try:
-                        # User request: "make his tags have tagging on not off so its a push message"
                         should_mention = not is_hush_request
                         sent_msg = await trigger_message.reply(
                             outgoing_text,
@@ -5495,6 +5681,8 @@ async def run_channel_response_pipeline(
                             allowed_mentions=push_allowed_mentions,
                         )
                     except Exception:
+                        if not is_hush_request and speaker_id and f"<@{speaker_id}>" not in outgoing_text:
+                            outgoing_text = f"<@{speaker_id}> {outgoing_text}"
                         sent_msg = await channel.send(outgoing_text, allowed_mentions=push_allowed_mentions)
                 else:
                     sent_msg = await channel.send(outgoing_text, allowed_mentions=push_allowed_mentions)
